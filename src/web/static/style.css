@@ -468,7 +468,26 @@ main { padding: 16px; max-width: 1500px; margin: 0 auto; }
 }
 .text-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
 #f-font { width: 100%; }
-#font-note { display: block; margin-top: 4px; }
+#font-note { display: block; margin: 4px 0 8px; }
+.font-missing {
+  font-size: 12px; line-height: 1.5; color: var(--warn); margin-bottom: 8px;
+  border-left: 3px solid var(--warn); padding: 4px 8px;
+  background: color-mix(in srgb, var(--warn) 8%, var(--surface));
+}
+.font-store {
+  margin-top: 8px; padding: 10px; border: 1px solid var(--line);
+  border-radius: 8px; background: var(--surface-2);
+}
+.font-store .hint { display: block; margin: 0 0 8px; line-height: 1.55; }
+.fs-cat { font-size: 11px; font-weight: 800; color: var(--muted); margin: 10px 0 4px; }
+.fs-item {
+  display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; align-items: center;
+  padding: 6px 0; border-top: 1px dashed var(--line);
+}
+.fs-name { font-size: 13px; font-weight: 700; }
+.fs-note { font-size: 11px; color: var(--muted); grid-column: 1; line-height: 1.45; }
+.fs-item .btn { grid-row: 1 / span 2; grid-column: 2; }
+.fs-done { font-size: 11px; color: var(--ok); font-weight: 700; grid-row: 1 / span 2; grid-column: 2; }
 /* スタンプ一覧・セリフ編集で改行を見えるようにする */
 .cell .ctext { white-space: pre-line; }
 .sheet textarea {

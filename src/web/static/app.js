@@ -1164,23 +1164,86 @@ function fillDesignControls(font) {
 }
 
 /** 選べるフォントの一覧を読み込みます。 */
-async function loadFonts() {
+async function loadFonts(selectId) {
   let d;
   try { d = await api('/api/fonts'); } catch (e) { return; }
   state.fonts = d.fonts;
-  const current = state.fontId || d.current;
+  state.freeFonts = d.free_fonts || [];
+  state.freeCategories = d.free_categories || [];
+  const current = selectId || $('#f-font').value || state.fontId || d.current;
   $('#f-font').innerHTML = d.fonts
     .map((f) => `<option value="${escapeHtml(f.id)}">${escapeHtml(f.label)}</option>`).join('');
   if (current && d.fonts.some((f) => f.id === current)) $('#f-font').value = current;
   showFontNote();
+  renderFontStore();
 }
 
 function showFontNote() {
   const f = (state.fonts || []).find((x) => x.id === $('#f-font').value);
   $('#font-note').textContent = f ? f.note : '';
+  checkFontGlyphs();
+}
+
+/** 選んだフォントに、セリフで使っている文字がそろっているかを調べて知らせます。 */
+let glyphTimer = null;
+function checkFontGlyphs() {
+  clearTimeout(glyphTimer);
+  glyphTimer = setTimeout(async () => {
+    const box = $('#font-missing');
+    const id = $('#f-font').value;
+    if (!id) { box.hidden = true; return; }
+    let d;
+    try { d = await api(`/api/fonts/check?font_id=${encodeURIComponent(id)}`); } catch (e) { box.hidden = true; return; }
+    if (!d.missing.length) { box.hidden = true; return; }
+    const chars = d.missing.slice(0, 12).map((c) => `「${escapeHtml(c)}」`).join('')
+      + (d.missing.length > 12 ? ` ほか${d.missing.length - 12}文字` : '');
+    const ids = d.affected_ids.length > 8
+      ? `${d.affected_ids.slice(0, 8).join(', ')} ほか${d.affected_ids.length - 8}件`
+      : d.affected_ids.join(', ');
+    box.innerHTML = `このフォントには ${chars} がありません。`
+      + `<b>${d.affected_ids.length}件</b>のスタンプで、その文字が「□」になります（${escapeHtml(ids)}）。`
+      + '別のフォントを選ぶか、セリフを変えてください。';
+    box.hidden = false;
+  }, 150);
 }
 
 $('#f-font').addEventListener('change', () => { showFontNote(); schedulePreview(); });
+
+/* ---------- フォントを増やす（無料フォントの追加） ---------- */
+function renderFontStore() {
+  const cats = state.freeCategories || [];
+  $('#font-store-list').innerHTML = cats.map((cat) => {
+    const items = (state.freeFonts || []).filter((f) => f.category === cat);
+    if (!items.length) return '';
+    return `<div class="fs-cat">${escapeHtml(cat)}</div>` + items.map((f) => `
+      <div class="fs-item">
+        <span class="fs-name">${escapeHtml(f.label)} <span class="hint">${f.size_mb}MB</span></span>
+        <span class="fs-note">${escapeHtml(f.note)}</span>
+        ${f.installed
+          ? '<span class="fs-done">追加済み</span>'
+          : `<button type="button" class="btn small" data-install="${escapeHtml(f.id)}">追加</button>`}
+      </div>`).join('');
+  }).join('');
+}
+
+$('#btn-font-store').addEventListener('click', () => {
+  $('#font-store').hidden = !$('#font-store').hidden;
+});
+
+$('#font-store-list').addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-install]');
+  if (!btn) return;
+  const id = btn.dataset.install;
+  const info = (state.freeFonts || []).find((f) => f.id === id);
+  withBusy(btn, 'ダウンロード中…', async () => {
+    try {
+      await api('/api/fonts/install', { method: 'POST', body: { id } });
+      await loadFonts(id);   // 追加したフォントをそのまま選んでプレビューします
+      schedulePreview();
+      toast(`「${info ? info.label : id}」を追加しました。プレビューで確認して、気に入ったら「この設定を保存」を押してください`);
+    } catch (err) { toast(err.message, true); }
+  });
+});
 
 function fillDesignTargets() {
   // 生成済みを先頭に並べますが、未生成もマスター画像で代用してプレビューできます。

@@ -38,3 +38,7 @@ desktop.ini
 .DS_Store
 .idea/
 .vscode/
+
+# --- 追加フォント（ファイルが大きいので管理しない。README だけ残す） ---
+fonts/*
+!fonts/README.md

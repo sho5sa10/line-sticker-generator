@@ -668,13 +668,50 @@ def create_app(config=None) -> Flask:
 
     @app.get("/api/fonts")
     def api_fonts():
-        """選べるフォントの一覧と、いま使っているフォント。"""
+        """選べるフォントの一覧と、いま使っているフォント、追加できる無料フォント。"""
         cfg_ = current_config()
+        installed = {f.id for f in fontlib.available_fonts(cfg_)}
         return jsonify({
             "fonts": [f.to_dict() for f in fontlib.available_fonts(cfg_)],
             "current": fontlib.current_font_id(cfg_),
             "custom_dir": str(fontlib.custom_font_dir(cfg_)),
+            "free_categories": fontlib.FREE_FONT_CATEGORIES,
+            "free_fonts": [
+                {"id": f.id, "label": f.label, "category": f.category, "size_mb": f.size_mb,
+                 "note": f.note, "installed": f.id in installed}
+                for f in fontlib.FREE_FONTS
+            ],
         })
+
+    @app.get("/api/fonts/check")
+    def api_fonts_check():
+        """選んだフォントに、セリフで使っている文字がそろっているか調べます。"""
+        cfg_ = current_config()
+        info = fontlib.find_font(cfg_, str(request.args.get("font_id", "")))
+        if info is None:
+            return jsonify({"error": "フォントが見つかりません"}), 404
+        try:
+            texts = [e.text for e in entries_or_error()]
+        except CsvLoadError as exc:
+            return jsonify({"error": str(exc)}), 400
+        missing = fontlib.missing_chars(info.path, texts, info.index)
+        affected = [e.id for e in entries_or_error() if any(ch in e.text for ch in missing)]
+        return jsonify({"font_id": info.id, "missing": missing, "affected_ids": affected})
+
+    @app.post("/api/fonts/install")
+    def api_fonts_install():
+        """一覧にある無料フォントをダウンロードして追加します（ボタンを押したときだけ）。"""
+        cfg_ = current_config()
+        font_id = str((request.get_json(silent=True) or {}).get("id", ""))
+        if jobs.is_running():
+            return jsonify({"error": "ほかの処理が実行中です。終わってから追加してください"}), 409
+        try:
+            path = fontlib.install_free_font(cfg_, font_id)
+        except fontlib.FontInstallError as exc:
+            return jsonify({"error": str(exc)}), 400
+        info = fontlib.find_font(cfg_, font_id)
+        return jsonify({"installed": font_id, "path": str(path),
+                        "font": info.to_dict() if info else None})
 
     @app.get("/api/design/suggest")
     def api_design_suggest():

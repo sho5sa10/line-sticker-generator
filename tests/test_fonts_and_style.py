@@ -152,3 +152,72 @@ def test_suggestions_are_readable(tmp_config, tmp_path):
 )
 def test_mood_font_tag(moods, kind, tag):
     assert ss.mood_font_tag({"mood": moods, "kind": kind})[0] == tag
+
+
+# --- フォントを増やす（ダウンロードは差し替えて、実際には通信しない） -----
+def _fake_http(font_path):
+    """一覧のURLに対して、手元のフォントとライセンス文を返すダミー。"""
+    data = open(font_path, "rb").read()
+
+    def get(url, timeout):
+        assert url.startswith(fontlib.GOOGLE_FONTS_BASE)  # 一覧のURL以外は取りに行かない
+        return b"SIL OPEN FONT LICENSE" if url.endswith("OFL.txt") else data
+    return get
+
+
+def test_install_free_font(tmp_config, font_path):
+    path = fontlib.install_free_font(tmp_config, "hachi-maru-pop", http_get=_fake_http(font_path))
+    assert path.name == "HachiMaruPop-Regular.ttf"
+    assert (path.parent / "HachiMaruPop-Regular-OFL.txt").read_bytes().startswith(b"SIL")
+    info = fontlib.find_font(tmp_config, "hachi-maru-pop")
+    assert info is not None
+    assert info.label == "はちまるポップ（手書き）"
+    assert "handwritten" in info.tags
+
+
+def test_install_rejects_unknown_font(tmp_config):
+    with pytest.raises(fontlib.FontInstallError, match="一覧にない"):
+        fontlib.install_free_font(tmp_config, "../../evil", http_get=lambda u, t: b"")
+
+
+def test_install_rejects_broken_download(tmp_config):
+    with pytest.raises(fontlib.FontInstallError, match="フォントとして読み込めません"):
+        fontlib.install_free_font(tmp_config, "yusei-magic", http_get=lambda u, t: b"<html>not a font</html>")
+    # 壊れたファイルを残さない
+    assert not list(fontlib.custom_font_dir(tmp_config).glob("*.ttf"))
+    assert not list(fontlib.custom_font_dir(tmp_config).glob("*.part"))
+
+
+def test_install_reports_network_error(tmp_config):
+    def boom(url, timeout):
+        raise OSError("network down")
+    with pytest.raises(fontlib.FontInstallError, match="ダウンロードできません"):
+        fontlib.install_free_font(tmp_config, "yomogi", http_get=boom)
+
+
+def test_every_free_font_is_on_google_fonts_ofl():
+    for f in fontlib.FREE_FONTS:
+        assert f.url.startswith("https://raw.githubusercontent.com/google/fonts/main/ofl/")
+        assert f.license_url.endswith("/OFL.txt")
+        assert f.category in fontlib.FREE_FONT_CATEGORIES
+    assert sum(1 for f in fontlib.FREE_FONTS if f.category == "手書き") >= 5
+
+
+def test_suggestion_prefers_added_handwritten_font(tmp_config, font_path, tmp_path):
+    import shutil
+
+    from src import character_profile as cp
+
+    fontlib.install_free_font(tmp_config, "hachi-maru-pop", http_get=_fake_http(font_path))
+    cp.save_profile(tmp_config.character_profile_path, cp.PRESETS["ゆるうさぎ"])
+    tmp_config.master_image_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(_bird(tmp_path), tmp_config.master_image_path)
+    first = ss.suggest_styles(tmp_config)["suggestions"][0]
+    assert first["font_id"] == "hachi-maru-pop"
+
+
+def test_missing_chars(font_path):
+    assert fontlib.missing_chars(font_path, ["了解！ありがとう"]) == []
+    arial = fontlib._find_file("arial.ttf")
+    if arial:
+        assert set(fontlib.missing_chars(str(arial), ["了解！OK"])) == {"了", "解", "！"}

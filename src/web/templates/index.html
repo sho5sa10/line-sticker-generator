@@ -281,6 +281,18 @@
           <select id="f-font"
                   data-tip="このPCで使える日本語フォントです。fonts フォルダに .ttf/.otf を置くと、ここに追加されます"></select>
           <span class="hint" id="font-note"></span>
+          <div class="font-missing" id="font-missing" hidden></div>
+          <button class="btn small ghost" id="btn-font-store"
+                  data-tip="手書き風・丸ゴシック・ポップ体などの無料フォントを追加できます">
+            ＋ フォントを増やす（無料）</button>
+          <div class="font-store" id="font-store" hidden>
+            <p class="hint">
+              Google Fonts の無料フォントです（SIL Open Font License）。
+              <b>スタンプとして販売する画像に使えます。</b>
+              「追加」を押したときだけダウンロードします（1つ 0.3〜8.5MB）。
+            </p>
+            <div id="font-store-list"></div>
+          </div>
         </div>
         <div class="field" data-tip="長いセリフは自動で小さくなります。これはその上限です">
           <label>文字サイズ上限 <b id="v-size"></b> px</label>

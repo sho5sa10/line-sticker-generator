@@ -137,7 +137,18 @@ def mood_font_tag(profile: dict | None) -> tuple[str, str]:
 
 
 def _pick_font(fonts: list[FontInfo], tag: str) -> FontInfo | None:
-    return next((f for f in fonts if tag in f.tags), None) or (fonts[0] if fonts else None)
+    """雰囲気に合うフォントを選びます。
+
+    自分で追加した無料フォント（手書きなど）があれば、それを優先します。
+    わざわざ追加したフォントは、使いたいフォントのはずだからです。
+    """
+    from .fonts import free_font
+
+    matches = [f for f in fonts if tag in f.tags]
+    added = [f for f in matches if free_font(f.id)]
+    if added:
+        return added[0]
+    return matches[0] if matches else (fonts[0] if fonts else None)
 
 
 _STROKE = {"impact": 8, "elegant": 8, "gentle": 7, "cool": 7, "standard": 7, "custom": 7}

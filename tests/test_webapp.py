@@ -737,3 +737,35 @@ def test_patch_sticker_text_keeps_line_break(client, tmp_config):
     assert entries["001"].text == "了解！"  # ほかの行は変わらない
     assert client.patch("/api/stickers/999", json={"text": "x"}).status_code == 404
     assert client.patch("/api/stickers/001", json={"text": "  "}).status_code == 400
+
+
+def test_font_store_and_install(client, tmp_config, font_path, monkeypatch):
+    d = client.get("/api/fonts").get_json()
+    item = next(f for f in d["free_fonts"] if f["id"] == "hachi-maru-pop")
+    assert item["installed"] is False and item["category"] == "手書き"
+
+    import httpx
+
+    data = open(font_path, "rb").read()
+
+    class Res:
+        def __init__(self, content):
+            self.content = content
+
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(httpx, "get", lambda url, **kw: Res(b"OFL" if url.endswith("OFL.txt") else data))
+    res = client.post("/api/fonts/install", json={"id": "hachi-maru-pop"})
+    assert res.status_code == 200
+    d = client.get("/api/fonts").get_json()
+    assert any(f["id"] == "hachi-maru-pop" for f in d["fonts"])
+    assert next(f for f in d["free_fonts"] if f["id"] == "hachi-maru-pop")["installed"] is True
+
+    assert client.post("/api/fonts/install", json={"id": "nope"}).status_code == 400
+
+
+def test_font_check_endpoint(client):
+    d = client.get("/api/fonts/check?font_id=biz-ud-gothic").get_json()
+    assert d["missing"] == [] and d["affected_ids"] == []
+    assert client.get("/api/fonts/check?font_id=nope").status_code == 404
