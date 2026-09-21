@@ -27,8 +27,11 @@ def real_config() -> Config:
 
 @pytest.fixture(scope="session")
 def font_path(real_config) -> str:
+    # GUI で選んだフォント（overrides.yaml）に左右されないよう、既定の設定から探します。
+    base = Config(raw=yaml.safe_load(real_config.path.read_text(encoding="utf-8")),
+                  root=real_config.root, path=real_config.path)
     try:
-        return str(resolve_font_path(real_config))
+        return str(resolve_font_path(base))
     except Exception as exc:  # noqa: BLE001
         pytest.skip(f"日本語フォントが見つからないためスキップします: {exc}")
 
