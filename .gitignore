@@ -1,0 +1,36 @@
+# --- 秘密情報 (最重要) ---
+.env
+.env.*
+!.env.example
+*.key
+secrets/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# --- 生成物 ---
+output/generated/*
+output/final/*
+output/main/*
+output/tab/*
+output/packages/*
+output/*.log
+output/state.json
+output/gallery.html
+prompts/generated/*
+!**/.gitkeep
+
+# --- OS / エディタ ---
+Thumbs.db
+desktop.ini
+.DS_Store
+.idea/
+.vscode/

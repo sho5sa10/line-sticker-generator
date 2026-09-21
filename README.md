@@ -1,0 +1,441 @@
+# LINE スタンプ自動生成システム
+
+セリフCSVから、LINE Creators Market へ提出できる透過PNGスタンプ一式（スタンプ画像・メイン画像・タブ画像・ZIP）を自動生成するローカルCLIツールです。
+
+```
+セリフCSV → プロンプト自動生成 → 画像生成API → キャラクター画像
+  → 日本語テキスト合成(Pillow) → LINE規格へリサイズ → 透過PNG化
+  → 余白チェック → 容量チェック → main/tab画像 → 提出用ZIP → gallery.html
+```
+
+**設計の要点**
+
+- 画像生成AIには**日本語を一切描かせません**（誤字・文字化け対策）。AIは「キャラクター＋ポーズ＋表情」だけを描き、セリフは後処理で Pillow により合成します。
+- キャラクターの一貫性は **`data/character/character_master.png`（マスター画像）を参照画像としてAPIへ渡す**方式で確保します。マスター画像を差し替えるだけで別キャラクターのスタンプセットを作れます。
+- 画像生成は Provider 抽象化されており、将来 Gemini / Stability などへ差し替えられます。
+- APIコストを守るため、キャッシュ・dry-run・範囲指定・リトライ・途中再開を標準装備しています。
+
+---
+
+## 1. 必要環境
+
+| 項目 | 要件 | 確認済みの構成 |
+|---|---|---|
+| OS | Windows / macOS / Linux | Windows 11 Pro 22631 |
+| Python | 3.10 以上 | 3.12.10 |
+| 日本語フォント | .ttf / .ttc | `C:\Windows\Fonts\BIZ-UDGothicB.ttc`（自動検出） |
+| 画像生成API | OpenAI APIキー | `gpt-image-1` |
+
+Git は任意です（バージョン管理する場合のみ）。
+
+---
+
+## 2. インストール
+
+```bash
+cd line-sticker-generator
+python -m venv .venv
+```
+
+```bash
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+macOS / Linux の場合は `.venv/bin/python` を使ってください。以降のコマンド例の `python` は、この仮想環境の Python を指します。
+
+---
+
+## 3. APIキーの設定
+
+```bash
+Copy-Item .env.example .env
+```
+
+`.env` を開き、`OPENAI_API_KEY` に自分のキーを記入してください。
+
+```env
+IMAGE_PROVIDER=openai
+OPENAI_API_KEY=sk-...
+IMAGE_MODEL=gpt-image-1
+IMAGE_QUALITY=low
+```
+
+- `.env` は `.gitignore` に含まれており、Gitにコミットされません。
+- APIキーをソースコードや `config/*.yaml` に書かないでください。
+- `IMAGE_QUALITY` は `low` / `medium` / `high`。**まずは `low` で試すことを強く推奨します**（コストが約1/4）。
+
+設定が正しいか確認します（APIは呼びません）。
+
+```bash
+python -m src.main doctor
+```
+
+---
+
+## 4. キャラクターマスター画像の準備
+
+`data/character/character_master.png` が基準画像です。**存在しない場合、システムは `character_master.pngがありません` と明示的にエラーを出して停止します**（勝手に100種類のキャラクターを生成することはありません）。
+
+用意する方法は2つあります。
+
+**A. 自分で用意する**（推奨・無料）
+
+透過PNG・全身・背景なしのキャラクター画像を `data/character/character_master.png` に置いてください。`prompts/character_master.txt` のデザイン指定に沿った画像だと一貫性が高まります。
+
+**B. APIで1枚だけ生成する**（API 1回 ≒ $0.01〜$0.17）
+
+```bash
+python -m src.main init-character --dry-run
+```
+
+```bash
+python -m src.main init-character
+```
+
+生成された画像が気に入らない場合は `--force` で作り直せます。**このマスター画像の出来が100枚すべての品質を決めるので、納得いくまでここで作り込んでください。**
+
+将来、別キャラクターのスタンプを作りたくなったら、このファイルを差し替えるだけです。
+
+---
+
+## 5. セリフCSVの編集
+
+`data/stickers.csv`（UTF-8、100件収録済み）
+
+```csv
+id,text,action,expression,category
+001,了解！,片手でびしっと敬礼する,自信のある笑顔,basic
+```
+
+| カラム | 内容 |
+|---|---|
+| `id` | 3桁の連番。出力ファイル名になります |
+| `text` | スタンプに合成される日本語セリフ |
+| `action` | ポーズ・動作（プロンプトに渡されます） |
+| `expression` | 表情（プロンプトに渡されます） |
+| `category` | 演出のトーン（`basic` `thanks` `work` `surprise` など） |
+
+`text` は画像生成AIには渡されません。後処理でのみ使われます。
+
+---
+
+## 6. プレビュー（APIを呼びません）
+
+生成予定の内容とプロンプトを確認します。
+
+```bash
+python -m src.main preview
+```
+
+```bash
+python -m src.main preview --id 001 --full
+```
+
+プロンプト全文を確認したうえで、API呼び出し数とコスト概算も表示されます。
+
+---
+
+## 7. 生成
+
+### 7-1. まず1枚だけ（必ず最初にこれを実行してください）
+
+```bash
+python -m src.main generate --id 001
+```
+
+`output/final/001.png` を目視確認してから次へ進んでください。
+
+### 7-2. 10枚で確認
+
+```bash
+python -m src.main generate --start 1 --end 10
+```
+
+### 7-3. 100枚すべて
+
+```bash
+python -m src.main generate --start 1 --end 100
+```
+
+実行前にAPI呼び出し数とコスト概算が表示され、確認プロンプトが出ます（`--yes` でスキップ）。
+
+### 7-4. その他
+
+```bash
+python -m src.main generate --dry-run
+```
+
+APIを一切呼ばず、生成予定のプロンプトとコスト概算だけを表示します。
+
+```bash
+python -m src.main generate --id 001 --force
+```
+
+既存画像を無視して強制再生成します（`--force` なしなら `SKIP 001 - already exists` でスキップ）。
+
+```bash
+python -m src.main render
+```
+
+**APIを呼ばずに**、既存の原画からセリフ合成だけをやり直します。フォントサイズや文字色を調整したときはこちらを使ってください（無料）。
+
+---
+
+## 8. バリデーション
+
+```bash
+python -m src.main validate
+```
+
+各画像について以下を検証します。
+
+- PNG形式であること / ファイルが破損していないこと
+- 370×320px 以内、縦横が偶数であること
+- 透過PNGであること、カラーモードが RGB / RGBA であること
+- ファイル容量が 1MB 以下であること
+- 画像が空でないこと
+- コンテンツが画像端に接触していないこと（接触＝ERROR）
+- 余白が10px以上あること（不足＝`WARNING: insufficient margin`）
+
+余白はパイプライン側で自動的に確保されるため、通常は警告は出ません。
+
+---
+
+## 9. ギャラリー確認
+
+```bash
+python -m src.main gallery
+```
+
+`output/gallery.html` が生成されます。ブラウザで開くと100枚のサムネイルとセリフが一覧表示され、クリックで拡大表示できます。
+
+```bash
+start output\gallery.html
+```
+
+---
+
+## 10. ZIP作成
+
+```bash
+python -m src.main package
+```
+
+- `output/main/main.png`（240×240）と `output/tab/tab.png`（96×74）を自動生成します
+- `output/packages/line_stickers_001_040.zip` のようなZIPを作成します
+- ZIP内のファイル名は `01.png` … `NN.png` / `main.png` / `tab.png`
+- 原画・ログなどの中間ファイルは含まれません
+
+> **重要**: LINEの1セットは **8 / 16 / 24 / 32 / 40 個** のいずれかです。100 は 8 の倍数ではないため、100枚は1セットにできません。本ツールは自動で `40 + 40 + 16 = 96枚`（3セット）に分割し、**余った4枚を警告付きで未パッケージとして報告**します。ちょうど使い切りたい場合は、CSVを96件または120件（40+40+40）に調整してください。
+
+---
+
+## 11. LINEへの申請方法
+
+1. [LINE Creators Market](https://creator.line.me/) にログイン
+2. 「新規登録」→「スタンプ」→「スタンプ」を選択
+3. スタンプ名、説明文、販売エリア、テイストなどを入力
+4. 「スタンプ画像」タブで `output/packages/line_stickers_001_040.zip` をアップロード
+5. メイン画像・タブ画像がZIPに含まれているので自動で割り当てられます（個別アップロードも可）
+6. 販売価格を設定して「リクエスト」→ 審査へ
+
+審査には通常数日かかります。審査基準（著作権・肖像権・公序良俗など）は公式ガイドラインを確認してください。
+
+---
+
+## 12. API料金に関する注意
+
+**本ツールは有料APIを呼び出します。実行前に必ずコスト概算を確認してください。**
+
+`gpt-image-1` の 1024×1024 1枚あたりの概算単価（画像出力トークン課金・USD）:
+
+| 画質 | 1枚 | 100枚 |
+|---|---|---|
+| `low` | 約 $0.011 | 約 **$1.1** |
+| `medium` | 約 $0.042 | 約 **$4.2** |
+| `high` | 約 $0.167 | 約 **$16.7** |
+
+- これは概算です。実際の請求額は OpenAI の最新単価に依存します。必ず [公式の料金表](https://platform.openai.com/docs/pricing) を確認してください。
+- 単価表は `src/providers/openai_provider.py` の `PRICE_TABLE_USD` に定義されています。値上げ・値下げがあればここを更新してください。
+- **リトライも課金対象**です。失敗が続くと想定以上の課金になる可能性があります。
+- 生成済み画像は自動的にスキップされるため、再実行しても二重課金は発生しません。
+- 気に入らない画像だけを `--id` で個別に `--force` 再生成するのが最も経済的です。
+
+コストを抑えるチェックリスト:
+
+1. `--dry-run` でプロンプトを確認する（無料）
+2. `IMAGE_QUALITY=low` で 001 を1枚だけ生成する
+3. 良ければ 10枚、最後に 100枚
+4. 文字レイアウトの調整は `render` コマンドで（無料）
+
+---
+
+## 13. LINE仕様の確認記録
+
+**確認日: 2026-09-21**
+
+参照した公式ページ（第三者サイトは参照していません）:
+
+- <https://creator.line.me/ja/guideline/sticker/>
+- <https://creator.line.me/en/guideline/sticker/>
+- <https://creator.line.me/ja/guideline/animationsticker/>（ZIP内のファイル名規則）
+
+| 項目 | 仕様 |
+|---|---|
+| スタンプ画像サイズ | 370 × 320 px（最大） |
+| スタンプ個数 | 8 / 16 / 24 / 32 / 40 個のいずれか |
+| メイン画像 | 240 × 240 px |
+| タブ画像 | 96 × 74 px |
+| ファイル形式 | PNG |
+| カラーモード | RGB（背景は透過） |
+| 解像度 | 72dpi 以上 |
+| 寸法 | 縦・横ともに偶数 |
+| 1ファイル容量 | 1MB 以下 |
+| ZIP容量 | 60MB 以下 |
+| 余白 | 画像の外枠とコンテンツの間に 10px 程度 |
+
+アニメーションスタンプとの違い（本ツールは**通常スタンプ専用**です）:
+
+| | 通常スタンプ | アニメーションスタンプ |
+|---|---|---|
+| サイズ | 370×320 px | 320×270 px |
+| 個数 | 8/16/24/32/40 | 8/16/24 |
+| 形式 | PNG | APNG（5〜20フレーム、最長4秒、ループ1〜4回） |
+
+これらの数値は `config/sticker_config.yaml` の `sticker` / `main` / `tab` / `package` セクションに反映されています。**LINEが仕様を変更した場合は、コードではなくこのYAMLを更新してください。**
+
+---
+
+## 14. コマンド一覧
+
+```bash
+python -m src.main doctor                        # 環境と設定を点検（API未使用）
+python -m src.main init-character                # マスター画像を1枚生成（API 1回）
+python -m src.main preview                       # 生成予定の一覧（API未使用）
+python -m src.main preview --id 001 --full       # プロンプト全文
+python -m src.main generate --dry-run            # プロンプトとコストのみ（API未使用）
+python -m src.main generate --id 001             # 001だけ生成
+python -m src.main generate --start 1 --end 10   # 001〜010
+python -m src.main generate --start 1 --end 100  # 001〜100
+python -m src.main generate --id 001 --force     # 強制再生成
+python -m src.main render                        # 文字合成のみやり直し（API未使用）
+python -m src.main validate                      # LINE仕様チェック
+python -m src.main gallery                       # gallery.html 生成
+python -m src.main package                       # main/tab画像 + ZIP生成
+```
+
+---
+
+## 15. ディレクトリ構成
+
+```
+line-sticker-generator/
+├── README.md
+├── .env.example            # .env のひな形（APIキーは .env にのみ書く）
+├── .gitignore              # .env と output/ を除外
+├── requirements.txt
+├── pytest.ini
+├── config/
+│   └── sticker_config.yaml # LINE仕様・フォント・生成設定
+├── data/
+│   ├── stickers.csv        # セリフ100件
+│   └── character/
+│       └── character_master.png   # 基準キャラクター画像（要準備）
+├── prompts/
+│   ├── character_master.txt       # キャラクター・マスタープロンプト
+│   └── generated/                 # 実際に送信したプロンプトの記録
+├── src/
+│   ├── main.py             # CLI
+│   ├── config.py           # YAML + .env
+│   ├── csv_loader.py       # CSV読み込み・範囲指定
+│   ├── prompt_generator.py # プロンプト組み立て
+│   ├── image_generator.py  # キャッシュ・リトライ・再開
+│   ├── image_processor.py  # 透過・トリム・リサイズ・合成・保存
+│   ├── text_renderer.py    # 日本語描画・自動改行・禁則処理
+│   ├── validator.py        # LINE仕様チェック
+│   ├── package_builder.py  # main/tab画像・セット分割・ZIP
+│   ├── gallery.py          # gallery.html
+│   ├── logger.py           # generation.log / state.json
+│   └── providers/
+│       ├── base.py             # ImageGenerationProvider 抽象基底
+│       ├── openai_provider.py  # OpenAI 実装
+│       └── __init__.py         # ファクトリ・単価表
+├── tests/                  # APIを呼ばない単体テスト（87件）
+└── output/
+    ├── generated/          # APIが返した原画（以降の工程で破壊しません）
+    ├── final/              # LINE規格の完成画像
+    ├── main/  tab/  packages/
+    ├── generation.log      # 処理ログ
+    ├── state.json          # 進捗（途中再開に使用）
+    └── gallery.html
+```
+
+---
+
+## 16. テスト
+
+```bash
+.\.venv\Scripts\python.exe -m pytest
+```
+
+87件のテストがすべてAPIを呼ばずに実行されます（CSV読み込み、画像サイズ、透過、容量、余白、日本語描画・自動改行、ZIP生成、既存ファイルスキップ、範囲指定、リトライ、途中再開など）。
+
+APIを呼ぶテストを書く場合は `@pytest.mark.api` を付けてください。既定では除外され、`pytest -m api` でのみ実行されます。
+
+---
+
+## 17. ログと途中再開
+
+`output/generation.log` に処理履歴が残ります。
+
+```
+001 START
+001 API REQUEST - attempt 1/3
+001 IMAGE GENERATED - 001.png
+001 TEXT RENDERED - 16KB
+001 VALIDATION PASS
+001 COMPLETE
+```
+
+エラー時:
+
+```
+035 ERROR
+035 REASON - RateLimitError: ...
+```
+
+生成済み画像は `output/generated/` に残るため、**同じコマンドを再実行するだけで失敗したIDから再開できます**。IDごとの状態は `output/state.json` にも記録されます。
+
+Ctrl+C で中断しても、その時点までの画像は保持されます。
+
+---
+
+## 18. トラブルシューティング
+
+| 症状 | 対処 |
+|---|---|
+| `character_master.pngがありません` | セクション4の手順でマスター画像を用意してください |
+| `OPENAI_API_KEY が設定されていません` | `.env` を作成し、キーを記入。`python -m src.main doctor` で確認 |
+| `日本語フォントが見つかりません` | `config/sticker_config.yaml` の `font.path` に .ttf/.ttc の絶対パスを設定 |
+| 文字が小さすぎる / 大きすぎる | `font.size` と `font.min_size` を調整し、`python -m src.main render` で無料で再合成 |
+| 文字がキャラに重なる | `font.band_ratio`（テキスト帯の高さ比）を上げる。`font.position: top` で上寄せも可能 |
+| 文字が3行以上になる | `font.max_lines` を増やすか、CSVのセリフを短くする |
+| `WARNING: insufficient margin` | `sticker.margin` を確認。通常は自動で確保されます |
+| キャラクターの見た目がバラバラ | マスター画像を作り直す／`prompts/character_master.txt` をより具体的にする／`generation.quality` を上げる |
+| 背景が透過されない | `make_background_transparent()` が四隅の色から自動で透過を試みます。それでも駄目ならプロンプトの `Transparent background` を強調 |
+| 容量が1MBを超える | 自動で減色されます。ログに減色の警告が出ます |
+| `SKIP 001 - already exists` を回避したい | `--force` を付ける |
+| Windowsで日本語が文字化けする | `$env:PYTHONIOENCODING="utf-8"` を設定してから実行 |
+| ZIPが作れない / 枚数が合わない | LINEは8の倍数（最大40）単位です。セクション10を参照 |
+
+---
+
+## 19. 実装上のルール
+
+1. APIキーはコードに書かない（`.env` のみ）
+2. `.env` はGit管理対象外
+3. 生成済み画像を自動削除しない
+4. 原画（`output/generated/`）を上書き・破壊しない
+5. APIを無駄に実行しない（キャッシュ・dry-run・範囲指定）
+6. まず1枚 → 10枚 → 100枚の順で確認する
+7. エラー時は途中から再開できる

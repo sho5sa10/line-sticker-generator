@@ -1,0 +1,117 @@
+# ============================================================
+# LINE Sticker Generator - 設定ファイル
+#
+# LINE Creators Market 公式ガイドライン確認日: 2026-09-21
+#   https://creator.line.me/ja/guideline/sticker/
+#   https://creator.line.me/en/guideline/sticker/
+#   https://creator.line.me/ja/guideline/animationsticker/  (ZIP内のファイル名規則)
+# ============================================================
+
+line_spec:
+  checked_at: "2026-09-21"
+  sources:
+    - "https://creator.line.me/ja/guideline/sticker/"
+    - "https://creator.line.me/en/guideline/sticker/"
+
+# --- 入力データ -----------------------------------------------
+data:
+  csv: "data/stickers.csv"
+
+# --- 通常スタンプ画像 -----------------------------------------
+sticker:
+  width: 370          # 最大 370px
+  height: 320         # 最大 320px
+  margin: 10          # 画像端からの余白(px)。公式推奨「10pxぐらい」
+  max_file_size_mb: 1 # 1ファイル 1MB以下
+  require_even_dimensions: true  # 公式: 縦横ともに偶数であること
+  min_dpi: 72
+
+# --- メイン画像 -----------------------------------------------
+main:
+  width: 240
+  height: 240
+  margin: 10
+  # "auto" = 生成済み画像のうち最もキャラクターが大きく写っているものを採用
+  # "001" のようにID直接指定も可能
+  source_id: "auto"
+  with_text: false    # メイン画像にはセリフを載せない
+
+# --- トークルームタブ画像 -------------------------------------
+tab:
+  width: 96
+  height: 74
+  margin: 4           # 96x74 は小さいため比例縮小した余白
+  source_id: "auto"
+  with_text: false
+
+# --- ZIPパッケージ --------------------------------------------
+package:
+  # 公式: 1セットは 8 / 16 / 24 / 32 / 40 個のいずれか
+  valid_set_sizes: [8, 16, 24, 32, 40]
+  max_zip_size_mb: 60
+  # ZIP内のファイル名規則: 01.png ... NN.png / main.png / tab.png
+  sticker_filename_format: "{index:02d}.png"
+  main_filename: "main.png"
+  tab_filename: "tab.png"
+  # デフォルトのセット分割（合計96枚 = 40+40+16）。
+  # 100は8の倍数でないため1セットに収まりません。
+  auto_split: true
+
+# --- 日本語テキスト描画 ---------------------------------------
+font:
+  # 空文字 "" の場合は font.candidates から自動検出します。
+  # 明示指定する場合は絶対パスを書いてください。
+  path: ""
+  index: 0                 # .ttc 内のフォント番号
+  candidates:
+    - "C:/Windows/Fonts/BIZ-UDGothicB.ttc"   # BIZ UDゴシック Bold (小サイズ視認性◎)
+    - "C:/Windows/Fonts/meiryob.ttc"          # メイリオ Bold
+    - "C:/Windows/Fonts/YuGothB.ttc"          # 游ゴシック Bold
+    - "C:/Windows/Fonts/NotoSansJP-VF.ttf"
+    - "C:/Windows/Fonts/msgothic.ttc"
+    - "/System/Library/Fonts/ヒラギノ角ゴシック W6.ttc"
+    - "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"
+    - "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf"
+  size: 60                 # 上限サイズ。収まらなければ自動で縮小します
+  min_size: 26             # これ以下には縮小しない（視認性の下限）
+  stroke_width: 7          # 縁取りの太さ
+  fill: "#FFFFFF"          # 文字色
+  stroke_fill: "#000000"   # 縁取り色
+  position: "bottom"       # bottom | top
+  max_lines: 3
+  line_spacing: 1.06
+  # テキスト帯がスタンプ高さに占める最大比率。キャラの顔を隠さないための上限
+  band_ratio: 0.40
+  gap: 4                   # キャラクターとテキストの間隔(px)
+
+# --- キャラクター ---------------------------------------------
+character:
+  master_image: "data/character/character_master.png"
+  master_prompt: "prompts/character_master.txt"
+  # マスター画像を参照画像としてAPIに渡す（一貫性向上）
+  use_as_reference: true
+
+# --- 画像生成 -------------------------------------------------
+generation:
+  provider: "openai"       # .env の IMAGE_PROVIDER が優先されます
+  model: "gpt-image-1"     # .env の IMAGE_MODEL が優先されます
+  size: "1024x1024"
+  quality: "medium"        # low | medium | high  (コストに直結します)
+  background: "transparent"
+  output_format: "png"
+  retries: 3
+  retry_backoff_sec: 3
+  timeout_sec: 180
+  skip_existing: true
+  save_prompt: true        # prompts/generated/ に実際のプロンプトを保存
+
+# --- 出力先 ---------------------------------------------------
+output:
+  generated: "output/generated"   # APIが返した加工前の原画（破壊しない）
+  final: "output/final"           # LINE規格の完成画像
+  main: "output/main"
+  tab: "output/tab"
+  packages: "output/packages"
+  log: "output/generation.log"
+  state: "output/state.json"
+  gallery: "output/gallery.html"
