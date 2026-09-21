@@ -12,6 +12,7 @@ const state = {
   eventOffset: 0,
   poller: null,
   csvDirty: false,
+  validated: false,
 };
 
 /* ------------------------------------------------------------------ */
@@ -51,6 +52,207 @@ document.addEventListener('keydown', (e) => {
 });
 
 /* ------------------------------------------------------------------ */
+/* ツールチップ（data-tip 属性を持つ要素にホバーで説明を出す）          */
+/* ------------------------------------------------------------------ */
+(function setupTooltips() {
+  const tip = $('#tip');
+  let target = null;
+
+  function place(el) {
+    const r = el.getBoundingClientRect();
+    tip.textContent = el.dataset.tip;
+    tip.classList.add('show');
+    const tr = tip.getBoundingClientRect();
+    let left = r.left + r.width / 2 - tr.width / 2;
+    left = Math.max(8, Math.min(left, window.innerWidth - tr.width - 8));
+    // 下に入りきらなければ上に出す
+    let top = r.bottom + 8;
+    if (top + tr.height > window.innerHeight - 8) top = r.top - tr.height - 8;
+    tip.style.left = `${left}px`;
+    tip.style.top = `${Math.max(8, top)}px`;
+  }
+
+  document.addEventListener('mouseover', (e) => {
+    const el = e.target.closest('[data-tip]');
+    if (!el || el === target) return;
+    target = el;
+    place(el);
+  });
+  document.addEventListener('mouseout', (e) => {
+    if (!target) return;
+    if (e.relatedTarget && target.contains(e.relatedTarget)) return;
+    target = null;
+    tip.classList.remove('show');
+  });
+  window.addEventListener('scroll', () => { target = null; tip.classList.remove('show'); }, true);
+})();
+
+/* ------------------------------------------------------------------ */
+/* 進め方ガイド                                                        */
+/* ------------------------------------------------------------------ */
+function readLS(key, fallback) {
+  try { const v = localStorage.getItem(key); return v === null ? fallback : v; }
+  catch (e) { return fallback; }
+}
+function writeLS(key, value) {
+  try { localStorage.setItem(key, value); } catch (e) { /* プライベートモード等 */ }
+}
+
+function switchTab(name) {
+  const tab = document.querySelector(`.tab[data-tab="${name}"]`);
+  if (tab) tab.click();
+}
+
+/** いまの状態から各ステップの達成状況を判定します。 */
+function computeSteps(info) {
+  const total = info.stickers.length;
+  const raw = info.stickers.filter((s) => s.has_raw).length;
+  const final = info.stickers.filter((s) => s.has_final).length;
+  const ready = info.api_key_set && !info.font_error && !info.csv_error;
+
+  return [
+    {
+      n: 1, key: 'setup', title: '準備を整える',
+      desc: ready
+        ? `APIキー・フォント・CSV(${total}件) すべてOK`
+        : [!info.api_key_set && 'APIキー未設定', info.font_error && 'フォント未検出',
+           info.csv_error && 'CSVエラー'].filter(Boolean).join(' / '),
+      done: ready, blocked: !ready,
+      action: null,
+      help: '.env に OPENAI_API_KEY を書いてから、このページを再読み込みしてください。',
+    },
+    {
+      n: 2, key: 'character', title: 'キャラクターを決める',
+      desc: info.master_ok
+        ? 'マスター画像あり。全スタンプがこの絵柄で作られます'
+        : 'data/character/character_master.png がまだありません',
+      done: info.master_ok, blocked: !info.master_ok && ready,
+      action: null,
+      help: 'ターミナルで python -m src.main init-character を実行するか、'
+          + '透過PNGを data/character/character_master.png に置いてください。',
+    },
+    {
+      n: 3, key: 'try', title: 'まず1枚だけ試す',
+      desc: raw ? `${raw}枚の画像ができています` : '001を1枚だけ作って絵柄を確認します',
+      done: raw >= 1, blocked: false,
+      action: { label: '001を1枚だけ生成', run: () => tryOne() },
+    },
+    {
+      n: 4, key: 'design', title: '文字の見た目を整える',
+      desc: raw
+        ? '大きさ・色・縁取りをその場で確認できます（APIを使わないので無料）'
+        : '1枚作るとプレビューできるようになります',
+      done: final >= 1, blocked: false, optional: true,
+      action: { label: '文字デザインを開く', run: () => switchTab('design') },
+    },
+    {
+      n: 5, key: 'rest', title: '残りをまとめて生成',
+      desc: raw >= total && total
+        ? `${total}枚すべて生成済み`
+        : `残り${Math.max(total - raw, 0)}枚。料金は実行前に確認できます`,
+      done: total > 0 && raw >= total, blocked: false,
+      action: { label: '未生成をまとめて選ぶ', run: () => selectMissing() },
+    },
+    {
+      n: 6, key: 'validate', title: 'LINE仕様を検証',
+      desc: state.validated
+        ? '検証に通りました'
+        : 'サイズ・透過・容量・余白をまとめてチェックします',
+      done: !!state.validated, blocked: false,
+      action: { label: '検証する', run: () => { switchTab('output'); $('#btn-validate').click(); } },
+    },
+    {
+      n: 7, key: 'package', title: '提出用ZIPを作る',
+      desc: info.packages.length
+        ? `${info.packages.length}個のZIPができています`
+        : 'main画像・tab画像も一緒に作ります',
+      done: info.packages.length > 0, blocked: false,
+      action: { label: 'ZIPを作る', run: () => { switchTab('output'); $('#btn-package').click(); } },
+    },
+  ];
+}
+
+function renderGuide() {
+  const info = state.info;
+  if (!info) return;
+  const steps = computeSteps(info);
+  const current = steps.find((s) => !s.done && !s.optional) || null;
+
+  $('#steps').innerHTML = steps.map((s) => {
+    const cls = s.done ? 'done' : s.blocked ? 'blocked'
+      : (current && s.key === current.key) ? 'current' : 'todo';
+    return `<li class="step ${cls}" data-step="${s.key}" data-tip="${escapeHtml(s.help || s.desc)}">
+      <span class="num"><span>${s.n}</span></span>
+      <span>
+        <span class="st">${escapeHtml(s.title)}${s.optional ? '<span class="sd">（任意）</span>' : ''}</span>
+        <span class="sd">${escapeHtml(s.desc)}</span>
+      </span>
+    </li>`;
+  }).join('');
+
+  const box = $('#next-action');
+  box.className = 'next';
+  if (!current) {
+    box.classList.add('finished');
+    $('#next-title').textContent = 'すべて完了しました';
+    $('#next-desc').textContent = '「検証・出力」タブからZIPをダウンロードして、LINE Creators Market に申請できます。';
+    $('#btn-next').textContent = 'ZIPを確認する';
+    $('#btn-next').onclick = () => switchTab('output');
+    return;
+  }
+  if (current.blocked) box.classList.add('blocked');
+  $('#next-title').textContent = `${current.n}. ${current.title}`;
+  $('#next-desc').textContent = current.blocked ? (current.help || current.desc) : current.desc;
+  const btn = $('#btn-next');
+  if (current.action && !current.blocked) {
+    btn.style.display = '';
+    btn.textContent = current.action.label;
+    btn.onclick = current.action.run;
+  } else {
+    btn.style.display = 'none';
+  }
+}
+
+$('#steps').addEventListener('click', (e) => {
+  const li = e.target.closest('.step');
+  if (!li) return;
+  ({
+    setup: () => toast('.env の OPENAI_API_KEY を設定してページを再読み込みしてください'),
+    character: () => toast('python -m src.main init-character でマスター画像を作れます'),
+    try: () => switchTab('grid'),
+    design: () => switchTab('design'),
+    rest: () => selectMissing(),
+    validate: () => switchTab('output'),
+    package: () => switchTab('output'),
+  }[li.dataset.step] || (() => {}))();
+});
+
+$('#btn-guide-toggle').addEventListener('click', () => {
+  const guide = $('#guide');
+  guide.hidden = !guide.hidden;
+  writeLS('guide.hidden', guide.hidden ? '1' : '0');
+});
+
+function tryOne() {
+  switchTab('grid');
+  const first = state.stickers[0];
+  if (!first) { toast('CSVにスタンプがありません', true); return; }
+  state.selected = new Set([first.id]);
+  renderGrid();
+  $('#btn-generate').click();
+}
+
+function selectMissing() {
+  switchTab('grid');
+  state.selected = new Set(state.stickers.filter((s) => !s.has_raw).map((s) => s.id));
+  renderGrid();
+  if (!state.selected.size) toast('未生成のスタンプはありません');
+  else toast(`未生成の${state.selected.size}枚を選びました。「選択した画像を生成」で開始できます`);
+}
+
+$('#btn-try-one').addEventListener('click', tryOne);
+
+/* ------------------------------------------------------------------ */
 /* タブ                                                                */
 /* ------------------------------------------------------------------ */
 $('#tabs').addEventListener('click', (e) => {
@@ -74,6 +276,8 @@ async function loadState() {
   renderCsvTable();
   fillDesignControls(info.font);
   fillDesignTargets();
+  $('#guide').hidden = readLS('guide.hidden', '0') === '1';
+  renderGuide();
   if (info.job && info.job.status === 'running') startPolling();
   const notes = [];
   if (info.csv_error) notes.push(`CSVエラー: ${info.csv_error}`);
@@ -133,6 +337,7 @@ function renderGrid() {
       </div>`;
   }).join('');
   $('#grid').innerHTML = html;
+  $('#grid-empty').hidden = state.stickers.some((s) => s.has_raw || s.has_final);
   updateSelectionUi();
 }
 
@@ -302,7 +507,11 @@ async function pollJob() {
 async function refreshStickers() {
   const d = await api('/api/stickers');
   state.stickers = d.stickers;
+  if (state.info) state.info.stickers = d.stickers;
+  state.validated = false;  // 画像が変わったので検証をやり直す必要があります
   renderGrid();
+  fillDesignTargets();
+  renderGuide();
 }
 
 /* ------------------------------------------------------------------ */
@@ -362,10 +571,12 @@ $('#btn-csv-save').addEventListener('click', async () => {
   try {
     const d = await api('/api/stickers', { method: 'POST', body: { stickers: rows } });
     state.stickers = d.stickers;
+    if (state.info) state.info.stickers = d.stickers;
     state.csvDirty = false;
     renderCsvTable();
     renderGrid();
     fillDesignTargets();
+    renderGuide();
     toast(`保存しました（${d.count}件）`);
   } catch (e) { toast(e.message, true); }
 });
@@ -499,6 +710,8 @@ $('#btn-validate').addEventListener('click', async () => {
     d.items.forEach((it) => it.issues.forEach((i) =>
       lines.push(`<div class="line ${i.severity}">[${i.severity}] ${escapeHtml(it.file)}: ${escapeHtml(i.message)}</div>`)));
     box.innerHTML = lines.join('');
+    state.validated = d.checked > 0 && d.errors === 0;
+    renderGuide();
   } catch (e) { box.innerHTML = `<div class="line ERROR">${escapeHtml(e.message)}</div>`; }
 });
 
@@ -520,6 +733,10 @@ $('#btn-package').addEventListener('click', async () => {
     });
     box.innerHTML = lines.join('');
     loadAssets();
+    if (state.info) {
+      state.info.packages = d.packages.filter((p) => p.downloadable).map((p) => p.name);
+      renderGuide();
+    }
   } catch (e) { box.innerHTML = `<div class="line ERROR">${escapeHtml(e.message)}</div>`; }
 });
 

@@ -14,7 +14,25 @@
     <span>スタンプ自動生成</span>
   </div>
   <div id="status-chips" class="chips"></div>
+  <button class="btn small ghost" id="btn-guide-toggle" data-tip="進め方のガイドを表示/非表示します">ガイド</button>
 </header>
+
+<!-- ===== 進め方ガイド ===== -->
+<section class="guide" id="guide">
+  <div class="guide-head">
+    <h2>進め方</h2>
+    <p id="guide-lead">いまどこまで進んでいるかを自動で判定しています。緑のボタンを押すだけで次に進めます。</p>
+  </div>
+  <ol class="steps" id="steps"></ol>
+  <div class="next" id="next-action">
+    <div class="next-text">
+      <span class="next-label">次にやること</span>
+      <strong id="next-title"></strong>
+      <span id="next-desc"></span>
+    </div>
+    <button class="btn primary" id="btn-next"></button>
+  </div>
+</section>
 
 <nav class="tabs" id="tabs">
   <button class="tab active" data-tab="grid">スタンプ一覧</button>
@@ -28,23 +46,39 @@
   <section class="panel active" id="panel-grid">
     <div class="toolbar">
       <div class="group">
-        <button class="btn" data-select="all">全選択</button>
-        <button class="btn" data-select="none">選択解除</button>
-        <button class="btn" data-select="missing">未生成のみ</button>
-        <button class="btn" data-select="invert">選択反転</button>
+        <button class="btn" data-select="all" data-tip="CSVの全スタンプを選びます">全選択</button>
+        <button class="btn" data-select="none" data-tip="選択をすべて外します">選択解除</button>
+        <button class="btn" data-select="missing"
+                data-tip="まだ画像が無いものだけを選びます。続きから生成したいときに使います">未生成のみ</button>
+        <button class="btn" data-select="invert" data-tip="選んでいるものと選んでいないものを入れ替えます">選択反転</button>
         <span class="count" id="selection-count">0枚選択中</span>
       </div>
       <div class="group">
-        <label class="check"><input type="checkbox" id="opt-force"> 強制再生成（課金されます）</label>
-        <label class="check"><input type="checkbox" id="opt-dryrun"> dry-run（APIを呼ばない）</label>
+        <label class="check"
+               data-tip="ふだんはOFFのままで大丈夫です。既に画像があるものも作り直すので、その分だけ追加で課金されます">
+          <input type="checkbox" id="opt-force"> 強制再生成（課金されます）</label>
+        <label class="check"
+               data-tip="APIを一切呼ばずに、送信予定のプロンプトだけを確認します。料金はかかりません">
+          <input type="checkbox" id="opt-dryrun"> dry-run（APIを呼ばない）</label>
       </div>
       <div class="group right">
-        <span class="cost" id="cost-label">—</span>
-        <button class="btn ghost" id="btn-render">文字だけ再合成（無料）</button>
-        <button class="btn primary" id="btn-generate">選択した画像を生成</button>
+        <span class="cost" id="cost-label"
+              data-tip="実際にAPIを呼ぶ枚数と概算料金です。すでに画像があるものは数に入りません">—</span>
+        <button class="btn ghost" id="btn-render"
+                data-tip="APIを呼ばずに、既にある画像の文字だけを貼り直します。無料です">文字だけ再合成（無料）</button>
+        <button class="btn primary" id="btn-generate"
+                data-tip="選択したスタンプの画像をAPIで生成します。実行前に料金の確認が出ます">選択した画像を生成</button>
       </div>
     </div>
     <div class="note" id="grid-note"></div>
+    <div class="empty-state" id="grid-empty" hidden>
+      <h3>まだスタンプ画像がありません</h3>
+      <p>
+        いきなり100枚作らず、<b>まず001を1枚だけ</b>作って絵柄を確かめるのがおすすめです。<br>
+        1枚あたりの料金はごくわずかですが、100枚まとめて失敗すると無駄になります。
+      </p>
+      <button class="btn primary" id="btn-try-one">001だけ試しに生成する</button>
+    </div>
     <div class="grid" id="grid"></div>
   </section>
 
@@ -57,7 +91,8 @@
       </div>
       <div class="group right">
         <span class="hint">保存すると data/stickers.csv を更新します（上書き前に .bak を作成）</span>
-        <button class="btn primary" id="btn-csv-save">CSVを保存</button>
+        <button class="btn primary" id="btn-csv-save"
+                data-tip="data/stickers.csv を更新します。画像は作り直されません">CSVを保存</button>
       </div>
     </div>
     <div class="tablewrap">
@@ -83,27 +118,27 @@
           <label>プレビュー用セリフ（保存されません）</label>
           <input type="text" id="design-text" placeholder="CSVのセリフを使用">
         </div>
-        <div class="field">
+        <div class="field" data-tip="長いセリフは自動で小さくなります。これはその上限です">
           <label>文字サイズ上限 <b id="v-size"></b> px</label>
           <input type="range" id="f-size" min="24" max="110" step="2">
         </div>
-        <div class="field">
+        <div class="field" data-tip="これ以上は小さくしません。小さすぎるとLINEで読めなくなります">
           <label>最小サイズ <b id="v-min_size"></b> px</label>
           <input type="range" id="f-min_size" min="16" max="60" step="2">
         </div>
-        <div class="field">
+        <div class="field" data-tip="文字のフチの太さ。太いほど背景に負けず読みやすくなります">
           <label>縁取りの太さ <b id="v-stroke_width"></b> px</label>
           <input type="range" id="f-stroke_width" min="0" max="16" step="1">
         </div>
-        <div class="field">
+        <div class="field" data-tip="この行数を超えないように文字サイズが自動調整されます">
           <label>最大行数 <b id="v-max_lines"></b></label>
           <input type="range" id="f-max_lines" min="1" max="4" step="1">
         </div>
-        <div class="field">
+        <div class="field" data-tip="文字に使う高さの割合。大きくすると文字は大きく、キャラは小さくなります">
           <label>テキスト帯の高さ <b id="v-band_ratio"></b></label>
           <input type="range" id="f-band_ratio" min="0.15" max="0.6" step="0.01">
         </div>
-        <div class="field">
+        <div class="field" data-tip="キャラクターと文字のすき間">
           <label>キャラとの間隔 <b id="v-gap"></b> px</label>
           <input type="range" id="f-gap" min="0" max="30" step="1">
         </div>
@@ -128,8 +163,10 @@
           <button class="btn" id="btn-swap-colors">白黒を入れ替える</button>
         </div>
         <div class="actions">
-          <button class="btn primary" id="btn-design-save">この設定を保存</button>
-          <button class="btn ghost" id="btn-design-apply">保存して全部に再適用（無料）</button>
+          <button class="btn primary" id="btn-design-save"
+                  data-tip="これから作るスタンプにこの設定が使われます">この設定を保存</button>
+          <button class="btn ghost" id="btn-design-apply"
+                  data-tip="既に作ったスタンプの文字も、この設定で全部貼り直します。APIは呼びません">保存して全部に再適用（無料）</button>
         </div>
         <p class="hint">
           ここでの調整は画像生成APIを使いません。何度でも無料でやり直せます。
@@ -160,14 +197,16 @@
       <div class="card">
         <h3>バリデーション</h3>
         <p class="hint">LINE仕様（サイズ・透過・容量・余白・偶数寸法）を検証します。</p>
-        <button class="btn primary" id="btn-validate">検証する</button>
+        <button class="btn primary" id="btn-validate"
+                data-tip="申請前の最終チェックです。ここでエラーが0なら仕様面の心配はありません">検証する</button>
         <div id="validate-result" class="result"></div>
       </div>
 
       <div class="card">
         <h3>main画像 / tab画像 / ZIP</h3>
         <p class="hint">提出用ZIPを作成します。LINEの1セットは8/16/24/32/40枚単位です。</p>
-        <button class="btn primary" id="btn-package">main・tab・ZIPを作成</button>
+        <button class="btn primary" id="btn-package"
+                data-tip="LINE Creators Market にそのままアップロードできるZIPを作ります">main・tab・ZIPを作成</button>
         <div class="assets">
           <figure><img id="asset-main" alt="main"><figcaption>main 240×240</figcaption></figure>
           <figure><img id="asset-tab" alt="tab"><figcaption>tab 96×74</figcaption></figure>
@@ -208,6 +247,7 @@
 <div id="lightbox"><img id="lb-img" alt=""><div id="lb-cap"></div></div>
 
 <div id="toast" class="toast"></div>
+<div id="tip" class="tip"></div>
 
 <script src="/static/app.js"></script>
 </body>
