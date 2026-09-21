@@ -313,8 +313,6 @@ def create_app(config=None) -> Flask:
         info = {
             "path": str(p),
             "exists": p.exists(),
-            "prompt": "",
-            "prompt_path": str(cfg_.master_prompt_path),
             "raw_count": len(list(cfg_.dir_generated.glob("*.png"))),
             "final_count": len(list(cfg_.dir_final.glob("*.png"))),
             "backups": sorted(b.name for b in p.parent.glob("character_master_*.png")),
@@ -327,23 +325,47 @@ def create_app(config=None) -> Flask:
                 info["size_kb"] = round(p.stat().st_size / 1024, 1)
             except Exception as exc:  # noqa: BLE001
                 info["error"] = f"画像を読み込めません: {exc}"
-        # ファイルが無くても組み込みの既定プロンプトを返し、編集欄が空にならないようにします。
-        from .prompt_generator import load_master_prompt
-
-        info["prompt"] = load_master_prompt(cfg_.master_prompt_path)
+        info.update(_prompt_info(cfg_))
         return jsonify(info)
+
+    def _prompt_info(cfg_) -> dict:
+        """マスタープロンプトの状態。日本語版があればそれが使われます。"""
+        from .prompt_generator import (
+            DEFAULT_CHARACTER_JA,
+            FIXED_STYLE_PROMPT,
+            master_prompt_from_config,
+        )
+
+        ja_path = cfg_.master_prompt_ja_path
+        ja_text = ja_path.read_text(encoding="utf-8").strip() if ja_path.exists() else ""
+        return {
+            # 編集欄が空にならないよう、未作成なら初期値（日本語）を返します。
+            "prompt_ja": ja_text or DEFAULT_CHARACTER_JA,
+            "prompt_mode": "ja" if ja_text else "en",
+            "prompt_ja_path": str(ja_path),
+            "prompt_en_path": str(cfg_.master_prompt_path),
+            "fixed_prompt": FIXED_STYLE_PROMPT,
+            "full_prompt": master_prompt_from_config(cfg_),
+        }
 
     @app.post("/api/master/prompt")
     def api_master_prompt():
+        """日本語のキャラクター説明を保存します。
+
+        英語版（prompts/character_master.txt）は書き換えません。
+        日本語版を空にして保存したい場合は、英語版へ戻すことになるため拒否します。
+        """
         cfg_ = current_config()
         body = request.get_json(silent=True) or {}
-        text = str(body.get("prompt", "")).strip()
+        text = str(body.get("prompt_ja", "")).strip()
         if not text:
-            return jsonify({"error": "プロンプトが空です"}), 400
-        path = cfg_.master_prompt_path
+            return jsonify({"error": "キャラクターの説明が空です"}), 400
+        path = cfg_.master_prompt_ja_path
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text + "\n", encoding="utf-8")
-        return jsonify({"saved_to": str(path)})
+        body = {"saved_to": str(path)}
+        body.update(_prompt_info(cfg_))
+        return jsonify(body)
 
     def _backup_master(path: Path) -> str | None:
         """既存のマスター画像を退避します（削除はしません）。"""
@@ -411,13 +433,13 @@ def create_app(config=None) -> Flask:
         return jsonify({"restored": name})
 
     def _run_master(job: Job) -> None:
-        from .prompt_generator import CONSISTENCY_RULE, NO_TEXT_RULE, load_master_prompt
+        from .prompt_generator import CONSISTENCY_RULE, NO_TEXT_RULE, master_prompt_from_config
         from .providers import create_provider
 
         cfg_ = current_config()
         prompt = "\n\n".join(
             [
-                load_master_prompt(cfg_.master_prompt_path),
+                master_prompt_from_config(cfg_),
                 "POSE: standing straight and relaxed, facing forward, arms down naturally.\n"
                 "FACIAL EXPRESSION: calm friendly smile.\n"
                 "This is the reference sheet image that defines the character design.",

@@ -14,7 +14,7 @@ from pathlib import Path
 
 from .csv_loader import StickerEntry
 from .importer import archive_existing
-from .prompt_generator import build_prompt, load_master_prompt, save_prompt
+from .prompt_generator import build_prompt, master_prompt_from_config, save_prompt
 from .providers import (
     ProviderError,
     RetryableProviderError,
@@ -66,7 +66,7 @@ class ImageGenerator:
         self.logger = logger
         self.state = state
         self.dry_run = dry_run
-        self.master_prompt = load_master_prompt(config.master_prompt_path)
+        self.master_prompt = master_prompt_from_config(config)
         self._provider = None
         self._reference: str | None = None
 

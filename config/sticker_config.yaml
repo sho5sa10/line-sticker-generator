@@ -88,6 +88,9 @@ font:
 character:
   master_image: "data/character/character_master.png"
   master_prompt: "prompts/character_master.txt"
+  # 日本語でキャラクターを書くファイル。中身があれば英語版より優先されます。
+  # 背景透過・全身・枠なしなどの技術的な指示は英語で自動的に付け足されます。
+  master_prompt_ja: "prompts/character_master_ja.txt"
   # マスター画像を参照画像としてAPIに渡す（一貫性向上）
   use_as_reference: true
 

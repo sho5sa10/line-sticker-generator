@@ -101,13 +101,29 @@
 
         <div class="warn-box" id="master-warn" hidden></div>
 
-        <details class="promptbox">
-          <summary>キャラクターの指定（マスタープロンプト）を編集する</summary>
+        <details class="promptbox" open>
+          <summary>キャラクターの特徴（日本語で書けます）</summary>
           <p class="hint">
-            AIでマスター画像を作るときに使われる指示です。髪型・服装・頭身などを変えたいときはここを書き換えてください。
+            AIで画像を作るときに使われる、キャラクターの説明です。髪型・服装・頭身・雰囲気などを、
+            <b>1行に1つずつ日本語で</b>書いてください。マスター画像にも、100枚のスタンプすべてにも使われます。
           </p>
-          <textarea id="master-prompt" spellcheck="false"></textarea>
-          <button class="btn" id="btn-prompt-save">プロンプトを保存</button>
+          <textarea id="master-prompt" spellcheck="false"
+                    placeholder="例）&#10;20代くらいの女性。&#10;茶色のボブヘア。&#10;黄色いパーカー。&#10;2頭身のちびキャラ。"></textarea>
+          <div class="prompt-actions">
+            <button class="btn primary" id="btn-prompt-save"
+                    data-tip="保存すると、これから作る画像から使われます。作成済みの画像は変わりません">この内容で保存</button>
+            <span class="hint" id="prompt-mode"></span>
+          </div>
+
+          <details class="fixedbox">
+            <summary>自動で付け足される指示と、実際にAIへ送る内容を見る</summary>
+            <p class="hint">
+              「背景を透明にする」「全身を描く」「枠や透かしを入れない」など、スタンプとして使うために欠かせない指示は、
+              AIが最も確実に従う<b>英語のまま自動で付け足します</b>。ここは書き換える必要はありません。
+              また、画像に文字を描かせない指示と、ポーズ・表情の指示も、スタンプごとに自動で追加されます。
+            </p>
+            <pre id="master-prompt-full" class="logview"></pre>
+          </details>
         </details>
       </div>
     </div>

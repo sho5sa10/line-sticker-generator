@@ -173,7 +173,7 @@ def cmd_init_character(config, args) -> int:
     既に画像がある場合は上書きしません（--force で上書き）。
     自分で用意した画像を data/character/character_master.png に置いても構いません。
     """
-    from .prompt_generator import CONSISTENCY_RULE, NO_TEXT_RULE, load_master_prompt
+    from .prompt_generator import CONSISTENCY_RULE, NO_TEXT_RULE, master_prompt_from_config
     from .providers import create_provider
 
     out = config.master_image_path
@@ -184,7 +184,7 @@ def cmd_init_character(config, args) -> int:
 
     prompt = "\n\n".join(
         [
-            load_master_prompt(config.master_prompt_path),
+            master_prompt_from_config(config),
             "POSE: standing straight and relaxed, facing forward, arms down naturally.\n"
             "FACIAL EXPRESSION: calm friendly smile.\n"
             "This is the reference sheet image that defines the character design.",

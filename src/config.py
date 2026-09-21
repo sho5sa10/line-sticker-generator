@@ -160,6 +160,11 @@ class Config:
         return self.resolve("character.master_prompt", "prompts/character_master.txt")
 
     @property
+    def master_prompt_ja_path(self) -> Path:
+        """日本語で書くキャラクター説明。あれば英語版より優先されます。"""
+        return self.resolve("character.master_prompt_ja", "prompts/character_master_ja.txt")
+
+    @property
     def dir_generated_prompts(self) -> Path:
         return self.root / "prompts" / "generated"
 

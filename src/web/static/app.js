@@ -456,7 +456,8 @@ async function loadMaster() {
     $('#master-meta').textContent = m.error || m.path;
   }
 
-  if ($('#master-prompt') !== document.activeElement) $('#master-prompt').value = m.prompt;
+  if ($('#master-prompt') !== document.activeElement) $('#master-prompt').value = m.prompt_ja;
+  renderPromptInfo(m);
 
   // 履歴
   const field = $('#master-history-field');
@@ -529,10 +530,21 @@ $('#btn-master-restore').addEventListener('click', async () => {
   } catch (e) { toast(e.message, true); }
 });
 
+/** 日本語版が使われているか、実際にAIへ送る全文はどうなるかを表示します。 */
+function renderPromptInfo(m) {
+  $('#prompt-mode').textContent = m.prompt_mode === 'ja'
+    ? `使用中: 日本語の説明（${m.prompt_ja_path.split(/[\\/]/).pop()}）`
+    : 'まだ保存されていません。いまは英語の初期プロンプトが使われています。保存すると日本語の説明に切り替わります。';
+  $('#master-prompt-full').textContent = m.full_prompt;
+}
+
 $('#btn-prompt-save').addEventListener('click', async () => {
   try {
-    await api('/api/master/prompt', { method: 'POST', body: { prompt: $('#master-prompt').value } });
-    toast('プロンプトを保存しました');
+    const d = await api('/api/master/prompt', {
+      method: 'POST', body: { prompt_ja: $('#master-prompt').value },
+    });
+    renderPromptInfo(d);
+    toast('キャラクターの説明を保存しました。これから作る画像に使われます');
   } catch (e) { toast(e.message, true); }
 });
 

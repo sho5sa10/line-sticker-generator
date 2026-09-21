@@ -161,11 +161,15 @@ body {
 
 .promptbox { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 12px; }
 .promptbox summary { cursor: pointer; font-size: 13px; font-weight: 700; }
+.promptbox .prompt-actions { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.fixedbox { margin-top: 14px; }
+.fixedbox summary { font-size: 12px; font-weight: 600; color: var(--muted); }
+.fixedbox pre { max-height: 260px; }
 .promptbox textarea {
   width: 100%; min-height: 220px; margin: 8px 0; padding: 10px;
   border: 1px solid var(--line); border-radius: 8px;
   background: var(--surface-2); color: var(--fg);
-  font-family: ui-monospace, Consolas, monospace; font-size: 12px; line-height: 1.6;
+  font: inherit; font-size: 14px; line-height: 1.7;
   resize: vertical;
 }
 

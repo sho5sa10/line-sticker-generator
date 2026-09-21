@@ -88,6 +88,89 @@ def test_all_100_prompts_are_unique(real_config):
         assert entry.text not in prompts[entry.id]
 
 
+# --- 日本語のマスタープロンプト -----------------------------------------
+FIXED_LINES = [
+    "Consistent character design.",
+    "Thick clean outline.",
+    "Simple flat illustration.",
+    "Highly readable at small size.",
+    "Full body.",
+    "Transparent background.",
+    "No scenery.",
+    "No frame.",
+    "No watermark.",
+]
+
+
+def test_japanese_master_takes_priority(tmp_path):
+    en = tmp_path / "en.txt"
+    en.write_text("English character.", encoding="utf-8")
+    ja = tmp_path / "ja.txt"
+    ja.write_text("茶色のボブヘアの女性。", encoding="utf-8")
+
+    master = load_master_prompt(en, ja)
+    assert "茶色のボブヘアの女性。" in master
+    assert "English character." not in master
+    # スタンプとして使うための技術的な指示は必ず付く
+    for line in FIXED_LINES:
+        assert line in master
+
+
+def test_empty_japanese_falls_back_to_english(tmp_path):
+    en = tmp_path / "en.txt"
+    en.write_text("English character.", encoding="utf-8")
+    ja = tmp_path / "ja.txt"
+    ja.write_text("   \n", encoding="utf-8")
+    assert load_master_prompt(en, ja) == "English character."
+    assert load_master_prompt(en, tmp_path / "missing.txt") == "English character."
+
+
+def test_project_japanese_master_file(real_config):
+    """同梱の日本語版は、英語版と同じキャラクターを日本語で書いたものです。"""
+    from src.prompt_generator import master_prompt_from_config
+
+    text = real_config.master_prompt_ja_path.read_text(encoding="utf-8")
+    for word in ("30代", "日本人男性", "会社員", "頭身", "黒髪", "ワイシャツ", "ネクタイ"):
+        assert word in text
+
+    master = master_prompt_from_config(real_config)
+    for line in FIXED_LINES:
+        assert line in master
+
+
+def test_japanese_master_used_in_every_sticker_prompt(real_config):
+    from src.prompt_generator import master_prompt_from_config
+
+    master = master_prompt_from_config(real_config)
+    entries = load_stickers(real_config.csv_path)
+    prompts = build_prompts(entries, master)
+    assert len(set(prompts.values())) == 100
+    for entry in entries:
+        p = prompts[entry.id]
+        assert "黒髪" in p
+        assert "no japanese characters" in p.lower()  # 文字を描かせない指示は残る
+        assert entry.text not in p                    # セリフ本文は送らない
+
+
+def test_consistency_rule_has_no_character_specific_features():
+    """固定の指示に特定キャラの特徴を書くと、キャラを変えたときに矛盾します。"""
+    from src.prompt_generator import CONSISTENCY_RULE, NO_TEXT_RULE
+
+    for fixed in (CONSISTENCY_RULE, NO_TEXT_RULE):
+        lowered = fixed.lower()
+        for word in ("black hair", "dress shirt", "necktie", "2.5-head", "office worker", "male"):
+            assert word not in lowered, word
+
+
+def test_different_character_has_no_contradiction(tmp_path):
+    """日本語で別キャラを書いたとき、元のキャラの特徴が紛れ込まないこと。"""
+    ja = tmp_path / "ja.txt"
+    ja.write_text("20代の女性。\n茶色のボブヘア。\n黄色いパーカー。", encoding="utf-8")
+    prompt = build_prompt(_entry(), load_master_prompt(tmp_path / "none.txt", ja)).lower()
+    for word in ("black hair", "dress shirt", "necktie", "office worker"):
+        assert word not in prompt, word
+
+
 def test_save_prompt(tmp_path):
     p = save_prompt("hello", tmp_path / "generated", "001")
     assert p.read_text(encoding="utf-8") == "hello"

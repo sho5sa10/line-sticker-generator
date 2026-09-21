@@ -311,7 +311,11 @@ def test_master_info_when_missing(client):
     d = client.get("/api/master").get_json()
     assert d["exists"] is False
     assert d["backups"] == []
-    assert "Japanese cute chibi office worker mascot." in d["prompt"]
+    # 日本語版が未作成なら、初期値（日本語）を編集欄に出し、実際は英語版が使われる
+    assert "黒髪" in d["prompt_ja"]
+    assert d["prompt_mode"] == "en"
+    assert "Japanese cute chibi office worker mascot." in d["full_prompt"]
+    assert "Transparent background." in d["fixed_prompt"]
 
 
 def test_master_upload_and_backup(client, tmp_config):
@@ -385,11 +389,21 @@ def test_master_restore_rejects_traversal(client):
         assert client.post("/api/master/restore", json={"name": name}).status_code == 404
 
 
-def test_master_prompt_save(client, tmp_config):
-    res = client.post("/api/master/prompt", json={"prompt": "A friendly robot mascot."})
+def test_master_prompt_save_japanese(client, tmp_config):
+    res = client.post("/api/master/prompt", json={"prompt_ja": "20代の女性。\n茶色のボブヘア。"})
     assert res.status_code == 200
-    assert "A friendly robot mascot." in tmp_config.master_prompt_path.read_text(encoding="utf-8")
-    assert client.post("/api/master/prompt", json={"prompt": "  "}).status_code == 400
+    d = res.get_json()
+    assert d["prompt_mode"] == "ja"
+    assert "茶色のボブヘア。" in tmp_config.master_prompt_ja_path.read_text(encoding="utf-8")
+    # 実際に送る全文には、日本語の説明と固定の英語指示の両方が入る
+    assert "茶色のボブヘア。" in d["full_prompt"]
+    assert "Transparent background." in d["full_prompt"]
+    # 英語版のファイルは作らない・書き換えない
+    assert not tmp_config.master_prompt_path.exists()
+
+
+def test_master_prompt_rejects_empty(client):
+    assert client.post("/api/master/prompt", json={"prompt_ja": "  "}).status_code == 400
 
 
 def test_master_generate_without_key(client, monkeypatch):

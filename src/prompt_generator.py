@@ -59,26 +59,72 @@ Fully transparent background (alpha channel), no background color, no shadow on 
 Single character, centered, full body visible, with generous empty margin on all four sides.
 Do not crop any part of the body."""
 
+# キャラクター固有の特徴（髪型・服装など）はここに書きません。
+# 書くとマスタープロンプトでキャラクターを変えたときに矛盾するためです。
 CONSISTENCY_RULE = """CHARACTER CONSISTENCY (highest priority):
-Keep the character design exactly identical every time:
-same face, same short black hair and hairline, same eye shape, same white dress shirt,
-same simple dark necktie, same slightly rounded body, same 2.5-head-tall chibi proportions,
-same thick outline weight, same flat and simple color palette.
+Keep the character design exactly identical every time, exactly as described above
+and as shown in the reference image:
+same face, same hairstyle and hair color, same eye shape, same outfit and outfit colors,
+same accessories, same body shape and head-to-body proportions,
+same outline weight, same color palette.
 Only the pose and the facial expression change."""
 
 
-def load_master_prompt(path: str | Path | None) -> str:
+# 日本語でキャラクターを書く場合に、自動で付け足す技術的な指示。
+# 背景透過・全身・枠なしなどはスタンプとして使えるかどうかに直結するため、
+# 画像生成AIが最も安定して従う英語のまま固定します。
+FIXED_STYLE_PROMPT = """Cute chibi mascot character for LINE messenger stickers.
+Consistent character design.
+Thick clean outline.
+Simple flat illustration.
+Highly readable at small size.
+Full body.
+Transparent background.
+No scenery.
+No frame.
+No watermark."""
+
+# 日本語マスタープロンプトの初期値（英語版と同じキャラクターを日本語で書いたもの）
+DEFAULT_CHARACTER_JA = """30代くらいの日本人男性の会社員。
+2〜2.5頭身のちびキャラ。
+短い黒髪。
+白いワイシャツ。
+シンプルな濃い色のネクタイ。
+少し丸みのある体型。
+親しみやすく、コミカルな雰囲気。
+配色はシンプルにする。"""
+
+
+def _read(path: str | Path | None) -> str:
+    if not path:
+        return ""
+    p = Path(path)
+    return p.read_text(encoding="utf-8").strip() if p.exists() else ""
+
+
+def compose_japanese_master(character_ja: str) -> str:
+    """日本語のキャラクター説明に、固定の技術指示（英語）を付け足します。"""
+    return (
+        "CHARACTER DESCRIPTION (written in Japanese; follow every detail exactly):\n"
+        f"{character_ja.strip()}\n\n{FIXED_STYLE_PROMPT}"
+    )
+
+
+def load_master_prompt(path: str | Path | None, ja_path: str | Path | None = None) -> str:
     """キャラクター・マスタープロンプトを読み込みます。
 
-    ファイルが無い場合は組み込みのフォールバックを使います。
+    日本語版（ja_path）に中身があればそれを優先し、固定の技術指示を付け足します。
+    無ければ英語版（path）、それも無ければ組み込みのフォールバックを使います。
     """
-    if path:
-        p = Path(path)
-        if p.exists():
-            text = p.read_text(encoding="utf-8").strip()
-            if text:
-                return text
-    return FALLBACK_MASTER_PROMPT
+    character_ja = _read(ja_path)
+    if character_ja:
+        return compose_japanese_master(character_ja)
+    return _read(path) or FALLBACK_MASTER_PROMPT
+
+
+def master_prompt_from_config(config) -> str:
+    """設定に従ってマスタープロンプトを読み込みます（日本語版を優先）。"""
+    return load_master_prompt(config.master_prompt_path, config.master_prompt_ja_path)
 
 
 def build_prompt(entry: StickerEntry, master_prompt: str | None = None) -> str:
