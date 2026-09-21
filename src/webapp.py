@@ -35,6 +35,18 @@ from .providers import estimate_cost_usd
 from .text_renderer import FontNotFoundError, TextStyle
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
+SRC_DIR = Path(__file__).resolve().parent
+
+
+def code_fingerprint() -> float:
+    """サーバー側プログラム（src/**/*.py）の最終更新時刻。
+
+    画面（HTML/JS）はリクエストのたびにファイルから読み直されますが、
+    サーバー側のプログラムは起動時のまま動き続けます。起動後にプログラムが
+    更新されると「新しい画面 + 古いサーバー」の食い違いが起きるため、
+    それを検出して再起動を促すのに使います。
+    """
+    return max((f.stat().st_mtime for f in SRC_DIR.rglob("*.py")), default=0.0)
 
 
 # ======================================================================
@@ -142,6 +154,10 @@ def create_app(config=None) -> Flask:
     app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024  # 1リクエストあたりのアップロード上限
     jobs = JobManager()
     app.config["JOBS"] = jobs
+    started_code = code_fingerprint()
+
+    def server_outdated() -> bool:
+        return code_fingerprint() > started_code + 0.001
 
     # ------------------------------------------------------------------
     # ヘルパ
@@ -221,6 +237,7 @@ def create_app(config=None) -> Flask:
 
         return jsonify(
             {
+                "server_outdated": server_outdated(),
                 "project_root": str(cfg_.root),
                 "config_path": str(cfg_.path),
                 "csv_path": str(cfg_.csv_path),
@@ -261,6 +278,11 @@ def create_app(config=None) -> Flask:
                 "job": jobs.current.to_dict() if jobs.current else None,
             }
         )
+
+    @app.get("/api/server")
+    def api_server():
+        """軽量な状態確認。プログラムが更新されて再起動が必要かどうかを返します。"""
+        return jsonify({"outdated": server_outdated()})
 
     @app.get("/api/cost")
     def api_cost():
@@ -357,7 +379,7 @@ def create_app(config=None) -> Flask:
         """
         cfg_ = current_config()
         body = request.get_json(silent=True) or {}
-        text = str(body.get("prompt_ja", "")).strip()
+        text = str(body.get("prompt_ja") or body.get("prompt") or "").strip()
         if not text:
             return jsonify({"error": "キャラクターの説明が空です"}), 400
         path = cfg_.master_prompt_ja_path

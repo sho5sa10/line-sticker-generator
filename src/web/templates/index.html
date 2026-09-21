@@ -18,6 +18,16 @@
   <button class="btn small ghost" id="btn-guide-toggle" data-tip="進め方のガイドを表示/非表示します">ガイド</button>
 </header>
 
+<!-- ===== プログラム更新の警告 ===== -->
+<div class="outdated" id="outdated-banner" hidden>
+  <strong>プログラムが更新されています。GUIを再起動してください。</strong>
+  <span>
+    このままだと、一部の操作（保存など）が正しく動きません。
+    GUIを起動したターミナルで <kbd>Ctrl</kbd>+<kbd>C</kbd> を押して止めてから、
+    もう一度 <code>.\.venv\Scripts\python.exe -m src.main gui</code> を実行し、このページを再読み込みしてください。
+  </span>
+</div>
+
 <!-- ===== 進め方ガイド ===== -->
 <section class="guide" id="guide">
   <div class="guide-head">

@@ -402,6 +402,41 @@ def test_master_prompt_save_japanese(client, tmp_config):
     assert not tmp_config.master_prompt_path.exists()
 
 
+def test_master_prompt_accepts_legacy_field(client, tmp_config):
+    """画面とサーバーの版がずれていても保存できるよう、旧名 "prompt" も受け付けます。"""
+    res = client.post("/api/master/prompt", json={"prompt": "短い黒髪。"})
+    assert res.status_code == 200
+    assert "短い黒髪。" in tmp_config.master_prompt_ja_path.read_text(encoding="utf-8")
+
+
+def test_japanese_text_from_user_report_is_saved(client, tmp_config):
+    """ユーザーが報告した入力そのもので保存できること（改行・全角記号を含む）。"""
+    text = (
+        "30代くらいの日本人男性の会社員。\n2〜2.5頭身のちびキャラ。\n短い黒髪。\n"
+        "白いワイシャツ。\nシンプルな濃い色のネクタイ。\n少し丸みのある体型。\n"
+        "親しみやすく、コミカルな雰囲気。\n配色はシンプルにする。"
+    )
+    res = client.post("/api/master/prompt", json={"prompt_ja": text})
+    assert res.status_code == 200, res.get_json()
+    assert tmp_config.master_prompt_ja_path.read_text(encoding="utf-8").strip() == text
+
+
+def test_server_not_outdated_right_after_start(client):
+    assert client.get("/api/server").get_json() == {"outdated": False}
+    assert client.get("/api/state").get_json()["server_outdated"] is False
+
+
+def test_server_outdated_after_code_change(tmp_config, monkeypatch):
+    """起動後にプログラムが更新されたら、再起動が必要だと知らせます。"""
+    from src import webapp
+
+    app = webapp.create_app(tmp_config)
+    client = app.test_client()
+    real = webapp.code_fingerprint()
+    monkeypatch.setattr(webapp, "code_fingerprint", lambda: real + 60)
+    assert client.get("/api/server").get_json() == {"outdated": True}
+
+
 def test_master_prompt_rejects_empty(client):
     assert client.post("/api/master/prompt", json={"prompt_ja": "  "}).status_code == 400
 

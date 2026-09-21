@@ -39,10 +39,34 @@ async function api(path, options = {}) {
   let data = null;
   try { data = await res.json(); } catch (e) { data = null; }
   if (!res.ok) {
-    throw new Error((data && data.error) || `${res.status} ${res.statusText}`);
+    // 失敗の原因が「サーバーが古いまま」のことがあるので、あわせて確認します。
+    const outdated = await checkServer();
+    const msg = (data && data.error) || `${res.status} ${res.statusText}`;
+    throw new Error(outdated ? `${msg}（GUIの再起動が必要です。画面上部の案内を見てください）` : msg);
   }
   return data;
 }
+
+/**
+ * サーバー側プログラムが起動後に更新されていないか確認します。
+ * 画面は常に最新のファイルが読み込まれますが、サーバーは起動時のまま動くため、
+ * 食い違うと保存などが正しく動かなくなります。
+ * 確認用の窓口（/api/server）自体が無い＝それより古いサーバー、とみなします。
+ */
+async function checkServer() {
+  let outdated = false;
+  try {
+    const res = await fetch('/api/server', { cache: 'no-store' });
+    if (res.status === 404) outdated = true;
+    else if (res.ok) outdated = !!(await res.json()).outdated;
+  } catch (e) {
+    return false;  // サーバー停止中などは別の問題なのでここでは判定しません
+  }
+  $('#outdated-banner').hidden = !outdated;
+  return outdated;
+}
+checkServer();
+setInterval(checkServer, 15000);
 
 function openLightbox(src, caption) {
   $('#lb-img').src = src;
