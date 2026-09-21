@@ -27,6 +27,7 @@ from . import style_suggest
 from . import gallery as gallery_mod
 from . import image_processor as ip
 from . import importer
+from . import listing as listing_mod
 from . import package_builder as pkg
 from . import pipeline
 from . import validator as vd
@@ -1041,6 +1042,55 @@ def create_app(config=None) -> Flask:
             "set_size": int(set_size) if str(set_size or "").strip().isdigit() else None,
             "ids": [str(i) for i in ids] if isinstance(ids, list) else None,
         }
+
+    # ---------- 申請用のタイトル・説明文 ----------
+    def _listing_payload(data: dict) -> dict:
+        return {
+            "listing": data,
+            "issues": listing_mod.check_listing(data),
+            "limits": listing_mod.LIMITS,
+            "labels": listing_mod.FIELD_LABELS,
+        }
+
+    @app.get("/api/listing")
+    def api_listing_get():
+        return jsonify(_listing_payload(listing_mod.load_listing(current_config())))
+
+    @app.put("/api/listing")
+    def api_listing_put():
+        body = request.get_json(silent=True) or {}
+        data = listing_mod.save_listing(current_config(), body.get("listing") or {})
+        return jsonify(_listing_payload(data))
+
+    @app.post("/api/listing/check")
+    def api_listing_check():
+        body = request.get_json(silent=True) or {}
+        return jsonify({"issues": listing_mod.check_listing(body.get("listing") or {})})
+
+    @app.post("/api/listing/suggest")
+    def api_listing_suggest():
+        """キャラの特徴とセリフから、タイトル・説明文の案を作ります（APIは使いません）。"""
+        cfg_ = current_config()
+        body = request.get_json(silent=True) or {}
+        try:
+            entries = entries_or_error()
+        except CsvLoadError as exc:
+            return jsonify({"error": str(exc)}), 400
+        ids = {str(i) for i in body.get("ids") or []}
+        if ids:
+            entries = [e for e in entries if e.id in ids] or entries
+        profile = cprof.load_profile(cfg_.character_profile_path) or {}
+        creator = str(body.get("creator") or listing_mod.load_listing(cfg_).get("creator", ""))
+        try:
+            volume = max(1, int(body.get("volume") or 1))
+        except (TypeError, ValueError):
+            volume = 1
+        candidates = listing_mod.suggest(profile, entries, creator=creator, volume=volume)
+        return jsonify({
+            "candidates": [{**c, "issues": listing_mod.check_listing(c)} for c in candidates],
+            "count": len(entries),
+            "has_profile": bool(profile),
+        })
 
     @app.post("/api/package/plan")
     def api_package_plan():

@@ -434,12 +434,86 @@
         <div id="package-result" class="result"></div>
       </div>
 
+      <div class="card wide" id="card-listing">
+        <h3>タイトル・説明文（申請用）</h3>
+        <p class="hint">LINE Creators Market で入力するタイトルや説明文を、キャラクターの特徴とセリフから自動で作ります（無料・APIは使いません）。
+          英語は必須、日本語は「言語を追加」で登録します。文字数やLINEのルールもその場でチェックします。</p>
+        <div class="lst-actions">
+          <label>どのセリフから作る？
+            <select id="lst-target" data-tip="複数のセットを申請するときは、セットごとに作ってタイトルを変えてください"></select></label>
+          <button type="button" class="btn primary" id="btn-listing-suggest">自動で作る</button>
+          <button type="button" class="btn" id="btn-listing-save" data-tip="data/listing.json に保存します">保存</button>
+        </div>
+        <p class="hint" id="lst-profile-hint" hidden>キャラクターの特徴が未入力のため、呼び名が「キャラクター」になっています。
+          「はじめに」タブの「かんたん入力」で選ぶと、キャラに合った文章になります。</p>
+        <div class="lst-candidates-row" id="lst-candidates-row" hidden>
+          <span class="hint">案を選ぶ：</span><span id="lst-candidates"></span>
+        </div>
+        <div class="lst-form" id="listing-form">
+          <div class="lst-row">
+            <div class="lst-head">
+              <label for="lst-creator" data-tip="あなたの名前やペンネーム（日本語でもOK）。案の作成時にコピーライトにも使います">クリエイター名</label>
+              <span class="lst-count" data-count="creator"></span>
+              <button type="button" class="btn small ghost" data-copy="creator" data-tip="この欄をコピーします。LINE Creators Market の入力欄に貼り付けてください">コピー</button>
+            </div>
+            <input id="lst-creator" type="text">
+            <div class="lst-issues" data-issues="creator" hidden></div>
+          </div>
+          <div class="lst-row">
+            <div class="lst-head">
+              <label for="lst-copyright" data-tip="半角英数字だけ。例: (C)2026 yourname">コピーライト</label>
+              <span class="lst-count" data-count="copyright"></span>
+              <button type="button" class="btn small ghost" data-copy="copyright" data-tip="この欄をコピーします。LINE Creators Market の入力欄に貼り付けてください">コピー</button>
+            </div>
+            <input id="lst-copyright" type="text">
+            <div class="lst-issues" data-issues="copyright" hidden></div>
+          </div>
+          <div class="lst-row">
+            <div class="lst-head">
+              <label for="lst-title_en" data-tip="英語は必須です。半角のみ">タイトル（英語・必須）</label>
+              <span class="lst-count" data-count="title_en"></span>
+              <button type="button" class="btn small ghost" data-copy="title_en" data-tip="この欄をコピーします。LINE Creators Market の入力欄に貼り付けてください">コピー</button>
+            </div>
+            <input id="lst-title_en" type="text">
+            <div class="lst-issues" data-issues="title_en" hidden></div>
+          </div>
+          <div class="lst-row">
+            <div class="lst-head">
+              <label for="lst-title_ja" data-tip="「言語を追加」で日本語を選ぶと入力できます。全角は2文字として数えます（全角20文字まで）">タイトル（日本語）</label>
+              <span class="lst-count" data-count="title_ja"></span>
+              <button type="button" class="btn small ghost" data-copy="title_ja" data-tip="この欄をコピーします。LINE Creators Market の入力欄に貼り付けてください">コピー</button>
+            </div>
+            <input id="lst-title_ja" type="text">
+            <div class="lst-issues" data-issues="title_ja" hidden></div>
+          </div>
+          <div class="lst-row">
+            <div class="lst-head">
+              <label for="lst-desc_en" data-tip="英語は必須です。半角のみ">説明文（英語・必須）</label>
+              <span class="lst-count" data-count="desc_en"></span>
+              <button type="button" class="btn small ghost" data-copy="desc_en" data-tip="この欄をコピーします。LINE Creators Market の入力欄に貼り付けてください">コピー</button>
+            </div>
+            <textarea id="lst-desc_en" rows="3"></textarea>
+            <div class="lst-issues" data-issues="desc_en" hidden></div>
+          </div>
+          <div class="lst-row">
+            <div class="lst-head">
+              <label for="lst-desc_ja" data-tip="全角は2文字として数えます（全角80文字まで）">説明文（日本語）</label>
+              <span class="lst-count" data-count="desc_ja"></span>
+              <button type="button" class="btn small ghost" data-copy="desc_ja" data-tip="この欄をコピーします。LINE Creators Market の入力欄に貼り付けてください">コピー</button>
+            </div>
+            <textarea id="lst-desc_ja" rows="3"></textarea>
+            <div class="lst-issues" data-issues="desc_ja" hidden></div>
+          </div>
+        </div>
+      </div>
+
       <div class="card" id="card-submit">
         <h3>LINEに登録・申請</h3>
         <p class="hint">ZIPができたら、LINE Creators Market（公式サイト）で販売の手続きをします。</p>
         <ol class="submit-steps">
           <li>LINEアカウントでログインし、クリエイター登録をする（初回のみ）</li>
-          <li>マイページでスタンプを新規登録し、タイトル・説明文などを入力する</li>
+          <li>マイページでスタンプを新規登録し、タイトル・説明文などを入力する
+            <span class="hint">（上の「タイトル・説明文（申請用）」で作った文をコピーして貼り付けられます）</span></li>
           <li>画像の登録で、上で作ったZIPをまとめてアップロードする
             <span class="hint">（ZIPは「ダウンロード」ボタン、または output/packages フォルダにあります）</span></li>
           <li>審査をリクエストする。承認されたら「リリース」で販売開始</li>

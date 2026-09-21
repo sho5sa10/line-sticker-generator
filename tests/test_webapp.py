@@ -769,3 +769,24 @@ def test_font_check_endpoint(client):
     d = client.get("/api/fonts/check?font_id=biz-ud-gothic").get_json()
     assert d["missing"] == [] and d["affected_ids"] == []
     assert client.get("/api/fonts/check?font_id=nope").status_code == 404
+
+
+# --- 申請用のタイトル・説明文 ---------------------------------------------
+def test_listing_suggest_save_and_check(client):
+    r = client.post("/api/listing/suggest", json={"creator": "yourname"})
+    assert r.status_code == 200
+    d = r.get_json()
+    assert d["count"] == 3 and d["candidates"]
+    first = d["candidates"][0]
+    assert first["title_en"] and first["copyright"].endswith("yourname")
+
+    r = client.post("/api/listing/suggest", json={"ids": ["002"]})
+    assert r.get_json()["count"] == 1
+
+    r = client.put("/api/listing", json={"listing": {**first, "title_en": "x" * 50}})
+    d = r.get_json()
+    assert any("長すぎ" in i for i in d["issues"]["title_en"])
+    assert client.get("/api/listing").get_json()["listing"]["creator"] == "yourname"
+
+    r = client.post("/api/listing/check", json={"listing": {"title_ja": "LINEのねこ"}})
+    assert r.get_json()["issues"]["title_ja"]

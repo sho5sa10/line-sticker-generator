@@ -630,3 +630,23 @@ main { padding: 16px; max-width: 1500px; margin: 0 auto; }
 .submit-steps .hint { display: block; }
 .submit-links { display: flex; flex-wrap: wrap; gap: 8px; }
 .submit-links a.btn { text-decoration: none; }
+
+/* ---------- 申請用のタイトル・説明文 ---------- */
+.lst-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; }
+.lst-actions label { display: flex; gap: 6px; align-items: center; font-size: 13px; }
+.lst-candidates-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 10px; }
+.lst-candidates-row .hint { display: inline; margin: 0; }
+#lst-candidates { display: flex; flex-wrap: wrap; gap: 6px; }
+.lst-form { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 16px; }
+@media (max-width: 700px) { .lst-form { grid-template-columns: 1fr; } }
+.lst-row { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.lst-head { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 700; }
+.lst-count { margin-left: auto; font-size: 12px; font-weight: 400; color: var(--muted); font-variant-numeric: tabular-nums; }
+.lst-count.over { color: var(--danger); font-weight: 700; }
+.lst-row input, .lst-row textarea {
+  width: 100%; padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--surface); color: var(--fg); font: inherit; font-size: 13px;
+}
+.lst-row textarea { resize: vertical; line-height: 1.5; }
+.lst-row .bad { border-color: var(--danger); }
+.lst-issues { font-size: 12px; color: var(--danger); }

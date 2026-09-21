@@ -42,3 +42,4 @@ desktop.ini
 # --- 追加フォント（ファイルが大きいので管理しない。README だけ残す） ---
 fonts/*
 !fonts/README.md
+data/listing.json

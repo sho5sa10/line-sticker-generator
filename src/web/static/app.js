@@ -180,7 +180,7 @@ function switchTab(name) {
 /** 各ステップが属するタブ。ステップをクリックするとここへ移動します。 */
 const STEP_TAB = {
   setup: 'start', character: 'start', try: 'grid', design: 'design',
-  rest: 'grid', validate: 'output', package: 'output',
+  rest: 'grid', validate: 'output', package: 'output', submit: 'output',
 };
 
 /** いまの状態から各ステップの達成状況を判定します。 */
@@ -273,6 +273,7 @@ function computeSteps(info) {
       done: readLS('submit.opened', '0') === '1', blocked: false,
       action: { label: 'LINE Creators Market を開く', run: () => openLineCreators() },
       help: 'LINE Creators Market（公式サイト）を別タブで開きます。'
+          + '登録に使うタイトル・説明文は「検証・出力」タブで自動作成できます。'
           + 'クリエイター登録 → タイトル等の入力と画像アップロード → 審査リクエスト → 承認後にリリース、の順に進みます。',
     },
   ];
@@ -425,7 +426,7 @@ $('#tabs').addEventListener('click', (e) => {
   $$('.tab').forEach((t) => t.classList.toggle('active', t === tab));
   $$('.panel').forEach((p) => p.classList.toggle('active', p.id === `panel-${tab.dataset.tab}`));
   if (tab.dataset.tab === 'design') refreshPreview();
-  if (tab.dataset.tab === 'output') { loadAssets(); updatePlan(); }
+  if (tab.dataset.tab === 'output') { loadAssets(); updatePlan(); loadListing(); }
   if (tab.dataset.tab === 'start') loadMaster();
 });
 
@@ -1548,6 +1549,8 @@ function updatePlan() {
     try {
       d = await api('/api/package/plan', { method: 'POST', body: packageOptions() });
     } catch (e) { box.textContent = e.message; box.classList.add('bad'); return; }
+    state.lastPlan = d;
+    fillListingTargets();
 
     const lines = [];
     if (d.sets.length) {
@@ -1634,4 +1637,148 @@ loadState().catch((e) => toast(e.message, true));
 
 document.querySelectorAll('[data-submit-link]').forEach((a) => {
   a.addEventListener('click', () => markSubmitOpened());
+});
+
+/* ------------------------------------------------------------------ */
+/* 申請用のタイトル・説明文                                             */
+/* ------------------------------------------------------------------ */
+const LISTING_KEYS = ['creator', 'copyright', 'title_en', 'desc_en', 'title_ja', 'desc_ja'];
+let listingLimits = {};
+let listingCandidates = [];
+let listingCheckTimer = null;
+
+/** LINE の数え方（全角は2文字）。サーバー側（listing.display_width）と同じ考え方です。 */
+function lineWidth(text) {
+  let n = 0;
+  for (const ch of text) {
+    const c = ch.codePointAt(0);
+    // 半角（ASCII・ラテン文字・半角カナ）は1、それ以外は2
+    n += (c <= 0xff || (c >= 0xff61 && c <= 0xff9f)) ? 1 : 2;
+  }
+  return n;
+}
+
+function listingValues() {
+  const out = {};
+  LISTING_KEYS.forEach((k) => { out[k] = $(`#lst-${k}`).value; });
+  return out;
+}
+
+function showListingIssues(issues) {
+  LISTING_KEYS.forEach((k) => {
+    const el = $(`#lst-${k}`);
+    const w = lineWidth(el.value);
+    const limit = listingLimits[k] || 0;
+    const count = $(`[data-count="${k}"]`);
+    count.textContent = `${w} / ${limit}`;
+    count.classList.toggle('over', w > limit);
+    const list = (issues && issues[k]) || [];
+    const box = $(`[data-issues="${k}"]`);
+    box.textContent = list.join(' ／ ');
+    box.hidden = !list.length;
+    el.classList.toggle('bad', list.length > 0 && !(list.length === 1 && list[0] === '必須の項目です' && !el.value));
+  });
+}
+
+async function loadListing() {
+  try {
+    const d = await api('/api/listing');
+    listingLimits = d.limits;
+    LISTING_KEYS.forEach((k) => { $(`#lst-${k}`).value = d.listing[k] || ''; });
+    showListingIssues(d.issues);
+    fillListingTargets();
+  } catch (e) { /* 古いサーバーのときは上部バナーで案内されます */ }
+}
+
+function fillListingTargets() {
+  const sel = $('#lst-target');
+  const prev = sel.value;
+  const opts = ['<option value="">すべてのセリフ</option>'];
+  if (state.selected.size) opts.push(`<option value="selected">スタンプ一覧で選んだ${state.selected.size}枚</option>`);
+  (state.lastPlan ? state.lastPlan.sets : []).forEach((st, i) => {
+    opts.push(`<option value="set:${st.first}:${st.last}">セット${i + 1}（${st.first}〜${st.last}・${st.count}枚）</option>`);
+  });
+  sel.innerHTML = opts.join('');
+  if ([...sel.options].some((o) => o.value === prev)) sel.value = prev;
+}
+
+function listingTargetIds() {
+  const v = $('#lst-target').value;
+  if (v === 'selected') return [...state.selected].sort();
+  if (v.startsWith('set:')) {
+    const [, first, last] = v.split(':');
+    return state.stickers.map((s) => s.id).filter((id) => id >= first && id <= last);
+  }
+  return [];
+}
+
+/** セット2以降を選んだときはタイトルに番号を付けます（同じタイトルのスタンプが並ばないように）。 */
+function listingVolume() {
+  const sel = $('#lst-target');
+  const v = sel.value;
+  if (!v.startsWith('set:')) return 1;
+  const sets = [...sel.options].filter((o) => o.value.startsWith('set:'));
+  return sets.length > 1 ? sets.findIndex((o) => o.value === v) + 1 : 1;
+}
+
+function applyCandidate(i) {
+  const c = listingCandidates[i];
+  if (!c) return;
+  ['title_en', 'desc_en', 'title_ja', 'desc_ja'].forEach((k) => { $(`#lst-${k}`).value = c[k]; });
+  if (!$('#lst-copyright').value && c.copyright) $('#lst-copyright').value = c.copyright;
+  document.querySelectorAll('#lst-candidates .opt').forEach((b, j) => b.classList.toggle('on', j === i));
+  checkListingSoon(0);
+}
+
+$('#btn-listing-suggest').addEventListener('click', (e) => withBusy(e.currentTarget, '作成中…', async () => {
+  try {
+    const d = await api('/api/listing/suggest', {
+      method: 'POST', body: { ids: listingTargetIds(), creator: $('#lst-creator').value, volume: listingVolume() },
+    });
+    listingCandidates = d.candidates;
+    $('#lst-candidates').innerHTML = d.candidates.map((c, i) =>
+      `<button type="button" class="opt" data-cand="${i}">案${i + 1}：${escapeHtml(c.title_ja || c.title_en)}</button>`).join('');
+    $('#lst-candidates-row').hidden = !d.candidates.length;
+    $('#lst-profile-hint').hidden = d.has_profile;
+    applyCandidate(0);
+    toast(`${d.count}件のセリフから案を${d.candidates.length}つ作りました。気に入らなければ書き換えてください`);
+  } catch (err) { toast(err.message, true); }
+}));
+
+$('#lst-candidates').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-cand]');
+  if (b) applyCandidate(Number(b.dataset.cand));
+});
+
+function checkListingSoon(delay = 300) {
+  clearTimeout(listingCheckTimer);
+  showListingIssues(null);
+  listingCheckTimer = setTimeout(async () => {
+    try {
+      const d = await api('/api/listing/check', { method: 'POST', body: { listing: listingValues() } });
+      showListingIssues(d.issues);
+    } catch (err) { /* 入力中なので黙って次を待ちます */ }
+  }, delay);
+}
+LISTING_KEYS.forEach((k) => $(`#lst-${k}`).addEventListener('input', () => checkListingSoon()));
+
+$('#btn-listing-save').addEventListener('click', (e) => withBusy(e.currentTarget, '保存中…', async () => {
+  try {
+    const d = await api('/api/listing', { method: 'PUT', body: { listing: listingValues() } });
+    showListingIssues(d.issues);
+    const bad = Object.values(d.issues).filter((l) => l.length).length;
+    toast(bad ? `保存しました（直したほうがよい項目が${bad}つあります）` : '保存しました。LINE Creators Market にコピーして使えます', !!bad);
+  } catch (err) { toast(err.message, true); }
+}));
+
+$('#listing-form').addEventListener('click', async (e) => {
+  const b = e.target.closest('[data-copy]');
+  if (!b) return;
+  const text = $(`#lst-${b.dataset.copy}`).value;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (err) {
+    const el = $(`#lst-${b.dataset.copy}`); el.select(); document.execCommand('copy');
+  }
+  toast('コピーしました');
 });
