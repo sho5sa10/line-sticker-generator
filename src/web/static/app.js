@@ -789,44 +789,120 @@ async function afterMasterChanged() {
 /* ------------------------------------------------------------------ */
 /* スタンプ一覧                                                        */
 /* ------------------------------------------------------------------ */
+/** CSV の category 列の表示名。ここに無いものは、そのまま表示します。 */
+const GENRE_LABELS = {
+  basic: '基本の返事', reply: '返事', thanks: 'お礼', apology: 'おわび', request: 'お願い',
+  work: '仕事', move: '移動・連絡', greeting: 'あいさつ', joy: 'よろこび', surprise: 'おどろき',
+  think: '考え中', trouble: 'こまった', tired: 'つかれた', care: '気づかい', life: '生活',
+  misc: 'その他',
+};
+const SALE_LABELS = { review: '申請中', selling: '販売中' };
+
+function genreLabel(cat) {
+  return GENRE_LABELS[cat] || cat || 'その他';
+}
+
+function gridFilter() {
+  const v = $('#grid-filter').value;
+  return state.stickers.filter((s) => v === 'all'
+    || (v === 'unsold' ? !s.sale : s.sale === v));
+}
+
+function cellHtml(s) {
+  const sel = state.selected.has(s.id);
+  let thumb = '<span class="empty">未生成</span>';
+  let tag = '';
+  if (s.has_final) {
+    thumb = `<img loading="lazy" src="/img/final/${s.id}.png?t=${s.final_mtime}" alt="${escapeHtml(s.text)}">`;
+    tag = '<span class="tag final">完成</span>';
+  } else if (s.has_raw) {
+    thumb = `<img loading="lazy" src="/img/generated/${s.id}.png?t=${s.raw_mtime}" alt="${escapeHtml(s.text)}">`;
+    tag = '<span class="tag raw">原画のみ</span>';
+  }
+  const sale = s.sale ? `<span class="sale-badge ${s.sale}">${SALE_LABELS[s.sale]}</span>` : '';
+  return `
+    <div class="cell ${sel ? 'selected' : ''} ${s.sale ? `sale-${s.sale}` : ''}" data-id="${s.id}">
+      <input class="pick" type="checkbox" ${sel ? 'checked' : ''} aria-label="選択">
+      ${sale}${tag}
+      <div class="thumb" data-zoom="${s.id}">${thumb}</div>
+      <div class="cid">${s.id}${s.size_kb ? ` · ${s.size_kb}KB` : ''}</div>
+      <div class="ctext">${escapeHtml(s.text)}</div>
+      <div class="meta">${escapeHtml(s.action || '')}</div>
+      <div class="rowbtns">
+        <button class="btn" data-act="upload"
+                data-tip="この番号に手持ちの画像を入れます。文字入れ・検証まで自動で行います（無料）">画像を入れる</button>
+      </div>
+      <div class="rowbtns">
+        <button class="btn" data-act="regen"
+                data-tip="この1枚だけAIで作り直します（課金されます）。前の画像は退避されます">AIで作り直す</button>
+        <button class="btn" data-act="rerender"
+                data-tip="APIを使わず文字だけ貼り直します（無料）">文字のみ</button>
+      </div>
+    </div>`;
+}
+
 function renderGrid() {
-  const html = state.stickers.map((s) => {
-    const sel = state.selected.has(s.id);
-    let thumb = '<span class="empty">未生成</span>';
-    let tag = '';
-    if (s.has_final) {
-      thumb = `<img loading="lazy" src="/img/final/${s.id}.png?t=${s.final_mtime}" alt="${escapeHtml(s.text)}">`;
-      tag = '<span class="tag final">完成</span>';
-    } else if (s.has_raw) {
-      thumb = `<img loading="lazy" src="/img/generated/${s.id}.png?t=${s.raw_mtime}" alt="${escapeHtml(s.text)}">`;
-      tag = '<span class="tag raw">原画のみ</span>';
-    }
-    return `
-      <div class="cell ${sel ? 'selected' : ''}" data-id="${s.id}">
-        <input class="pick" type="checkbox" ${sel ? 'checked' : ''} aria-label="選択">
-        ${tag}
-        <div class="thumb" data-zoom="${s.id}">${thumb}</div>
-        <div class="cid">${s.id}${s.size_kb ? ` · ${s.size_kb}KB` : ''}</div>
-        <div class="ctext">${escapeHtml(s.text)}</div>
-        <div class="meta">${escapeHtml(s.action || '')}</div>
-        <div class="rowbtns">
-          <button class="btn" data-act="upload"
-                  data-tip="この番号に手持ちの画像を入れます。文字入れ・検証まで自動で行います（無料）">画像を入れる</button>
-        </div>
-        <div class="rowbtns">
-          <button class="btn" data-act="regen"
-                  data-tip="この1枚だけAIで作り直します（課金されます）。前の画像は退避されます">AIで作り直す</button>
-          <button class="btn" data-act="rerender"
-                  data-tip="APIを使わず文字だけ貼り直します（無料）">文字のみ</button>
-        </div>
-      </div>`;
-  }).join('');
-  $('#grid').innerHTML = html;
+  const shown = gridFilter();
+  let html;
+  if ($('#grid-by-genre').checked) {
+    // CSV に最初に出てきた順にジャンルを並べます
+    const groups = new Map();
+    shown.forEach((s) => {
+      const key = s.category || 'misc';
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(s);
+    });
+    html = [...groups].map(([cat, items]) => {
+      const selling = items.filter((s) => s.sale === 'selling').length;
+      const review = items.filter((s) => s.sale === 'review').length;
+      const extra = [selling && `販売中${selling}`, review && `申請中${review}`].filter(Boolean).join('・');
+      return `<div class="genre-head">
+          <h4>${escapeHtml(genreLabel(cat))}</h4>
+          <span class="gcount">${items.length}枚${extra ? `（${extra}）` : ''}</span>
+          <button type="button" class="btn small ghost" data-genre="${escapeHtml(cat)}"
+                  data-tip="このジャンルのスタンプをまとめて選択に加えます">このジャンルを選ぶ</button>
+        </div>` + items.map(cellHtml).join('');
+    }).join('');
+  } else {
+    html = shown.map(cellHtml).join('');
+  }
+  $('#grid').innerHTML = html || '<p class="hint">この条件に合うスタンプはありません。</p>';
   $('#grid-empty').hidden = state.stickers.some((s) => s.has_raw || s.has_final);
+  updateSaleSummary();
   updateSelectionUi();
 }
 
+function updateSaleSummary() {
+  const count = (v) => state.stickers.filter((s) => (v ? s.sale === v : !s.sale)).length;
+  $('#sale-summary').innerHTML = `販売中 <b>${count('selling')}</b> ・ 申請中 <b>${count('review')}</b> ・ 未販売 <b>${count('')}</b>`;
+}
+
+$('#grid-filter').addEventListener('change', () => { writeLS('grid.filter', $('#grid-filter').value); renderGrid(); });
+$('#grid-by-genre').addEventListener('change', () => { writeLS('grid.genre', $('#grid-by-genre').checked ? '1' : '0'); renderGrid(); });
+$('#grid-filter').value = readLS('grid.filter', 'all');
+$('#grid-by-genre').checked = readLS('grid.genre', '1') === '1';
+
+document.querySelectorAll('[data-sale]').forEach((btn) => btn.addEventListener('click', async () => {
+  const ids = [...state.selected].sort();
+  if (!ids.length) { toast('先にスタンプを選んでください', true); return; }
+  const status = btn.dataset.sale;
+  const label = status ? SALE_LABELS[status] : '未販売';
+  try {
+    const d = await api('/api/sales', { method: 'POST', body: { ids, status } });
+    state.stickers.forEach((s) => { s.sale = d.sales[s.id] || ''; });
+    renderGrid();
+    toast(`${ids.length}枚を「${label}」にしました`);
+  } catch (err) { toast(err.message, true); }
+}));
+
 $('#grid').addEventListener('click', async (e) => {
+  const genreBtn = e.target.closest('[data-genre]');
+  if (genreBtn) {
+    gridFilter().filter((s) => (s.category || 'misc') === genreBtn.dataset.genre)
+      .forEach((s) => state.selected.add(s.id));
+    renderGrid();
+    return;
+  }
   const cell = e.target.closest('.cell');
   if (!cell) return;
   const id = cell.dataset.id;
@@ -879,14 +955,14 @@ $('#selection-float').addEventListener('click', () => {
 $('.toolbar').addEventListener('click', (e) => {
   const mode = e.target.dataset.select;
   if (!mode) return;
-  if (mode === 'all') state.stickers.forEach((s) => state.selected.add(s.id));
+  if (mode === 'all') gridFilter().forEach((s) => state.selected.add(s.id));
   else if (mode === 'none') state.selected.clear();
   else if (mode === 'missing') {
     state.selected.clear();
-    state.stickers.filter((s) => !s.has_raw).forEach((s) => state.selected.add(s.id));
+    gridFilter().filter((s) => !s.has_raw).forEach((s) => state.selected.add(s.id));
   } else if (mode === 'invert') {
     const next = new Set();
-    state.stickers.forEach((s) => { if (!state.selected.has(s.id)) next.add(s.id); });
+    gridFilter().forEach((s) => { if (!state.selected.has(s.id)) next.add(s.id); });
     state.selected = next;
   }
   renderGrid();

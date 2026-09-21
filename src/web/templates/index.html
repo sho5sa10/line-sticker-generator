@@ -193,6 +193,26 @@
         <button class="btn primary" id="btn-generate"
                 data-tip="選択したスタンプの画像をAPIで生成します。実行前に料金の確認が出ます">選択した画像を生成</button>
       </div>
+      <div class="group sales-row">
+        <label class="inline" data-tip="販売状況で絞り込みます">表示
+          <select id="grid-filter">
+            <option value="all">すべて</option>
+            <option value="unsold">未販売だけ</option>
+            <option value="review">申請中だけ</option>
+            <option value="selling">販売中だけ</option>
+          </select></label>
+        <label class="check" data-tip="CSVの category 列ごとに見出しを付けて並べます">
+          <input type="checkbox" id="grid-by-genre" checked> ジャンル別に表示</label>
+        <span class="sep"></span>
+        <span class="hint">選んだスタンプを</span>
+        <button class="btn small" data-sale="review"
+                data-tip="LINE Creators Market で審査に出したスタンプに付けます">申請中にする</button>
+        <button class="btn small" data-sale="selling"
+                data-tip="販売が始まったスタンプに付けます。一覧で「販売中」の印が付きます">販売中にする</button>
+        <button class="btn small ghost" data-sale=""
+                data-tip="印を外して未販売に戻します">未販売に戻す</button>
+        <span class="sale-summary" id="sale-summary"></span>
+      </div>
       <div class="group import-row">
         <button class="btn" id="btn-bulk-import"
                 data-tip="ほかのツールで作った画像や自分で描いた絵を、まとめて取り込みます。ファイル名の数字がIDになります（001.png → 001）。APIは使わないので無料です">

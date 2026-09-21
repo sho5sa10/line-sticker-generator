@@ -27,6 +27,7 @@ from . import style_suggest
 from . import gallery as gallery_mod
 from . import image_processor as ip
 from . import importer
+from . import sales as sales_mod
 from . import listing as listing_mod
 from . import package_builder as pkg
 from . import pipeline
@@ -202,7 +203,9 @@ def create_app(config=None) -> Flask:
                 setattr(style, key, type(getattr(style, key))(value))
         return style
 
-    def sticker_status(cfg_, entry: StickerEntry) -> dict:
+    def sticker_status(cfg_, entry: StickerEntry, sales: dict | None = None) -> dict:
+        if sales is None:
+            sales = sales_mod.load_sales(cfg_)
         raw = cfg_.dir_generated / f"{entry.id}.png"
         final = cfg_.dir_final / f"{entry.id}.png"
         return {
@@ -216,7 +219,12 @@ def create_app(config=None) -> Flask:
             "final_mtime": int(final.stat().st_mtime) if final.exists() else 0,
             "raw_mtime": int(raw.stat().st_mtime) if raw.exists() else 0,
             "size_kb": round(final.stat().st_size / 1024, 1) if final.exists() else 0,
+            "sale": sales.get(entry.id, ""),
         }
+
+    def statuses(cfg_, entries) -> list[dict]:
+        sales = sales_mod.load_sales(cfg_)
+        return [sticker_status(cfg_, e, sales) for e in entries]
 
     # ------------------------------------------------------------------
     # 画面
@@ -286,7 +294,7 @@ def create_app(config=None) -> Flask:
                     "gap": cfg_.get("font.gap"),
                     "font_id": fontlib.current_font_id(cfg_),
                 },
-                "stickers": [sticker_status(cfg_, e) for e in entries],
+                "stickers": statuses(cfg_, entries),
                 "job": jobs.current.to_dict() if jobs.current else None,
             }
         )
@@ -752,7 +760,7 @@ def create_app(config=None) -> Flask:
         except CsvLoadError as exc:
             return jsonify({"error": str(exc)}), 400
         cfg_ = current_config()
-        return jsonify({"stickers": [sticker_status(cfg_, e) for e in entries]})
+        return jsonify({"stickers": statuses(cfg_, entries)})
 
     @app.post("/api/stickers")
     def api_stickers_post():
@@ -782,7 +790,7 @@ def create_app(config=None) -> Flask:
             {
                 "saved_to": str(path),
                 "count": len(entries),
-                "stickers": [sticker_status(cfg_, e) for e in entries],
+                "stickers": statuses(cfg_, entries),
             }
         )
 
@@ -983,7 +991,7 @@ def create_app(config=None) -> Flask:
             "imported": sum(1 for r in results if r["ok"]),
             "results": results,
             "skipped": skipped,
-            "stickers": [sticker_status(cfg_, e) for e in entries_or_error()],
+            "stickers": statuses(cfg_, entries_or_error()),
         })
 
     @app.get("/api/job")
@@ -1042,6 +1050,21 @@ def create_app(config=None) -> Flask:
             "set_size": int(set_size) if str(set_size or "").strip().isdigit() else None,
             "ids": [str(i) for i in ids] if isinstance(ids, list) else None,
         }
+
+    # ---------- 販売状況 ----------
+    @app.post("/api/sales")
+    def api_sales():
+        """選んだスタンプに「申請中」「販売中」などの印を付けます。"""
+        cfg_ = current_config()
+        body = request.get_json(silent=True) or {}
+        ids = [str(i) for i in body.get("ids") or []]
+        if not ids:
+            return jsonify({"error": "スタンプが選ばれていません"}), 400
+        try:
+            sales = sales_mod.set_status(cfg_, ids, str(body.get("status", "")))
+        except sales_mod.SalesError as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"sales": sales, "labels": sales_mod.STATUS_LABELS})
 
     # ---------- 申請用のタイトル・説明文 ----------
     def _listing_payload(data: dict) -> dict:

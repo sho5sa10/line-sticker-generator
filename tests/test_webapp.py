@@ -790,3 +790,19 @@ def test_listing_suggest_save_and_check(client):
 
     r = client.post("/api/listing/check", json={"listing": {"title_ja": "LINEのねこ"}})
     assert r.get_json()["issues"]["title_ja"]
+
+
+# --- 販売状況 ------------------------------------------------------------
+def test_sales_status_roundtrip(client):
+    stickers = client.get("/api/state").get_json()["stickers"]
+    assert all(s["sale"] == "" for s in stickers)
+    assert {s["category"] for s in stickers} == {"basic", "thanks", "misc"}
+
+    r = client.post("/api/sales", json={"ids": ["001", "003"], "status": "selling"})
+    assert r.status_code == 200 and r.get_json()["sales"] == {"001": "selling", "003": "selling"}
+    sale = {s["id"]: s["sale"] for s in client.get("/api/state").get_json()["stickers"]}
+    assert sale == {"001": "selling", "002": "", "003": "selling"}
+
+    assert client.post("/api/sales", json={"ids": ["001"], "status": ""}).get_json()["sales"] == {"003": "selling"}
+    assert client.post("/api/sales", json={"ids": [], "status": "selling"}).status_code == 400
+    assert client.post("/api/sales", json={"ids": ["001"], "status": "bogus"}).status_code == 400

@@ -43,3 +43,4 @@ desktop.ini
 fonts/*
 !fonts/README.md
 data/listing.json
+data/sales.json

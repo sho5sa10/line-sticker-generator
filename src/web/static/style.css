@@ -650,3 +650,27 @@ main { padding: 16px; max-width: 1500px; margin: 0 auto; }
 .lst-row textarea { resize: vertical; line-height: 1.5; }
 .lst-row .bad { border-color: var(--danger); }
 .lst-issues { font-size: 12px; color: var(--danger); }
+
+/* ---------- 販売状況・ジャンル ---------- */
+.sales-row { flex-basis: 100%; padding-top: 10px; border-top: 1px dashed var(--line); }
+.sales-row .inline { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+.sales-row .sep { width: 1px; height: 22px; background: var(--line); margin: 0 4px; }
+.sales-row .hint { margin: 0; }
+.sale-summary { font-size: 12px; color: var(--muted); margin-left: auto; }
+.sale-summary b { color: var(--fg); }
+.sale-badge {
+  position: absolute; top: 9px; left: 34px; z-index: 2; font-size: 10px; font-weight: 800;
+  padding: 2px 8px; border-radius: 99px; color: #fff;
+}
+.sale-badge.selling { background: #1b8f4d; }
+.sale-badge.review { background: #c07a12; }
+.cell.sale-selling { background: color-mix(in srgb, #1b8f4d 7%, var(--surface)); }
+.cell.sale-review { background: color-mix(in srgb, #c07a12 7%, var(--surface)); }
+.genre-head {
+  grid-column: 1 / -1; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 10px 2px 2px; border-bottom: 2px solid var(--line);
+}
+.genre-head:first-child { padding-top: 0; }
+.genre-head h4 { margin: 0; font-size: 15px; }
+.genre-head .gcount { font-size: 12px; color: var(--muted); }
+.genre-head .btn { margin-left: auto; }
