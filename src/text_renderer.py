@@ -188,24 +188,35 @@ def render_text_image(
         return Image.new("RGBA", (1, 1), (0, 0, 0, 0))
 
     font, lines, line_height = fit_text(text, style, max_width, max_height)
-    widths = [_measure(ln, font, style.stroke_width)[0] for ln in lines]
-    width = max(max(widths, default=1), 1)
-    height = max(line_height * len(lines), 1)
+    sw = style.stroke_width
 
-    img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    # 各行の「縁取りを含めた実際のインクの範囲」。縁取りは文字の外側へ広がり、
+    # 字形によっては送り幅の外にもはみ出すので、送り幅ではなくこの範囲で配置します。
+    # （以前は送り幅で配置していたため、左端の縁取りが数px欠けていました）
+    boxes = [font.getbbox(ln, stroke_width=sw, anchor="la") if ln else (0, 0, 0, 0)
+             for ln in lines]
+    widths = [b[2] - b[0] for b in boxes]
+    block_w = max(max(widths, default=1), 1)
+
+    # どの方向にも欠けないよう余白を十分に取って描き、最後に描いた範囲で切り抜きます。
+    pad = sw * 2 + style.size // 2
+    img = Image.new("RGBA", (block_w + pad * 2, line_height * len(lines) + pad * 2), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
-    for i, line in enumerate(lines):
-        x = (width - widths[i]) // 2  # 中央揃え
-        y = i * line_height + style.stroke_width
+    for i, (line, box, w) in enumerate(zip(lines, boxes, widths)):
+        if not line:
+            continue
+        x = pad + (block_w - w) // 2 - box[0]  # インクの範囲で中央揃え
+        y = pad + i * line_height + sw
         draw.text(
             (x, y),
             line,
             font=font,
             fill=style.fill,
-            stroke_width=style.stroke_width,
+            stroke_width=sw,
             stroke_fill=style.stroke_fill,
             anchor="la",
         )
 
-    return img.crop(img.getbbox() or (0, 0, width, height))
+    bbox = img.getbbox()
+    return img.crop(bbox) if bbox else Image.new("RGBA", (1, 1), (0, 0, 0, 0))

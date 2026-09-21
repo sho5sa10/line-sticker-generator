@@ -105,3 +105,56 @@ def test_style_from_config(real_config):
     assert s.stroke_width >= 1
     assert s.size >= s.min_size
     assert Image  # Pillow が使えること
+
+
+# --- 縁取りが欠けないこと -------------------------------------------------
+def _reference_ink_size(text, style, max_w, max_h):
+    """十分に大きいキャンバスに描いたときの、縁取りを含むインクの大きさ（正解）。"""
+    from PIL import ImageDraw
+
+    from src.text_renderer import fit_text
+
+    font, lines, lh = fit_text(text, style, max_w, max_h)
+    pad = 200
+    img = Image.new("RGBA", (2000, lh * len(lines) + pad * 2), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    for i, ln in enumerate(lines):
+        d.text((pad, pad + i * lh), ln, font=font, fill="#fff",
+               stroke_width=style.stroke_width, stroke_fill="#000", anchor="la")
+    widest = max(
+        (lambda b: b[2] - b[0])(img.crop((0, pad + i * lh - style.stroke_width - 60,
+                                          2000, pad + (i + 1) * lh + 60)).getbbox() or (0, 0, 0, 0))
+        for i in range(len(lines))
+    )
+    return widest, lines
+
+
+def test_stroke_is_never_clipped_for_any_bundled_text(real_config, font_path):
+    """同梱の100件すべてで、縁取りが画像の外に切れていないこと。
+
+    以前は送り幅で配置していたため、左端の縁取りが2〜4px欠けていました。
+    """
+    from src.csv_loader import load_stickers
+
+    style = TextStyle(font_path=font_path, size=60, min_size=26, stroke_width=7)
+    w, h = real_config.sticker_size
+    m = real_config.margin
+    max_w, max_h = w - m * 2, int((h - m * 2) * 0.40)
+    clipped = []
+    for e in load_stickers(real_config.csv_path):
+        img = render_text_image(e.text, style, max_w, max_h)
+        expected_w, _ = _reference_ink_size(e.text, style, max_w, max_h)
+        if img.width < expected_w:
+            clipped.append((e.id, e.text, expected_w - img.width))
+    assert clipped == [], clipped
+
+
+def test_thick_stroke_is_not_clipped(font_path):
+    style = TextStyle(font_path=font_path, size=60, min_size=20, stroke_width=16)
+    img = render_text_image("了解！", style, 350, 120)
+    expected_w, _ = _reference_ink_size("了解！", style, 350, 120)
+    assert img.width >= expected_w
+    # 上下も欠けない: 縁取りの上端・下端の行にインクがあり、それより外は無い
+    a = img.getchannel("A")
+    assert a.crop((0, 0, img.width, 1)).getextrema()[1] > 0
+    assert a.crop((0, img.height - 1, img.width, img.height)).getextrema()[1] > 0
