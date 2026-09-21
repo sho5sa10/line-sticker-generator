@@ -177,6 +177,27 @@ body {
 }
 .empty-state h3 { margin: 0 0 6px; font-size: 15px; }
 .empty-state p { margin: 0 0 14px; color: var(--muted); font-size: 13px; }
+.choices {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px; max-width: 720px; margin: 0 auto; text-align: left;
+}
+.choice {
+  display: flex; flex-direction: column; gap: 6px;
+  border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 14px; background: var(--surface-2);
+}
+.choice span { font-size: 12px; color: var(--muted); flex: 1; }
+.choice .btn { align-self: flex-start; }
+
+/* 取り込み行（ツールバー2段目） */
+.import-row {
+  flex-basis: 100%; padding-top: 10px; border-top: 1px dashed var(--line);
+}
+.import-row code {
+  background: var(--surface-2); padding: 0 4px; border-radius: 4px;
+  font-family: ui-monospace, Consolas, monospace;
+}
+.tag.imported { color: var(--accent); }
 
 /* ---------- tooltip ---------- */
 .tip {

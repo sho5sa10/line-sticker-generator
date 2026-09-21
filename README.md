@@ -252,6 +252,29 @@ python -m src.main render
 
 **APIを呼ばずに**、既存の原画からセリフ合成だけをやり直します。フォントサイズや文字色を調整したときはこちらを使ってください（無料）。
 
+### 7-5. 手持ちの画像を使う（APIなし・無料）
+
+画像生成APIを使わずに、**ほかのツールで作った画像や自分で描いた絵**をスタンプの原画として取り込めます。取り込んだあとの文字入れ・LINE規格化・検証・main/tab・ZIP作成は、AIで作った場合とまったく同じです。**APIキーが無くても最後まで進められます。**
+
+```bash
+python -m src.main import path\to\images
+```
+
+- フォルダを指定すると、**ファイル名の数字をIDとして**取り込みます（`001.png` → 001、`sticker_12.jpg` → 012）
+- 数字が無い・数字が2か所ある・CSVに無い番号のファイルはスキップし、理由を表示します
+- PNG / JPEG / WebP / GIF / BMP に対応。背景が不透明な画像は、四隅の色を背景とみなして自動で透過を試みます
+- 長辺2048pxを超える画像は自動で縮小します
+
+1枚だけ取り込むなら `--id` で番号を指定できます。
+
+```bash
+python -m src.main import my_drawing.png --id 001
+```
+
+GUIでは「スタンプ一覧」の各カードにある「**画像を入れる**」、またはツールバーの「**手持ちの画像をまとめて取り込む**」から同じことができます。
+
+> **既存の画像は消えません。** 取り込みや「強制再生成」で原画を置き換えるときは、前の画像を `output/archive/replaced/<ID>_<日時>.png` に退避してから置き換えます。
+
 ---
 
 ## 8. バリデーション
@@ -334,6 +357,10 @@ python -m src.main package
 - 生成済み画像は自動的にスキップされるため、再実行しても二重課金は発生しません。
 - 気に入らない画像だけを `--id` で個別に `--force` 再生成するのが最も経済的です。
 
+**無料で使える画像生成APIについて（2026-09-21 確認）**
+Google Gemini API の画像生成モデル（`gemini-2.5-flash-image` / `gemini-3.1-flash-image` / `gemini-3.1-flash-lite-image` / `gemini-3-pro-image`）は、[公式の料金ページ](https://ai.google.dev/gemini-api/docs/pricing)で**無料枠の画像出力が "Not available"** とされています。最も安い `gemini-3.1-flash-lite-image` でも1枚 約$0.034 で、OpenAI `gpt-image-1` の `low`（約$0.011）より高くなります。
+料金をかけたくない場合は、セクション7-5の「**手持ちの画像を使う**」機能を使ってください。
+
 コストを抑えるチェックリスト:
 
 1. `--dry-run` でプロンプトを確認する（無料）
@@ -393,6 +420,7 @@ python -m src.main generate --start 1 --end 10   # 001〜010
 python -m src.main generate --start 1 --end 100  # 001〜100
 python -m src.main generate --id 001 --force     # 強制再生成
 python -m src.main render                        # 文字合成のみやり直し（API未使用）
+python -m src.main import path\to\images         # 手持ちの画像を取り込む（API未使用）
 python -m src.main validate                      # LINE仕様チェック
 python -m src.main gallery                       # gallery.html 生成
 python -m src.main package                       # main/tab画像 + ZIP生成
@@ -430,6 +458,7 @@ line-sticker-generator/
 │   ├── validator.py        # LINE仕様チェック
 │   ├── package_builder.py  # main/tab画像・セット分割・ZIP
 │   ├── pipeline.py         # 原画+セリフ→完成画像（CLIとGUIで共有）
+│   ├── importer.py         # 手持ち画像の取り込み・原画の退避
 │   ├── gallery.py          # gallery.html
 │   ├── logger.py           # generation.log / state.json
 │   ├── webapp.py           # ローカルWeb GUI（Flask）

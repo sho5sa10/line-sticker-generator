@@ -25,6 +25,7 @@ output/final/*
 output/main/*
 output/tab/*
 output/packages/*
+output/archive/
 output/*.log
 output/state.json
 output/gallery.html

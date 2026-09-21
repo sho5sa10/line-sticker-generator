@@ -420,6 +420,74 @@ def test_archive_without_files(client):
     assert client.post("/api/generated/archive", json={}).status_code == 400
 
 
+# --- 手持ち画像の取り込み -----------------------------------------------
+def test_upload_single_sticker(client, tmp_config):
+    res = client.post(
+        "/api/stickers/002/upload",
+        data={"file": (io.BytesIO(_png_bytes(make_character())), "whatever.png")},
+        content_type="multipart/form-data",
+    )
+    assert res.status_code == 200
+    d = res.get_json()
+    assert d["ok"] is True
+    assert d["sticker"]["has_final"] is True
+    assert (tmp_config.dir_final / "002.png").exists()
+
+
+def test_upload_works_without_api_key(client, monkeypatch, tmp_config):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    res = client.post(
+        "/api/stickers/001/upload",
+        data={"file": (io.BytesIO(_png_bytes(make_character())), "a.png")},
+        content_type="multipart/form-data",
+    )
+    assert res.status_code == 200
+    assert res.get_json()["ok"] is True
+
+
+def test_upload_unknown_id(client):
+    res = client.post(
+        "/api/stickers/999/upload",
+        data={"file": (io.BytesIO(_png_bytes(make_character())), "a.png")},
+        content_type="multipart/form-data",
+    )
+    assert res.status_code == 404
+
+
+def test_upload_broken_file(client, tmp_config):
+    res = client.post(
+        "/api/stickers/001/upload",
+        data={"file": (io.BytesIO(b"nope"), "a.png")},
+        content_type="multipart/form-data",
+    )
+    assert res.status_code == 400
+    assert not (tmp_config.dir_generated / "001.png").exists()
+
+
+def test_bulk_import_maps_filenames_to_ids(client, tmp_config):
+    data = {
+        "files": [
+            (io.BytesIO(_png_bytes(make_character())), "001.png"),
+            (io.BytesIO(_png_bytes(make_character())), "sticker_3.png"),
+            (io.BytesIO(_png_bytes(make_character())), "no_number.png"),
+            (io.BytesIO(_png_bytes(make_character())), "050.png"),  # CSVに無いID
+        ]
+    }
+    res = client.post("/api/stickers/import", data=data, content_type="multipart/form-data")
+    assert res.status_code == 200
+    d = res.get_json()
+    assert d["imported"] == 2
+    assert sorted(r["id"] for r in d["results"]) == ["001", "003"]
+    assert len(d["skipped"]) == 2
+    assert (tmp_config.dir_final / "001.png").exists()
+    assert (tmp_config.dir_final / "003.png").exists()
+
+
+def test_bulk_import_requires_files(client):
+    res = client.post("/api/stickers/import", data={}, content_type="multipart/form-data")
+    assert res.status_code == 400
+
+
 # --- 起動時の案内 -------------------------------------------------------
 def test_banner_is_quiet_on_loopback():
     from src.webapp import startup_banner

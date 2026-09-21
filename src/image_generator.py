@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .csv_loader import StickerEntry
+from .importer import archive_existing
 from .prompt_generator import build_prompt, load_master_prompt, save_prompt
 from .providers import (
     ProviderError,
@@ -125,6 +126,10 @@ class ImageGenerator:
                     reference_image=reference,
                     output_path=str(tmp),
                 )
+                # 強制再生成でも前の画像（手持ちの取り込み画像を含む）は消さずに退避します。
+                archived = archive_existing(self.config, entry.id)
+                if archived:
+                    self.logger.event(entry.id, "ARCHIVED", archived.name)
                 tmp.replace(out)
                 self.logger.event(entry.id, "IMAGE GENERATED", str(out.name))
                 self.state.set(entry.id, "generated")

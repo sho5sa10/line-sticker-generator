@@ -140,15 +140,33 @@
         <button class="btn primary" id="btn-generate"
                 data-tip="選択したスタンプの画像をAPIで生成します。実行前に料金の確認が出ます">選択した画像を生成</button>
       </div>
+      <div class="group import-row">
+        <button class="btn" id="btn-bulk-import"
+                data-tip="ほかのツールで作った画像や自分で描いた絵を、まとめて取り込みます。ファイル名の数字がIDになります（001.png → 001）。APIは使わないので無料です">
+          手持ちの画像をまとめて取り込む（無料）</button>
+        <span class="hint">ファイル名を <code>001.png</code>・<code>002.png</code> … にしておくと、番号どおりに入ります。1枚ずつなら各カードの「画像を入れる」から。</span>
+        <input type="file" id="bulk-file" accept="image/*" multiple hidden>
+        <input type="file" id="cell-file" accept="image/*" hidden>
+      </div>
     </div>
     <div class="note" id="grid-note"></div>
     <div class="empty-state" id="grid-empty" hidden>
       <h3>まだスタンプ画像がありません</h3>
       <p>
-        いきなり100枚作らず、<b>まず001を1枚だけ</b>作って絵柄を確かめるのがおすすめです。<br>
-        1枚あたりの料金はごくわずかですが、100枚まとめて失敗すると無駄になります。
+        画像の用意のしかたは2通りあります。どちらも、文字入れ・LINE規格化・検証・ZIP作成はこのツールが行います。
       </p>
-      <button class="btn primary" id="btn-try-one">001だけ試しに生成する</button>
+      <div class="choices">
+        <div class="choice">
+          <b>手持ちの画像を使う（無料）</b>
+          <span>ほかのツールで作った画像や自分で描いた絵を取り込みます。APIの料金はかかりません。</span>
+          <button class="btn primary" id="btn-empty-import">画像を取り込む</button>
+        </div>
+        <div class="choice">
+          <b>AIで作る（有料）</b>
+          <span>いきなり100枚作らず、<b>まず001を1枚だけ</b>作って絵柄を確かめるのがおすすめです。</span>
+          <button class="btn" id="btn-try-one">001だけ試しに生成する</button>
+        </div>
+      </div>
     </div>
     <div class="grid" id="grid"></div>
   </section>

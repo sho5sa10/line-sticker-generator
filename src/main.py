@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from pathlib import Path
 
 from . import gallery as gallery_mod
 from . import package_builder as pkg
@@ -383,6 +384,58 @@ def cmd_render(config, args) -> int:
     return EXIT_OK if failed == 0 else EXIT_ERROR
 
 
+def cmd_import(config, args) -> int:
+    """手持ちの画像を原画として取り込みます（APIを呼びません＝無料）。
+
+    ファイル名の数字をIDとして使います（例: 001.png, sticker_12.jpg）。
+    """
+    from . import importer
+
+    src = Path(args.path)
+    if src.is_dir():
+        files = sorted(
+            p for p in src.iterdir()
+            if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
+        )
+    elif src.is_file():
+        files = [src]
+    else:
+        print(f"見つかりません: {src}", file=sys.stderr)
+        return EXIT_ERROR
+    if not files:
+        print(f"取り込める画像がありません: {src}", file=sys.stderr)
+        return EXIT_ERROR
+
+    config.ensure_output_dirs()
+    style = TextStyle.from_config(config)
+    logger = RunLogger(config.log_path)
+    state = StateStore(config.state_path)
+    by_id = {e.index: e for e in load_stickers(config.csv_path)}
+
+    ok = failed = skipped = 0
+    for f in files:
+        num = int(args.id) if (args.id and len(files) == 1) else importer.id_from_filename(f.name)
+        entry = by_id.get(num) if num is not None else None
+        if entry is None:
+            print(f"SKIP {f.name} - ファイル名からIDが分からないか、CSVにありません")
+            skipped += 1
+            continue
+        r = importer.import_image(config, entry, f.read_bytes(), style, logger, state)
+        if r.archived:
+            print(f"     前の原画は output/archive/replaced/{r.archived} に退避しました")
+        for issue in r.issues:
+            print(f"     {issue}")
+        if r.ok:
+            ok += 1
+        else:
+            print(f"{entry.id} NG - {r.message}")
+            failed += 1
+
+    print("-" * 72)
+    print(f"取り込み: 成功 {ok} / 失敗 {failed} / スキップ {skipped}（APIは呼んでいません）")
+    return EXIT_OK if failed == 0 else EXIT_ERROR
+
+
 def cmd_validate(config, args) -> int:
     """完成画像がLINE仕様を満たすか検証します。"""
     entries = _select_entries(config, args) if (args.id or args.start or args.end) else None
@@ -490,6 +543,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--yes", "-y", action="store_true", help="コスト確認をスキップする")
     p.add_argument("--no-render", action="store_true", help="原画生成のみでセリフ合成しない")
     p.set_defaults(func=cmd_generate)
+
+    p = sub.add_parser("import", help="手持ちの画像を原画として取り込む（APIを呼びません）")
+    p.add_argument("path", help="画像ファイル、または画像を入れたフォルダ（ファイル名の数字=ID）")
+    p.add_argument("--id", help="1ファイルだけ取り込むときに、IDを明示する (例: 001)")
+    p.set_defaults(func=cmd_import)
 
     p = sub.add_parser("render", help="既存の原画からセリフ合成のみ再実行（APIを呼びません）")
     _add_selection_args(p)

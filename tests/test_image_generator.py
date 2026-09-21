@@ -101,6 +101,30 @@ def test_force_regenerates(generator):
     assert generator._provider.calls == 2
 
 
+def test_force_archives_previous_image(generator, tmp_config):
+    """強制再生成でも前の画像（手持ちの取り込み画像を含む）を消さずに退避します。"""
+    from src.importer import archive_dir
+
+    generator.generate_one(_entry())
+    first = generator.output_path(_entry()).read_bytes()
+    generator.generate_one(_entry(), force=True)
+
+    archived = list(archive_dir(tmp_config).glob("001_*.png"))
+    assert len(archived) == 1
+    assert archived[0].read_bytes() == first
+
+
+def test_failed_force_keeps_previous_image(generator, tmp_config):
+    """APIが失敗したら、前の画像はそのまま残ります。"""
+    generator.generate_one(_entry())
+    before = generator.output_path(_entry()).read_bytes()
+
+    generator._provider = FakeProvider(fail_times=99, fatal=True)
+    result = generator.generate_one(_entry(), force=True)
+    assert result.status == "error"
+    assert generator.output_path(_entry()).read_bytes() == before
+
+
 def test_dry_run_never_calls_api(tmp_config, generator):
     generator.dry_run = True
     result = generator.generate_one(_entry())

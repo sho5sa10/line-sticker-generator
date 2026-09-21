@@ -23,6 +23,7 @@ from PIL import Image
 
 from . import gallery as gallery_mod
 from . import image_processor as ip
+from . import importer
 from . import package_builder as pkg
 from . import pipeline
 from . import validator as vd
@@ -138,7 +139,7 @@ def create_app(config=None) -> Flask:
         static_url_path="/static",
     )
     app.config["STICKER_CONFIG"] = cfg
-    app.config["MAX_CONTENT_LENGTH"] = 24 * 1024 * 1024  # アップロード上限
+    app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024  # 1リクエストあたりのアップロード上限
     jobs = JobManager()
     app.config["JOBS"] = jobs
 
@@ -726,6 +727,84 @@ def create_app(config=None) -> Flask:
             return jsonify({"error": "すでに処理が実行中です"}), 409
         job = jobs.start("render", len(ids), _run_render, ids)
         return jsonify(job.to_dict())
+
+    # ------------------------------------------------------------------
+    # 手持ち画像の取り込み（APIを呼ばない＝無料）
+    # ------------------------------------------------------------------
+    def _import_result_dict(r: importer.ImportResult) -> dict:
+        return {
+            "id": r.sticker_id, "ok": r.ok, "message": r.message,
+            "archived": r.archived, "issues": r.issues, "size_kb": r.size_kb,
+        }
+
+    def _import_context():
+        cfg_ = current_config()
+        cfg_.ensure_output_dirs()
+        style = TextStyle.from_config(cfg_)
+        logger = RunLogger(cfg_.log_path, echo=False)
+        state = StateStore(cfg_.state_path)
+        by_id = {e.index: e for e in entries_or_error()}
+        return cfg_, style, logger, state, by_id
+
+    @app.post("/api/stickers/<sticker_id>/upload")
+    def api_sticker_upload(sticker_id: str):
+        """1枚分の画像を取り込み、完成画像まで作ります。"""
+        if jobs.is_running():
+            return jsonify({"error": "ほかの処理が実行中です。終わってから取り込んでください"}), 409
+        file = request.files.get("file")
+        if file is None or not file.filename:
+            return jsonify({"error": "ファイルが選ばれていません"}), 400
+        try:
+            cfg_, style, logger, state, by_id = _import_context()
+        except (CsvLoadError, FontNotFoundError) as exc:
+            return jsonify({"error": str(exc)}), 400
+
+        entry = by_id.get(int(sticker_id)) if sticker_id.isdigit() else None
+        if entry is None:
+            return jsonify({"error": f"IDが見つかりません: {sticker_id}"}), 404
+
+        result = importer.import_image(cfg_, entry, file.read(), style, logger, state)
+        body = _import_result_dict(result)
+        body["sticker"] = sticker_status(cfg_, entry)
+        # 画像として読めない等、取り込み自体が失敗したときだけ 400 にします。
+        failed_to_store = not result.ok and not (cfg_.dir_generated / f"{entry.id}.png").exists()
+        return jsonify(body), (400 if failed_to_store else 200)
+
+    @app.post("/api/stickers/import")
+    def api_stickers_import():
+        """複数の画像をまとめて取り込みます。ファイル名の数字をIDとして使います。"""
+        if jobs.is_running():
+            return jsonify({"error": "ほかの処理が実行中です。終わってから取り込んでください"}), 409
+        files = request.files.getlist("files")
+        if not files:
+            return jsonify({"error": "ファイルが選ばれていません"}), 400
+        try:
+            cfg_, style, logger, state, by_id = _import_context()
+        except (CsvLoadError, FontNotFoundError) as exc:
+            return jsonify({"error": str(exc)}), 400
+
+        results, skipped = [], []
+        for f in files:
+            num = importer.id_from_filename(f.filename or "")
+            entry = by_id.get(num) if num is not None else None
+            if entry is None:
+                skipped.append({
+                    "file": f.filename,
+                    "reason": "ファイル名からIDが分かりません（例: 001.png）"
+                    if num is None else f"CSVにID {num:03d} がありません",
+                })
+                continue
+            r = importer.import_image(cfg_, entry, f.read(), style, logger, state)
+            d = _import_result_dict(r)
+            d["file"] = f.filename
+            results.append(d)
+
+        return jsonify({
+            "imported": sum(1 for r in results if r["ok"]),
+            "results": results,
+            "skipped": skipped,
+            "stickers": [sticker_status(cfg_, e) for e in entries_or_error()],
+        })
 
     @app.get("/api/job")
     def api_job():

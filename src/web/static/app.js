@@ -129,18 +129,21 @@ function computeSteps(info) {
   const total = info.stickers.length;
   const raw = info.stickers.filter((s) => s.has_raw).length;
   const final = info.stickers.filter((s) => s.has_final).length;
-  const ready = info.api_key_set && !info.font_error && !info.csv_error;
+  // APIキーは必須ではありません（手持ち画像の取り込みだけでも最後まで進められます）。
+  const ready = !info.font_error && !info.csv_error;
+  const aiReady = info.api_key_set && info.master_ok;
 
   return [
     {
       n: 1, key: 'setup', title: '準備を整える',
-      desc: ready
-        ? `APIキー・フォント・CSV(${total}件) すべてOK`
-        : [!info.api_key_set && 'APIキー未設定', info.font_error && 'フォント未検出',
-           info.csv_error && 'CSVエラー'].filter(Boolean).join(' / '),
+      desc: !ready
+        ? [info.font_error && 'フォント未検出', info.csv_error && 'CSVエラー'].filter(Boolean).join(' / ')
+        : info.api_key_set
+          ? `フォント・CSV(${total}件)・APIキー すべてOK`
+          : `フォント・CSV(${total}件) OK。APIキーなし＝手持ち画像で進めます`,
       done: ready, blocked: !ready,
       action: { label: '準備の状態を見る', run: () => switchTab('start') },
-      help: '.env に OPENAI_API_KEY を書いてから、このページを再読み込みしてください。',
+      help: 'フォントとCSVが必要です。APIキーはAIで画像を作るときだけ必要です。',
     },
     {
       n: 2, key: 'character', title: 'キャラクターを決める',
@@ -148,16 +151,24 @@ function computeSteps(info) {
         ? 'マスター画像あり。差し替えれば別キャラのセットも作れます'
         : 'まだありません。画像を用意するか、AIに作ってもらえます',
       done: info.master_ok, blocked: false,
+      // AIを使わない（APIキーなし）なら、マスター画像は無くても進められます。
+      optional: !info.api_key_set,
       action: { label: info.master_ok ? 'キャラクターを見直す' : 'キャラクターを用意する',
                 run: () => switchTab('start') },
       help: '画像をアップロードするか、AIに1枚だけ作らせることができます。'
           + 'いまの画像は履歴として残るので、いつでも戻せます。',
     },
     {
-      n: 3, key: 'try', title: 'まず1枚だけ試す',
-      desc: raw ? `${raw}枚の画像ができています` : '001を1枚だけ作って絵柄を確認します',
+      n: 3, key: 'try', title: 'まず1枚用意する',
+      desc: raw
+        ? `${raw}枚の画像ができています`
+        : aiReady
+          ? '001を1枚だけAIで作るか、手持ちの画像を取り込みます'
+          : '手持ちの画像を取り込みます（無料）',
       done: raw >= 1, blocked: false,
-      action: { label: '001を1枚だけ生成', run: () => tryOne() },
+      action: aiReady
+        ? { label: '001を1枚だけ生成', run: () => tryOne() }
+        : { label: '画像を取り込む（無料）', run: () => startBulkImport() },
     },
     {
       n: 4, key: 'design', title: '文字の見た目を整える',
@@ -167,12 +178,15 @@ function computeSteps(info) {
       action: { label: '文字デザインを開く', run: () => switchTab('design') },
     },
     {
-      n: 5, key: 'rest', title: '残りをまとめて生成',
+      n: 5, key: 'rest', title: '残りをそろえる',
       desc: raw >= total && total
-        ? `${total}枚すべて生成済み`
-        : `残り${Math.max(total - raw, 0)}枚。料金は実行前に確認できます`,
+        ? `${total}枚すべてそろいました`
+        : `残り${Math.max(total - raw, 0)}枚。`
+          + (aiReady ? 'AIで作る（料金は実行前に確認）か、画像を取り込みます' : '手持ちの画像を取り込みます'),
       done: total > 0 && raw >= total, blocked: false,
-      action: { label: '未生成をまとめて選ぶ', run: () => selectMissing() },
+      action: aiReady
+        ? { label: '未生成をまとめて選ぶ', run: () => selectMissing() }
+        : { label: '残りの画像を取り込む', run: () => startBulkImport() },
     },
     {
       n: 6, key: 'validate', title: 'LINE仕様を検証',
@@ -351,8 +365,8 @@ async function loadState() {
   const notes = [];
   if (info.csv_error) notes.push(`CSVエラー: ${info.csv_error}`);
   if (info.font_error) notes.push(`フォント: ${info.font_error}`);
-  if (!info.master_ok) notes.push('マスター画像がありません。`python -m src.main init-character` か、自分で用意した透過PNGを data/character/character_master.png に置いてください。');
-  if (!info.api_key_set) notes.push('APIキーが未設定です（.env の OPENAI_API_KEY）。dry-run と文字合成だけなら実行できます。');
+  if (!info.master_ok && info.api_key_set) notes.push('キャラクターマスター画像がありません（AIで作るときに必要です）。「はじめに」タブで用意できます。');
+  if (!info.api_key_set) notes.push('APIキーが未設定のため、AIでの画像生成は使えません。手持ちの画像を取り込めば、文字入れ・検証・ZIP作成まで無料で進められます。');
   $('#grid-note').innerHTML = notes.map((n) => `⚠ ${n}`).join('<br>');
 }
 
@@ -570,8 +584,14 @@ function renderGrid() {
         <div class="ctext">${escapeHtml(s.text)}</div>
         <div class="meta">${escapeHtml(s.action || '')}</div>
         <div class="rowbtns">
-          <button class="btn" data-act="regen" title="この1枚だけAPIで作り直します（課金されます）">作り直す</button>
-          <button class="btn" data-act="rerender" title="APIを使わず文字だけ再合成します">文字のみ</button>
+          <button class="btn" data-act="upload"
+                  data-tip="この番号に手持ちの画像を入れます。文字入れ・検証まで自動で行います（無料）">画像を入れる</button>
+        </div>
+        <div class="rowbtns">
+          <button class="btn" data-act="regen"
+                  data-tip="この1枚だけAIで作り直します（課金されます）。前の画像は退避されます">AIで作り直す</button>
+          <button class="btn" data-act="rerender"
+                  data-tip="APIを使わず文字だけ貼り直します（無料）">文字のみ</button>
         </div>
       </div>`;
   }).join('');
@@ -602,6 +622,13 @@ $('#grid').addEventListener('click', async (e) => {
     return;
   }
   const act = e.target.dataset.act;
+  if (act === 'upload') {
+    const input = $('#cell-file');
+    input.dataset.target = id;
+    input.value = '';
+    input.click();
+    return;
+  }
   if (act === 'regen') {
     const cost = await costFor(1);
     if (!confirm(`${id}「${sticker.text}」をAPIで作り直します。\n概算コスト: ${cost}\n\n実行しますか？`)) return;
@@ -666,6 +693,93 @@ $('#btn-generate').addEventListener('click', async () => {
 });
 
 $('#btn-render').addEventListener('click', () => runRender([...state.selected].sort()));
+
+/* ------------------------------------------------------------------ */
+/* 手持ち画像の取り込み（APIを呼ばない＝無料）                          */
+/* ------------------------------------------------------------------ */
+function startBulkImport() {
+  switchTab('grid');
+  const input = $('#bulk-file');
+  input.value = '';
+  input.click();
+}
+$('#btn-bulk-import').addEventListener('click', startBulkImport);
+$('#btn-empty-import').addEventListener('click', startBulkImport);
+
+/** 1枚だけ取り込む（カードの「画像を入れる」）。 */
+$('#cell-file').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  const id = e.target.dataset.target;
+  if (!file || !id) return;
+  const sticker = state.stickers.find((s) => s.id === id);
+  if (sticker && sticker.has_raw
+      && !confirm(`${id} にはすでに画像があります。\n置き換えますか？（前の画像は output/archive/replaced/ に残ります）`)) {
+    return;
+  }
+  const form = new FormData();
+  form.append('file', file);
+  try {
+    const res = await fetch(`/api/stickers/${encodeURIComponent(id)}/upload`, { method: 'POST', body: form });
+    const d = await res.json();
+    if (!res.ok) throw new Error(d.error || d.message || '取り込みに失敗しました');
+    const extra = d.issues && d.issues.length ? `（注意: ${d.issues[0]}）` : '';
+    toast(d.ok ? `${id} に画像を入れました ${extra}` : `${id}: ${d.message} ${extra}`, !d.ok);
+    await refreshStickers();
+  } catch (err) { toast(err.message, true); }
+});
+
+/** まとめて取り込む。大量でも止まらないよう、8枚ずつ送って進捗を出します。 */
+$('#bulk-file').addEventListener('change', async (e) => {
+  const files = Array.from(e.target.files);
+  if (!files.length) return;
+
+  const existing = new Set(state.stickers.filter((s) => s.has_raw).map((s) => s.id));
+  const overwrite = files.filter((f) => {
+    const m = f.name.replace(/\.[^.]+$/, '').match(/^\D*(\d{1,4})\D*$/);
+    return m && existing.has(String(parseInt(m[1], 10)).padStart(3, '0'));
+  }).length;
+  if (overwrite && !confirm(`${files.length}枚のうち ${overwrite}枚は、すでに画像がある番号です。\n`
+      + '置き換えますか？（前の画像は output/archive/replaced/ に残ります）')) return;
+
+  resetJobUi('画像を取り込んでいます（APIは使いません）');
+  $('#btn-cancel').style.display = 'none';
+  $('#job-api').textContent = 'API呼び出し 0回';
+  const log = $('#job-log');
+  const line = (cls, text) => {
+    const div = document.createElement('div');
+    div.className = cls;
+    div.textContent = text;
+    log.appendChild(div);
+    log.scrollTop = log.scrollHeight;
+  };
+
+  let done = 0, ok = 0, ng = 0, skip = 0;
+  const CHUNK = 8;
+  for (let i = 0; i < files.length; i += CHUNK) {
+    const form = new FormData();
+    files.slice(i, i + CHUNK).forEach((f) => form.append('files', f));
+    try {
+      const res = await fetch('/api/stickers/import', { method: 'POST', body: form });
+      const d = await res.json();
+      if (!res.ok) throw new Error(d.error || '取り込みに失敗しました');
+      d.results.forEach((r) => {
+        if (r.ok) ok++; else ng++;
+        line(r.ok ? 'ok' : 'error', `${r.id} ${r.file} … ${r.message}${r.issues.length ? '（' + r.issues[0] + '）' : ''}`);
+      });
+      d.skipped.forEach((s) => { skip++; line('skip', `${s.file} … ${s.reason}`); });
+    } catch (err) {
+      ng += Math.min(CHUNK, files.length - i);
+      line('error', err.message);
+    }
+    done = Math.min(i + CHUNK, files.length);
+    $('#job-progress').textContent = `${done} / ${files.length}`;
+    $('#job-fill').style.width = `${Math.round((done / files.length) * 100)}%`;
+  }
+
+  $('#job-title').textContent = `取り込み完了: 成功 ${ok} / 失敗 ${ng} / スキップ ${skip}`;
+  toast(`取り込み完了: 成功 ${ok}枚`, ng > 0 && ok === 0);
+  await refreshStickers();
+});
 
 /* ------------------------------------------------------------------ */
 /* ジョブ実行と進捗                                                    */
