@@ -405,6 +405,10 @@ def create_app(config=None) -> Flask:
         return jsonify({
             "groups": cprof.GROUPS,
             "presets": cprof.PRESETS,
+            "preset_info": cprof.PRESET_INFO,
+            "preset_categories": cprof.PRESET_CATEGORIES,
+            # JSONの辞書はキーが並べ替えられるので、表示順は別に渡します。
+            "preset_order": list(cprof.PRESETS),
             "profile": profile,
             # 説明文が選択内容から作った文章と違う＝手で書き換えてある
             "text_matches_profile": bool(profile) and cprof.compose(profile) == text,

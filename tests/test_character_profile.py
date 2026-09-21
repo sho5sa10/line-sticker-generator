@@ -124,3 +124,39 @@ def test_load_profile_missing_or_broken(tmp_path):
 def test_infer_profile_from_text():
     assert cp.infer_profile(DEFAULT_CHARACTER_JA) == cp.PRESETS["会社員（男性）"]
     assert cp.infer_profile("自由に書いた説明。") is None
+
+
+# --- ランキングの傾向から追加したひな形 -----------------------------------
+def test_every_preset_has_category_and_reason():
+    assert set(cp.PRESETS) == set(cp.PRESET_INFO)
+    for name, info in cp.PRESET_INFO.items():
+        assert info["category"] in cp.PRESET_CATEGORIES, name
+        assert info["note"], name
+
+
+def test_presets_do_not_name_existing_characters():
+    """人気キャラの名前をひな形に使わない（似せたスタンプは審査で落ちる・権利の問題）。"""
+    banned = ["ちいかわ", "ハチワレ", "うさまる", "ピングー", "モンチッチ", "もちにゃみ",
+              "コビハム", "うるせぇトリ", "もちわさ", "プリキュア"]
+    texts = [cp.compose(p) for p in cp.PRESETS.values()] + list(cp.PRESETS)
+    for word in banned:
+        assert not any(word in t for t in texts), word
+
+
+@pytest.mark.parametrize(
+    "profile,first_line",
+    [
+        ({"kind": "ふしぎな生き物", "creature": "おばけ"}, "おばけのキャラクター。"),
+        ({"kind": "ふしぎな生き物"}, "ふしぎな生き物のキャラクター。"),
+        ({"kind": "食べ物", "food": "プリン"}, "プリンに顔と手足がついたキャラクター。"),
+        ({"kind": "動物", "animal": "ハシビロコウ"}, "ハシビロコウのキャラクター。"),
+    ],
+)
+def test_new_kinds(profile, first_line):
+    assert cp.compose(profile).splitlines()[0] == first_line
+
+
+def test_fur_color_only_for_animals_and_creatures():
+    assert "三毛もようの体。" in cp.compose({"kind": "動物", "animal": "ねこ", "fur": "三毛"})
+    assert "fur" not in cp.normalize({"kind": "人", "fur": "白"})
+    assert "fur" not in cp.normalize({"kind": "食べ物", "fur": "白"})

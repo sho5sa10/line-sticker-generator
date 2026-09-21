@@ -195,6 +195,11 @@ body {
   background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 700;
 }
 .opt.preset { border-style: dashed; }
+#preset-row { display: grid; gap: 6px; }
+.preset-cat { display: flex; gap: 8px; align-items: flex-start; }
+.preset-cat-name {
+  flex: none; width: 56px; font-size: 11px; color: var(--muted); padding-top: 6px;
+}
 #profile-extra {
   width: 100%; padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px;
   background: var(--surface); color: var(--fg); font: inherit; font-size: 13px;

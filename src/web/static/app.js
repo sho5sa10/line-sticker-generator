@@ -569,6 +569,9 @@ async function loadProfile() {
   try { d = await api('/api/master/profile'); } catch (e) { return; }
   state.groups = d.groups;
   state.presets = d.presets;
+  state.presetInfo = d.preset_info || {};
+  state.presetCategories = d.preset_categories || [];
+  state.presetOrder = d.preset_order || Object.keys(d.presets);
   state.profile = d.profile || {};
   // 保存された選択内容と説明文が食い違う＝手で書き換えてある
   setManualEdit(!d.text_matches_profile && !!$('#master-prompt').value.trim());
@@ -588,9 +591,20 @@ function pruneProfile() {
 }
 
 function renderProfile() {
-  $('#preset-row').innerHTML = Object.keys(state.presets)
-    .map((name) => `<button type="button" class="opt preset" data-preset="${escapeHtml(name)}">${escapeHtml(name)}</button>`)
-    .join('');
+  // ひな形は「人／動物／そのほか」に分けて並べ、選んだ理由をツールチップで出します。
+  const btn = (name) => {
+    const note = (state.presetInfo[name] || {}).note || '';
+    return `<button type="button" class="opt preset" data-preset="${escapeHtml(name)}"
+      ${note ? `data-tip="${escapeHtml(note)}"` : ''}>${escapeHtml(name)}</button>`;
+  };
+  const names = state.presetOrder || Object.keys(state.presets);
+  const cats = state.presetCategories.length ? state.presetCategories : [''];
+  $('#preset-row').innerHTML = cats.map((cat) => {
+    const inCat = names.filter((n) => !cat || (state.presetInfo[n] || {}).category === cat);
+    if (!inCat.length) return '';
+    return `<div class="preset-cat">${cat ? `<span class="preset-cat-name">${escapeHtml(cat)}</span>` : ''}
+            <div class="chips-row">${inCat.map(btn).join('')}</div></div>`;
+  }).join('');
 
   $('#profile-groups').innerHTML = state.groups
     .filter((g) => isGroupVisible(g, state.profile))

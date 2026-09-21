@@ -617,3 +617,12 @@ def test_is_loopback():
     assert is_loopback("localhost")
     assert not is_loopback("0.0.0.0")
     assert not is_loopback("192.168.1.5")
+
+
+def test_profile_returns_preset_categories(client):
+    d = client.get("/api/master/profile").get_json()
+    assert d["preset_categories"] == ["人", "動物", "そのほか"]
+    assert d["preset_info"]["ハシビロコウ"]["category"] == "動物"
+    assert "ランキング" in d["preset_info"]["ふわふわ子ねこ"]["note"]
+    # 表示順は定義順（JSONのキー並べ替えの影響を受けない）
+    assert d["preset_order"][0] == "会社員（男性）"
