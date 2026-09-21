@@ -21,6 +21,7 @@ from pathlib import Path
 from flask import Flask, jsonify, request, send_file, send_from_directory
 from PIL import Image
 
+from . import character_profile as cprof
 from . import gallery as gallery_mod
 from . import image_processor as ip
 from . import importer
@@ -385,9 +386,36 @@ def create_app(config=None) -> Flask:
         path = cfg_.master_prompt_ja_path
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text + "\n", encoding="utf-8")
+        if isinstance(body.get("profile"), dict):
+            cprof.save_profile(cfg_.character_profile_path, body["profile"])
         body = {"saved_to": str(path)}
         body.update(_prompt_info(cfg_))
         return jsonify(body)
+
+    @app.get("/api/master/profile")
+    def api_master_profile():
+        """かんたん入力の選択肢・ひな形と、保存済みの選択内容を返します。"""
+        cfg_ = current_config()
+        ja_path = cfg_.master_prompt_ja_path
+        text = ja_path.read_text(encoding="utf-8").strip() if ja_path.exists() else ""
+        profile = cprof.load_profile(cfg_.character_profile_path)
+        if profile is None and text:
+            # 保存された選択内容が無くても、説明文がひな形と同じなら選択状態を復元します。
+            profile = cprof.infer_profile(text)
+        return jsonify({
+            "groups": cprof.GROUPS,
+            "presets": cprof.PRESETS,
+            "profile": profile,
+            # 説明文が選択内容から作った文章と違う＝手で書き換えてある
+            "text_matches_profile": bool(profile) and cprof.compose(profile) == text,
+        })
+
+    @app.post("/api/master/compose")
+    def api_master_compose():
+        """選択内容から説明文を組み立てます（保存はしません）。"""
+        body = request.get_json(silent=True) or {}
+        profile = cprof.normalize(body.get("profile"))
+        return jsonify({"text": cprof.compose(profile), "profile": profile})
 
     def _backup_master(path: Path) -> str | None:
         """既存のマスター画像を退避します（削除はしません）。"""

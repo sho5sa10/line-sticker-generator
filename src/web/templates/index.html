@@ -112,11 +112,36 @@
         <div class="warn-box" id="master-warn" hidden></div>
 
         <details class="promptbox" open>
-          <summary>キャラクターの特徴（日本語で書けます）</summary>
+          <summary>キャラクターの特徴</summary>
           <p class="hint">
-            AIで画像を作るときに使われる、キャラクターの説明です。髪型・服装・頭身・雰囲気などを、
-            <b>1行に1つずつ日本語で</b>書いてください。マスター画像にも、100枚のスタンプすべてにも使われます。
+            AIで画像を作るときに使われる、キャラクターの説明です。マスター画像にも、100枚のスタンプすべてにも使われます。
+            <b>下のボタンを選ぶだけで説明文ができあがります。</b>
           </p>
+
+          <div class="easy">
+            <div class="easy-row">
+              <span class="easy-label">ひな形から始める</span>
+              <div class="chips-row" id="preset-row"></div>
+            </div>
+            <div id="profile-groups"></div>
+            <div class="easy-row">
+              <span class="easy-label">そのほかの特徴</span>
+              <input type="text" id="profile-extra" maxlength="500"
+                     placeholder="選択肢に無いものを自由に（例: 左目の下にほくろ。）"
+                     data-tip="ここに書いた内容は説明文の最後に追加されます">
+            </div>
+          </div>
+
+          <div class="result-head">
+            <b>できあがった説明文</b>
+            <span class="hint">直接書き換えてもかまいません</span>
+            <button class="btn small ghost" id="btn-recompose" hidden
+                    data-tip="手で書き換えた内容を捨てて、上の選択内容から説明文を作り直します">選択内容で作り直す</button>
+          </div>
+          <div class="manual-note" id="manual-note" hidden>
+            説明文を手で書き換えたので、上の選択を変えても説明文は自動で変わりません。
+            選択内容に合わせたいときは「選択内容で作り直す」を押してください。
+          </div>
           <textarea id="master-prompt" spellcheck="false"
                     placeholder="例）&#10;20代くらいの女性。&#10;茶色のボブヘア。&#10;黄色いパーカー。&#10;2頭身のちびキャラ。"></textarea>
           <div class="prompt-actions">

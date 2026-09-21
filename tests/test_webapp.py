@@ -437,6 +437,59 @@ def test_server_outdated_after_code_change(tmp_config, monkeypatch):
     assert client.get("/api/server").get_json() == {"outdated": True}
 
 
+# --- かんたん入力 ------------------------------------------------------
+def test_profile_options_returned(client):
+    d = client.get("/api/master/profile").get_json()
+    assert {g["key"] for g in d["groups"]} >= {"kind", "gender", "hair", "outfit", "mood"}
+    assert "会社員（男性）" in d["presets"]
+    assert d["profile"] is None  # 何も保存されていない
+
+
+def test_profile_inferred_from_bundled_text(client, tmp_config):
+    """選択内容の保存が無くても、説明文がひな形と同じなら選択状態を復元します。"""
+    from src.prompt_generator import DEFAULT_CHARACTER_JA
+
+    tmp_config.master_prompt_ja_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_config.master_prompt_ja_path.write_text(DEFAULT_CHARACTER_JA + "\n", encoding="utf-8")
+    d = client.get("/api/master/profile").get_json()
+    assert d["profile"]["job"] == "会社員"
+    assert d["text_matches_profile"] is True
+
+
+def test_compose_endpoint(client):
+    d = client.post("/api/master/compose", json={
+        "profile": {"kind": "動物", "animal": "うさぎ", "hair": "ボブ", "palette": "パステル"},
+    }).get_json()
+    assert d["text"].splitlines()[0] == "うさぎのキャラクター。"
+    assert "ボブ" not in d["text"]          # 動物には髪型を使わない
+    assert "hair" not in d["profile"]
+
+
+def test_save_prompt_with_profile(client, tmp_config):
+    from src import character_profile as cp
+
+    profile = cp.PRESETS["学生"]
+    text = cp.compose(profile)
+    res = client.post("/api/master/prompt", json={"prompt_ja": text, "profile": profile})
+    assert res.status_code == 200
+    assert cp.load_profile(tmp_config.character_profile_path) == profile
+
+    d = client.get("/api/master/profile").get_json()
+    assert d["profile"] == profile
+    assert d["text_matches_profile"] is True
+
+
+def test_manual_edit_is_detected(client, tmp_config):
+    from src import character_profile as cp
+
+    profile = cp.PRESETS["学生"]
+    client.post("/api/master/prompt",
+                json={"prompt_ja": cp.compose(profile) + "\n手で足した一文。", "profile": profile})
+    d = client.get("/api/master/profile").get_json()
+    assert d["profile"] == profile
+    assert d["text_matches_profile"] is False  # 画面は「手で書き換えた」扱いにする
+
+
 def test_master_prompt_rejects_empty(client):
     assert client.post("/api/master/prompt", json={"prompt_ja": "  "}).status_code == 400
 

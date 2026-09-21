@@ -16,6 +16,12 @@ const state = {
   steps: [],
   pinnedStep: null,   // ユーザーが明示的に選んだステップ（自動判定より優先）
   master: null,
+  // かんたん入力
+  groups: [],
+  presets: {},
+  profile: {},
+  manualEdit: false,   // 説明文を手で書き換えたら true（選択を変えても上書きしない）
+  promptDirty: false,  // 保存していない変更がある
 };
 
 /* ------------------------------------------------------------------ */
@@ -480,7 +486,10 @@ async function loadMaster() {
     $('#master-meta').textContent = m.error || m.path;
   }
 
-  if ($('#master-prompt') !== document.activeElement) $('#master-prompt').value = m.prompt_ja;
+  if (!state.promptDirty && $('#master-prompt') !== document.activeElement) {
+    $('#master-prompt').value = m.prompt_ja;
+    await loadProfile();
+  }
   renderPromptInfo(m);
 
   // 履歴
@@ -554,6 +563,118 @@ $('#btn-master-restore').addEventListener('click', async () => {
   } catch (e) { toast(e.message, true); }
 });
 
+/* ---------- かんたん入力（選択肢から説明文を作る） ---------- */
+async function loadProfile() {
+  let d;
+  try { d = await api('/api/master/profile'); } catch (e) { return; }
+  state.groups = d.groups;
+  state.presets = d.presets;
+  state.profile = d.profile || {};
+  // 保存された選択内容と説明文が食い違う＝手で書き換えてある
+  setManualEdit(!d.text_matches_profile && !!$('#master-prompt').value.trim());
+  $('#profile-extra').value = state.profile.extra || '';
+  renderProfile();
+}
+
+function isGroupVisible(g, profile) {
+  return Object.entries(g.when || {}).every(([k, allowed]) => allowed.includes(profile[k]));
+}
+
+/** 表示されなくなった項目（例: 動物にしたときの髪型）の選択を外します。 */
+function pruneProfile() {
+  for (const g of state.groups) {
+    if (!isGroupVisible(g, state.profile)) delete state.profile[g.key];
+  }
+}
+
+function renderProfile() {
+  $('#preset-row').innerHTML = Object.keys(state.presets)
+    .map((name) => `<button type="button" class="opt preset" data-preset="${escapeHtml(name)}">${escapeHtml(name)}</button>`)
+    .join('');
+
+  $('#profile-groups').innerHTML = state.groups
+    .filter((g) => isGroupVisible(g, state.profile))
+    .map((g) => {
+      const cur = state.profile[g.key];
+      const chips = g.options.map((o) => {
+        const on = g.type === 'multi' ? (cur || []).includes(o) : cur === o;
+        return `<button type="button" class="opt${on ? ' on' : ''}" data-key="${g.key}" data-val="${escapeHtml(o)}">${escapeHtml(o)}</button>`;
+      }).join('');
+      const note = g.type === 'multi' ? '<small>いくつでも</small>' : '<small>もう一度押すと解除</small>';
+      return `<div class="easy-row"><span class="easy-label">${escapeHtml(g.label)}${note}</span>
+              <div class="chips-row">${chips}</div></div>`;
+    }).join('');
+}
+
+function setManualEdit(on) {
+  state.manualEdit = on;
+  $('#manual-note').hidden = !on;
+  $('#btn-recompose').hidden = !on;
+}
+
+let composeTimer = null;
+function onProfileChange() {
+  state.promptDirty = true;
+  pruneProfile();
+  renderProfile();
+  if (state.manualEdit) return;   // 手で書き換えた説明文は勝手に上書きしません
+  clearTimeout(composeTimer);
+  composeTimer = setTimeout(composeFromProfile, 120);
+}
+
+async function composeFromProfile() {
+  try {
+    const d = await api('/api/master/compose', { method: 'POST', body: { profile: state.profile } });
+    $('#master-prompt').value = d.text;
+  } catch (e) { toast(e.message, true); }
+}
+
+$('#preset-row').addEventListener('click', (e) => {
+  const name = e.target.dataset.preset;
+  if (!name) return;
+  if (state.manualEdit && !confirm(`「${name}」の内容で説明文を作り直します。手で書き換えた部分は消えますがよろしいですか？`)) return;
+  state.profile = JSON.parse(JSON.stringify(state.presets[name]));
+  $('#profile-extra').value = '';
+  setManualEdit(false);
+  onProfileChange();
+  toast(`「${name}」を読み込みました。気になるところだけ変えてください`);
+});
+
+$('#profile-groups').addEventListener('click', (e) => {
+  const { key, val } = e.target.dataset;
+  if (!key) return;
+  const g = state.groups.find((x) => x.key === key);
+  if (g.type === 'multi') {
+    const list = new Set(state.profile[key] || []);
+    if (list.has(val)) list.delete(val); else list.add(val);
+    // 選択肢の並び順にそろえる（説明文の語順が安定するように）
+    const ordered = g.options.filter((o) => list.has(o));
+    if (ordered.length) state.profile[key] = ordered; else delete state.profile[key];
+  } else if (state.profile[key] === val) {
+    delete state.profile[key];   // もう一度押すと解除
+  } else {
+    state.profile[key] = val;
+  }
+  onProfileChange();
+});
+
+$('#profile-extra').addEventListener('input', (e) => {
+  const v = e.target.value;
+  if (v.trim()) state.profile.extra = v; else delete state.profile.extra;
+  onProfileChange();
+});
+
+$('#master-prompt').addEventListener('input', () => {
+  state.promptDirty = true;
+  setManualEdit(true);
+});
+
+$('#btn-recompose').addEventListener('click', () => {
+  if (!confirm('手で書き換えた説明文を捨てて、選択内容から作り直します。よろしいですか？')) return;
+  setManualEdit(false);
+  onProfileChange();
+});
+
 /** 日本語版が使われているか、実際にAIへ送る全文はどうなるかを表示します。 */
 function renderPromptInfo(m) {
   $('#prompt-mode').textContent = m.prompt_mode === 'ja'
@@ -565,8 +686,9 @@ function renderPromptInfo(m) {
 $('#btn-prompt-save').addEventListener('click', async () => {
   try {
     const d = await api('/api/master/prompt', {
-      method: 'POST', body: { prompt_ja: $('#master-prompt').value },
+      method: 'POST', body: { prompt_ja: $('#master-prompt').value, profile: state.profile },
     });
+    state.promptDirty = false;
     renderPromptInfo(d);
     toast('キャラクターの説明を保存しました。これから作る画像に使われます');
   } catch (e) { toast(e.message, true); }

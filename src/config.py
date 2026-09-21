@@ -165,6 +165,11 @@ class Config:
         return self.resolve("character.master_prompt_ja", "prompts/character_master_ja.txt")
 
     @property
+    def character_profile_path(self) -> Path:
+        """GUIの「かんたん入力」で選んだ内容の保存先。"""
+        return self.resolve("character.profile", "prompts/character_profile.json")
+
+    @property
     def dir_generated_prompts(self) -> Path:
         return self.root / "prompts" / "generated"
 
