@@ -160,6 +160,13 @@ def create_app(config=None) -> Flask:
     def server_outdated() -> bool:
         return code_fingerprint() > started_code + 0.001
 
+    @app.after_request
+    def no_stale_assets(response):
+        """画面（HTML/CSS/JS）は毎回サーバーに確認させ、古いものが使われないようにします。"""
+        if request.path == "/" or request.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-cache"
+        return response
+
     # ------------------------------------------------------------------
     # ヘルパ
     # ------------------------------------------------------------------

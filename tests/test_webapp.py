@@ -626,3 +626,24 @@ def test_profile_returns_preset_categories(client):
     assert "ランキング" in d["preset_info"]["ふわふわ子ねこ"]["note"]
     # 表示順は定義順（JSONのキー並べ替えの影響を受けない）
     assert d["preset_order"][0] == "会社員（男性）"
+
+
+# --- 画面の表示・キャッシュ ---------------------------------------------
+def test_css_hidden_attribute_always_wins():
+    """hidden を付けた要素は、個別の display 指定より優先して必ず隠す。
+
+    以前は .assets img { display: block } が hidden を打ち消し、
+    まだ無い main/tab 画像が壊れた画像として表示されていました。
+    """
+    from src.webapp import WEB_DIR
+
+    css = (WEB_DIR / "static" / "style.css").read_text(encoding="utf-8")
+    assert "[hidden] { display: none !important; }" in css
+
+
+def test_assets_are_revalidated(client):
+    """画面のファイルは毎回サーバーに確認させ、古いCSS/JSが使われないようにする。"""
+    for path in ("/", "/static/style.css", "/static/app.js"):
+        res = client.get(path)
+        assert res.status_code == 200, path
+        assert res.headers.get("Cache-Control") == "no-cache", path

@@ -80,9 +80,9 @@ def test_prompt_demands_transparency_and_consistency():
 def test_all_100_prompts_are_unique(real_config):
     entries = load_stickers(real_config.csv_path)
     prompts = build_prompts(entries, load_master_prompt(real_config.master_prompt_path))
-    assert len(prompts) == 100
+    assert len(prompts) == len(entries)
     # ポーズ・表情が違うのでプロンプトも全て異なるはず
-    assert len(set(prompts.values())) == 100
+    assert len(set(prompts.values())) == len(entries)
     # セリフ本文はどのプロンプトにも含まれない
     for entry in entries:
         assert entry.text not in prompts[entry.id]
@@ -125,29 +125,38 @@ def test_empty_japanese_falls_back_to_english(tmp_path):
     assert load_master_prompt(en, tmp_path / "missing.txt") == "English character."
 
 
-def test_project_japanese_master_file(real_config):
-    """同梱の日本語版は、英語版と同じキャラクターを日本語で書いたものです。"""
-    from src.prompt_generator import master_prompt_from_config
+def test_default_japanese_master_matches_english_character():
+    """初期値の日本語説明は、英語版と同じキャラクターを日本語で書いたものです。
 
-    text = real_config.master_prompt_ja_path.read_text(encoding="utf-8")
+    実際の prompts/character_master_ja.txt はユーザーが自由に書き換えるので、
+    その中身ではなく、組み込みの初期値（DEFAULT_CHARACTER_JA）を確認します。
+    """
+    from src.prompt_generator import DEFAULT_CHARACTER_JA
+
     for word in ("30代", "日本人男性", "会社員", "頭身", "黒髪", "ワイシャツ", "ネクタイ"):
-        assert word in text
+        assert word in DEFAULT_CHARACTER_JA
+
+
+def test_project_master_prompt_always_has_fixed_lines(real_config):
+    """ユーザーがどんなキャラを書いても、技術的な指示は必ず付くこと。"""
+    from src.prompt_generator import master_prompt_from_config
 
     master = master_prompt_from_config(real_config)
     for line in FIXED_LINES:
         assert line in master
 
 
-def test_japanese_master_used_in_every_sticker_prompt(real_config):
-    from src.prompt_generator import master_prompt_from_config
+def test_japanese_master_used_in_every_sticker_prompt(real_config, tmp_path):
+    ja = tmp_path / "ja.txt"
+    ja.write_text("茶色のボブヘアの女性。\n黄色いパーカー。", encoding="utf-8")
+    master = load_master_prompt(tmp_path / "none.txt", ja)
 
-    master = master_prompt_from_config(real_config)
     entries = load_stickers(real_config.csv_path)
     prompts = build_prompts(entries, master)
-    assert len(set(prompts.values())) == 100
+    assert len(set(prompts.values())) == len(entries)
     for entry in entries:
         p = prompts[entry.id]
-        assert "黒髪" in p
+        assert "茶色のボブヘアの女性。" in p
         assert "no japanese characters" in p.lower()  # 文字を描かせない指示は残る
         assert entry.text not in p                    # セリフ本文は送らない
 

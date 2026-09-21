@@ -32,6 +32,9 @@
 }
 
 * { box-sizing: border-box; }
+/* hidden 属性は、要素側で display を指定していても必ず隠します。
+   （.assets img { display: block } などが hidden を打ち消していた不具合の対策） */
+[hidden] { display: none !important; }
 html, body { height: 100%; }
 body {
   margin: 0; background: var(--bg); color: var(--fg);
