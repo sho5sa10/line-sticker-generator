@@ -866,9 +866,11 @@ async function costFor(count) {
 async function updateSelectionUi() {
   const n = state.selected.size;
   const valid = (state.info && state.info.line_spec.valid_set_sizes) || [8, 16, 24, 32, 40];
-  $('#selection-count').textContent = n && valid.includes(n)
-    ? `${n}枚選択中（このまま1セットにできます）`
-    : `${n}枚選択中`;
+  const countEl = $('#selection-count');
+  countEl.innerHTML = n && valid.includes(n)
+    ? `<b>${n}</b>枚選択中（このまま1セットにできます）`
+    : `<b>${n}</b>枚選択中`;
+  countEl.classList.toggle('has', n > 0);
   if (packageMode() === 'selected') updatePlan();
   $('#btn-generate').disabled = n === 0;
   $('#btn-render').disabled = n === 0;
