@@ -108,11 +108,21 @@ document.addEventListener('keydown', (e) => {
 /* ------------------------------------------------------------------ */
 (function trackTopbarHeight() {
   const bar = document.querySelector('.topbar');
-  const apply = () => document.documentElement.style.setProperty(
-    '--topbar-h', `${Math.round(bar.getBoundingClientRect().height)}px`);
+  const tabs = document.querySelector('.tabs');
+  const apply = () => {
+    const root = document.documentElement.style;
+    root.setProperty('--topbar-h', `${Math.round(bar.getBoundingClientRect().height)}px`);
+    // タブの高さも測り、付いてくるプレビューがタブの下に止まるようにします。
+    root.setProperty('--tabs-h', `${Math.round(tabs.getBoundingClientRect().height)}px`);
+  };
   apply();
-  if (window.ResizeObserver) new ResizeObserver(apply).observe(bar);
-  else window.addEventListener('resize', apply);
+  if (window.ResizeObserver) {
+    const ro = new ResizeObserver(apply);
+    ro.observe(bar);
+    ro.observe(tabs);
+  } else {
+    window.addEventListener('resize', apply);
+  }
 })();
 
 /* ------------------------------------------------------------------ */

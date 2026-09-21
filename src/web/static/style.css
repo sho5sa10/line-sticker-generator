@@ -384,6 +384,18 @@ main { padding: 16px; max-width: 1500px; margin: 0 auto; }
 /* ---------- design ---------- */
 .design { display: grid; grid-template-columns: 340px 1fr; gap: 16px; align-items: start; }
 @media (max-width: 900px) { .design { grid-template-columns: 1fr; } }
+/* プレビューはスクロールしても画面内に付いてくる（左の設定を下のほうで変えても、
+   すぐ横で結果が見えるように）。ヘッダーとタブの下にぴったり止まります。 */
+@media (min-width: 901px) {
+  .design .preview {
+    position: sticky;
+    top: calc(var(--topbar-h) + var(--tabs-h, 48px) + 12px);
+    max-height: calc(100vh - var(--topbar-h) - var(--tabs-h, 48px) - 24px);
+    overflow-y: auto;
+  }
+  /* 画面の高さに収まるよう、大きいプレビューの高さを抑えます */
+  .design .preview-box img { max-height: calc(100vh - var(--topbar-h) - var(--tabs-h, 48px) - 260px); width: auto; max-width: 100%; }
+}
 .controls, .preview {
   background: var(--surface); border: 1px solid var(--line);
   border-radius: var(--radius); padding: 14px; box-shadow: var(--shadow);
