@@ -624,3 +624,9 @@ main { padding: 16px; max-width: 1500px; margin: 0 auto; }
 }
 .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 .toast.bad { background: var(--danger); }
+
+/* ---------- LINEに登録・申請 ---------- */
+.submit-steps { margin: 8px 0 12px; padding-left: 20px; font-size: 13px; line-height: 1.7; }
+.submit-steps .hint { display: block; }
+.submit-links { display: flex; flex-wrap: wrap; gap: 8px; }
+.submit-links a.btn { text-decoration: none; }

@@ -263,7 +263,31 @@ function computeSteps(info) {
       done: info.packages.length > 0, blocked: false,
       action: { label: 'ZIPを作る', run: () => { switchTab('output'); $('#btn-package').click(); } },
     },
+    {
+      n: 8, key: 'submit', title: 'LINEに登録・申請',
+      desc: readLS('submit.opened', '0') === '1'
+        ? 'LINE Creators Market を開きました。審査に出したら完了です'
+        : info.packages.length
+          ? 'LINE Creators Market を開いて、ZIPをアップロードします'
+          : 'ZIPができたら、LINE Creators Market で登録・申請します',
+      done: readLS('submit.opened', '0') === '1', blocked: false,
+      action: { label: 'LINE Creators Market を開く', run: () => openLineCreators() },
+      help: 'LINE Creators Market（公式サイト）を別タブで開きます。'
+          + 'クリエイター登録 → タイトル等の入力と画像アップロード → 審査リクエスト → 承認後にリリース、の順に進みます。',
+    },
   ];
+}
+
+const LINE_CREATORS_URL = 'https://creator.line.me/ja/';
+
+function openLineCreators(url = LINE_CREATORS_URL) {
+  window.open(url, '_blank', 'noopener');
+  markSubmitOpened();
+}
+
+function markSubmitOpened() {
+  writeLS('submit.opened', '1');
+  renderGuide();
 }
 
 function renderGuide() {
@@ -1607,3 +1631,7 @@ $('#btn-log').addEventListener('click', async () => {
 
 /* ------------------------------------------------------------------ */
 loadState().catch((e) => toast(e.message, true));
+
+document.querySelectorAll('[data-submit-link]').forEach((a) => {
+  a.addEventListener('click', () => markSubmitOpened());
+});
