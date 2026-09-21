@@ -839,6 +839,18 @@ $('#grid').addEventListener('click', async (e) => {
   }
 });
 
+// ボタンの帯が画面の外に出たら、選択数だけを右上に出します
+function updateSelectionFloat() {
+  const tabs = document.querySelector('.tabs').getBoundingClientRect();
+  $('#selection-float').hidden = $('#selection-count').getBoundingClientRect().bottom > tabs.bottom;
+}
+window.addEventListener('scroll', updateSelectionFloat, { passive: true });
+window.addEventListener('resize', updateSelectionFloat);
+document.querySelector('.tabs').addEventListener('click', () => setTimeout(updateSelectionFloat, 0));
+$('#selection-float').addEventListener('click', () => {
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
 $('.toolbar').addEventListener('click', (e) => {
   const mode = e.target.dataset.select;
   if (!mode) return;
@@ -871,6 +883,10 @@ async function updateSelectionUi() {
     ? `<b>${n}</b>枚選択中（このまま1セットにできます）`
     : `<b>${n}</b>枚選択中`;
   countEl.classList.toggle('has', n > 0);
+  const floatEl = $('#selection-float');
+  floatEl.innerHTML = `<b>${n}</b>枚選択中`;
+  floatEl.classList.toggle('has', n > 0);
+  updateSelectionFloat();
   if (packageMode() === 'selected') updatePlan();
   $('#btn-generate').disabled = n === 0;
   $('#btn-render').disabled = n === 0;

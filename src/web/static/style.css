@@ -302,13 +302,15 @@ main { padding: 16px; max-width: 1500px; margin: 0 auto; }
   color: var(--muted); font-size: 13px; font-weight: 700; white-space: nowrap;
 }
 #selection-count.has { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
-#selection-count b { font-size: 16px; margin-right: 1px; }
-/* 下のほうのスタンプを選んでいるときも、選択数とボタンが見えるように付いてきます */
-@media (min-width: 901px) {
-  #panel-grid .toolbar {
-    position: sticky; top: calc(var(--topbar-h) + var(--tabs-h, 48px) + 8px); z-index: 3;
-  }
+#selection-count b, #selection-float b { font-size: 16px; margin-right: 1px; }
+/* ボタンの帯が画面の外に出たら、選択数だけ右上に付いてきます */
+#selection-float {
+  position: fixed; right: 20px; top: calc(var(--topbar-h) + var(--tabs-h, 48px) + 10px); z-index: 3;
+  padding: 6px 14px; border-radius: 999px; border: 1px solid var(--line);
+  background: var(--surface); color: var(--muted); font-size: 13px; font-weight: 700;
+  box-shadow: var(--shadow); cursor: pointer;
 }
+#selection-float.has { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
 .cost { font-size: 13px; font-weight: 700; }
 .check { display: flex; align-items: center; gap: 5px; font-size: 13px; cursor: pointer; }
 .note { color: var(--muted); font-size: 12px; margin: 0 2px 10px; }
