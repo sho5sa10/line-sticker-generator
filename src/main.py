@@ -17,17 +17,16 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from pathlib import Path
 
 from . import gallery as gallery_mod
-from . import image_processor as ip
 from . import package_builder as pkg
+from . import pipeline
 from . import validator as vd
 from .config import ConfigError, load_config
 from .csv_loader import CsvLoadError, StickerEntry, filter_entries, load_stickers
 from .image_generator import ImageGenerator, MasterImageMissingError, check_master_image
 from .logger import RunLogger, StateStore
-from .text_renderer import FontNotFoundError, TextStyle, render_text_image
+from .text_renderer import FontNotFoundError, TextStyle
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -59,34 +58,8 @@ def _confirm(prompt: str) -> bool:
         return False
 
 
-def render_final(config, entry: StickerEntry, style: TextStyle) -> tuple[Path, int, list[str]]:
-    """原画 + セリフ → LINE規格の完成PNG。原画は変更しません。"""
-    src = config.dir_generated / f"{entry.id}.png"
-    canvas_w, canvas_h = config.sticker_size
-    margin = config.margin
-    gap = int(config.get("font.gap", 4))
-    band_ratio = float(config.get("font.band_ratio", 0.40))
-    position = str(config.get("font.position", "bottom"))
-
-    character = ip.make_background_transparent(ip.load_rgba(src))
-
-    max_text_w = canvas_w - margin * 2
-    max_text_h = int((canvas_h - margin * 2) * band_ratio)
-    text_img = render_text_image(entry.text, style, max_text_w, max_text_h)
-
-    result = ip.compose_sticker(
-        character,
-        text_img,
-        (canvas_w, canvas_h),
-        margin,
-        gap=gap,
-        text_position=position,
-    )
-    out = config.dir_final / f"{entry.id}.png"
-    path, size_bytes, save_warnings = ip.save_png(
-        result.image, out, config.max_file_size_bytes
-    )
-    return path, size_bytes, result.warnings + save_warnings
+# 実体は pipeline.py にあります（Web GUI と共有するため）。
+render_final = pipeline.render_final
 
 
 # ======================================================================
@@ -164,6 +137,33 @@ def cmd_doctor(config, args) -> int:
 
     print("\n結果: " + ("OK - 生成を開始できます" if ok else "NG - 上記を解消してください"))
     return EXIT_OK if ok else EXIT_ERROR
+
+
+def cmd_gui(config, args) -> int:
+    """ブラウザで操作できるローカルWeb GUIを起動します。"""
+    try:
+        from .webapp import run_server
+    except ImportError as exc:
+        print(
+            f"GUIの起動に必要なパッケージがありません: {exc}\n"
+            "  pip install -r requirements.txt を実行してください。",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+
+    config.ensure_output_dirs()
+    try:
+        run_server(
+            config,
+            host=args.host,
+            port=args.port,
+            open_browser=not args.no_browser,
+        )
+    except OSError as exc:
+        print(f"サーバーを起動できません（ポート {args.port} が使用中かもしれません）: {exc}",
+              file=sys.stderr)
+        return EXIT_ERROR
+    return EXIT_OK
 
 
 def cmd_init_character(config, args) -> int:
@@ -460,6 +460,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("doctor", help="環境と設定を点検（APIを呼びません）")
     p.set_defaults(func=cmd_doctor)
+
+    p = sub.add_parser("gui", help="ブラウザで操作するローカルWeb GUIを起動")
+    p.add_argument("--port", type=int, default=8765, help="待ち受けポート (既定: 8765)")
+    p.add_argument(
+        "--host", default="127.0.0.1",
+        help="待ち受けアドレス (既定: 127.0.0.1 / このPCからのみ接続可)",
+    )
+    p.add_argument("--no-browser", action="store_true", help="ブラウザを自動で開かない")
+    p.set_defaults(func=cmd_gui)
 
     p = sub.add_parser(
         "init-character", help="キャラクターマスター画像を1枚生成（API 1回）"

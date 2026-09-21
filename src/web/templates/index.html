@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LINEスタンプ生成</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">LINE</span>
+    <span>スタンプ自動生成</span>
+  </div>
+  <div id="status-chips" class="chips"></div>
+</header>
+
+<nav class="tabs" id="tabs">
+  <button class="tab active" data-tab="grid">スタンプ一覧</button>
+  <button class="tab" data-tab="csv">セリフ編集</button>
+  <button class="tab" data-tab="design">文字デザイン</button>
+  <button class="tab" data-tab="output">検証・出力</button>
+</nav>
+
+<main>
+  <!-- ============ スタンプ一覧 ============ -->
+  <section class="panel active" id="panel-grid">
+    <div class="toolbar">
+      <div class="group">
+        <button class="btn" data-select="all">全選択</button>
+        <button class="btn" data-select="none">選択解除</button>
+        <button class="btn" data-select="missing">未生成のみ</button>
+        <button class="btn" data-select="invert">選択反転</button>
+        <span class="count" id="selection-count">0枚選択中</span>
+      </div>
+      <div class="group">
+        <label class="check"><input type="checkbox" id="opt-force"> 強制再生成（課金されます）</label>
+        <label class="check"><input type="checkbox" id="opt-dryrun"> dry-run（APIを呼ばない）</label>
+      </div>
+      <div class="group right">
+        <span class="cost" id="cost-label">—</span>
+        <button class="btn ghost" id="btn-render">文字だけ再合成（無料）</button>
+        <button class="btn primary" id="btn-generate">選択した画像を生成</button>
+      </div>
+    </div>
+    <div class="note" id="grid-note"></div>
+    <div class="grid" id="grid"></div>
+  </section>
+
+  <!-- ============ セリフ編集 ============ -->
+  <section class="panel" id="panel-csv">
+    <div class="toolbar">
+      <div class="group">
+        <button class="btn" id="btn-row-add">行を追加</button>
+        <span class="count" id="csv-count"></span>
+      </div>
+      <div class="group right">
+        <span class="hint">保存すると data/stickers.csv を更新します（上書き前に .bak を作成）</span>
+        <button class="btn primary" id="btn-csv-save">CSVを保存</button>
+      </div>
+    </div>
+    <div class="tablewrap">
+      <table class="sheet">
+        <thead>
+          <tr><th style="width:70px">ID</th><th>セリフ</th><th>ポーズ・動作</th><th>表情</th>
+              <th style="width:120px">カテゴリ</th><th style="width:60px"></th></tr>
+        </thead>
+        <tbody id="csv-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============ 文字デザイン ============ -->
+  <section class="panel" id="panel-design">
+    <div class="design">
+      <div class="controls">
+        <div class="field">
+          <label>プレビュー対象</label>
+          <select id="design-target"></select>
+        </div>
+        <div class="field">
+          <label>プレビュー用セリフ（保存されません）</label>
+          <input type="text" id="design-text" placeholder="CSVのセリフを使用">
+        </div>
+        <div class="field">
+          <label>文字サイズ上限 <b id="v-size"></b> px</label>
+          <input type="range" id="f-size" min="24" max="110" step="2">
+        </div>
+        <div class="field">
+          <label>最小サイズ <b id="v-min_size"></b> px</label>
+          <input type="range" id="f-min_size" min="16" max="60" step="2">
+        </div>
+        <div class="field">
+          <label>縁取りの太さ <b id="v-stroke_width"></b> px</label>
+          <input type="range" id="f-stroke_width" min="0" max="16" step="1">
+        </div>
+        <div class="field">
+          <label>最大行数 <b id="v-max_lines"></b></label>
+          <input type="range" id="f-max_lines" min="1" max="4" step="1">
+        </div>
+        <div class="field">
+          <label>テキスト帯の高さ <b id="v-band_ratio"></b></label>
+          <input type="range" id="f-band_ratio" min="0.15" max="0.6" step="0.01">
+        </div>
+        <div class="field">
+          <label>キャラとの間隔 <b id="v-gap"></b> px</label>
+          <input type="range" id="f-gap" min="0" max="30" step="1">
+        </div>
+        <div class="row2">
+          <div class="field">
+            <label>文字色</label>
+            <input type="color" id="f-fill">
+          </div>
+          <div class="field">
+            <label>縁取り色</label>
+            <input type="color" id="f-stroke_fill">
+          </div>
+        </div>
+        <div class="field">
+          <label>文字の位置</label>
+          <select id="f-position">
+            <option value="bottom">下（推奨・顔を隠しません）</option>
+            <option value="top">上</option>
+          </select>
+        </div>
+        <div class="field">
+          <button class="btn" id="btn-swap-colors">白黒を入れ替える</button>
+        </div>
+        <div class="actions">
+          <button class="btn primary" id="btn-design-save">この設定を保存</button>
+          <button class="btn ghost" id="btn-design-apply">保存して全部に再適用（無料）</button>
+        </div>
+        <p class="hint">
+          ここでの調整は画像生成APIを使いません。何度でも無料でやり直せます。
+        </p>
+      </div>
+      <div class="preview">
+        <div class="preview-box">
+          <img id="design-preview" alt="プレビュー">
+        </div>
+        <div class="preview-scale">
+          <div>
+            <span class="cap">実寸 370×320</span>
+            <img id="design-preview-1x" alt="実寸プレビュー">
+          </div>
+          <div>
+            <span class="cap">LINE表示くらいの大きさ</span>
+            <img id="design-preview-sm" class="small" alt="小サイズプレビュー">
+          </div>
+        </div>
+        <div class="err" id="design-error"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 検証・出力 ============ -->
+  <section class="panel" id="panel-output">
+    <div class="cards">
+      <div class="card">
+        <h3>バリデーション</h3>
+        <p class="hint">LINE仕様（サイズ・透過・容量・余白・偶数寸法）を検証します。</p>
+        <button class="btn primary" id="btn-validate">検証する</button>
+        <div id="validate-result" class="result"></div>
+      </div>
+
+      <div class="card">
+        <h3>main画像 / tab画像 / ZIP</h3>
+        <p class="hint">提出用ZIPを作成します。LINEの1セットは8/16/24/32/40枚単位です。</p>
+        <button class="btn primary" id="btn-package">main・tab・ZIPを作成</button>
+        <div class="assets">
+          <figure><img id="asset-main" alt="main"><figcaption>main 240×240</figcaption></figure>
+          <figure><img id="asset-tab" alt="tab"><figcaption>tab 96×74</figcaption></figure>
+        </div>
+        <div id="package-result" class="result"></div>
+      </div>
+
+      <div class="card">
+        <h3>ギャラリーHTML</h3>
+        <p class="hint">output/gallery.html を書き出します。</p>
+        <button class="btn" id="btn-gallery">gallery.html を生成</button>
+        <div id="gallery-result" class="result"></div>
+      </div>
+
+      <div class="card wide">
+        <h3>処理ログ（generation.log）</h3>
+        <button class="btn" id="btn-log">最新を読み込む</button>
+        <pre id="log-view" class="logview"></pre>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- 進捗バー -->
+<div id="job-bar" class="jobbar">
+  <div class="jobhead">
+    <strong id="job-title">処理中</strong>
+    <span id="job-progress">0 / 0</span>
+    <span id="job-api" class="apicount"></span>
+    <button class="btn danger small" id="btn-cancel">中止</button>
+    <button class="btn small ghost" id="btn-job-close">閉じる</button>
+  </div>
+  <div class="bar"><div id="job-fill"></div></div>
+  <div class="joblog" id="job-log"></div>
+</div>
+
+<!-- 拡大表示 -->
+<div id="lightbox"><img id="lb-img" alt=""><div id="lb-cap"></div></div>
+
+<div id="toast" class="toast"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

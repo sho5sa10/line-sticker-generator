@@ -1,4 +1,5 @@
 Pillow>=10.3,<12
+Flask>=3.0
 PyYAML>=6.0
 python-dotenv>=1.0
 httpx>=0.27

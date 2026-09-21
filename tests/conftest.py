@@ -48,7 +48,11 @@ def tmp_config(tmp_path, real_config, font_path) -> Config:
         "state": "output/state.json",
         "gallery": "output/gallery.html",
     }
-    cfg = Config(raw=raw, root=tmp_path, path=tmp_path / "config" / "sticker_config.yaml")
+    cfg_path = tmp_path / "config" / "sticker_config.yaml"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+    cfg = Config(raw=raw, root=tmp_path, path=cfg_path)
     cfg.ensure_output_dirs()
     return cfg
 

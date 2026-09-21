@@ -162,6 +162,14 @@ def test_build_packages_reports_leftover(tmp_config):
     assert "2枚" in leftover[0].warnings[0]
 
 
+def test_summarize_shortens_long_id_lists():
+    assert pkg._summarize(["001", "002"]) == "001, 002"
+    long_text = pkg._summarize([f"{i:03d}" for i in range(1, 51)])
+    assert "ほか42件" in long_text
+    assert "計50件" in long_text
+    assert len(long_text) < 120
+
+
 def test_build_packages_without_final_raises(tmp_config):
     with pytest.raises(pkg.PackageError):
         pkg.build_packages(tmp_config, _entries(3))

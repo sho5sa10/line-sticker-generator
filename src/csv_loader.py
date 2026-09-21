@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -79,6 +80,41 @@ def load_stickers(path: str | Path) -> list[StickerEntry]:
     if not entries:
         raise CsvLoadError(f"CSVにデータ行がありません: {p}")
     return entries
+
+
+def save_stickers(path: str | Path, entries: Sequence[StickerEntry], *, backup: bool = True) -> Path:
+    """StickerEntry のリストをCSVへ書き戻します（GUIからの編集用）。
+
+    既存CSVは上書き前に <name>.bak として退避します。
+    """
+    p = Path(path)
+    if backup and p.exists():
+        shutil.copy2(p, p.with_suffix(p.suffix + ".bak"))
+
+    ids = [e.id for e in entries]
+    if len(set(ids)) != len(ids):
+        raise CsvLoadError("IDが重複しています")
+    for e in entries:
+        if not e.id.isdigit():
+            raise CsvLoadError(f"id は数字にしてください: {e.id}")
+        if not e.text.strip():
+            raise CsvLoadError(f"text が空です (id={e.id})")
+
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(REQUIRED_COLUMNS))
+        writer.writeheader()
+        for e in entries:
+            writer.writerow(
+                {
+                    "id": e.id,
+                    "text": e.text,
+                    "action": e.action,
+                    "expression": e.expression,
+                    "category": e.category,
+                }
+            )
+    return p
 
 
 def filter_entries(

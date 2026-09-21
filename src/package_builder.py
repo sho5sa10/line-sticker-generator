@@ -179,6 +179,13 @@ def build_zip(
     return PackageResult(zip_path, len(sticker_paths), size_bytes, warnings)
 
 
+def _summarize(ids: list[str], limit: int = 8) -> str:
+    """IDが多すぎるときに一覧を短くまとめます。"""
+    if len(ids) <= limit:
+        return ", ".join(ids)
+    return f"{', '.join(ids[:limit])} ほか{len(ids) - limit}件（計{len(ids)}件）"
+
+
 def build_packages(config, entries) -> list[PackageResult]:
     """完成画像を LINE の許可枚数ごとにZIP化します。"""
     final_dir = config.dir_final
@@ -222,9 +229,7 @@ def build_packages(config, entries) -> list[PackageResult]:
             tab_path=tab_path,
         )
         if missing:
-            result.warnings.append(
-                f"NOTE: 完成画像が無いIDをスキップしました: {', '.join(missing)}"
-            )
+            result.warnings.append(f"NOTE: 完成画像が無いIDをスキップしました: {_summarize(missing)}")
         results.append(result)
 
     if leftover:
@@ -236,7 +241,7 @@ def build_packages(config, entries) -> list[PackageResult]:
                 size_bytes=0,
                 warnings=[
                     f"WARNING: {leftover}枚は LINE の許可枚数 {valid_sizes} に分割できず"
-                    f"ZIP化していません: {', '.join(leftover_ids)}"
+                    f"ZIP化していません: {_summarize(leftover_ids)}"
                 ],
             )
         )

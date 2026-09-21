@@ -16,6 +16,9 @@ venv/
 .coverage
 htmlcov/
 
+# --- GUIが保存するローカル設定（フォントパス等が環境依存のため） ---
+config/overrides.yaml
+
 # --- 生成物 ---
 output/generated/*
 output/final/*

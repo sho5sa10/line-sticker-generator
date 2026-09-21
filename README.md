@@ -119,6 +119,46 @@ id,text,action,expression,category
 
 ---
 
+## 5-2. GUI（ブラウザで操作する）
+
+コマンドを覚えなくても、ブラウザ上ですべての操作ができます。
+
+```bash
+python -m src.main gui
+```
+
+`http://127.0.0.1:8765/` が自動で開きます。**127.0.0.1 にのみバインドするため、このPCの外からは接続できません。** 終了は Ctrl+C です。
+
+| オプション | 説明 |
+|---|---|
+| `--port 8765` | 待ち受けポート |
+| `--no-browser` | ブラウザを自動で開かない |
+| `--host` | 既定は `127.0.0.1`。変更すると外部に公開されるため推奨しません |
+
+### 画面構成
+
+**スタンプ一覧**
+100枚をサムネイルで一覧表示します。チェックボックスで選び「選択した画像を生成」。**実行前にAPI呼び出し枚数と概算コストが必ず表示され、確認ダイアログが出ます。** 既に原画があるものは自動的に除外されるので、二重課金は起きません。1枚ごとの「作り直す」ボタンで、気に入らない1枚だけをピンポイントで再生成できます。画像クリックで拡大表示。
+
+**セリフ編集**
+セリフ・ポーズ・表情・カテゴリを表形式で編集し、`data/stickers.csv` に保存します。上書き前に `stickers.csv.bak` を自動作成します。行の追加・削除も可能です。
+
+**文字デザイン**
+フォントサイズ・縁取りの太さ・色・行数・テキスト帯の高さ・文字位置をスライダーで変えると、**その場でプレビューが更新されます。画像生成APIを呼ばないので何度でも無料です。** 実寸（370×320）とLINE表示相当の小サイズも同時に確認できます。「この設定を保存」で `config/overrides.yaml` に保存され、「保存して全部に再適用」で全スタンプの文字を無料で貼り直します。
+
+> 設定は `config/overrides.yaml` に差分として保存されます。コメント付きの `config/sticker_config.yaml` は書き換えません。読み込み時に上書きマージされるので、CLIにも同じ設定が反映されます。
+
+**検証・出力**
+バリデーション、main/tab画像の生成とプレビュー、ZIP作成とダウンロード、gallery.html 生成、`generation.log` の閲覧ができます。
+
+### 進捗表示
+
+生成中は画面下部に進捗バーとリアルタイムログ（ID・成功/スキップ/警告/エラー）と **API呼び出し回数** が表示されます。「中止」を押すと、実行中の1枚が終わった時点で安全に停止します。生成済み画像は残るので、そのまま再開できます。
+
+GUIとCLIは同じパイプライン（`pipeline.py` / `image_generator.py` / `validator.py` / `package_builder.py`）を呼ぶため、どちらで実行しても結果は同じです。併用もできます。
+
+---
+
 ## 6. プレビュー（APIを呼びません）
 
 生成予定の内容とプロンプトを確認します。
@@ -309,6 +349,7 @@ python -m src.main package
 ## 14. コマンド一覧
 
 ```bash
+python -m src.main gui                           # ブラウザGUIを起動
 python -m src.main doctor                        # 環境と設定を点検（API未使用）
 python -m src.main init-character                # マスター画像を1枚生成（API 1回）
 python -m src.main preview                       # 生成予定の一覧（API未使用）
@@ -336,7 +377,8 @@ line-sticker-generator/
 ├── requirements.txt
 ├── pytest.ini
 ├── config/
-│   └── sticker_config.yaml # LINE仕様・フォント・生成設定
+│   ├── sticker_config.yaml # LINE仕様・フォント・生成設定
+│   └── overrides.yaml      # GUIで変更した設定の差分（自動生成）
 ├── data/
 │   ├── stickers.csv        # セリフ100件
 │   └── character/
@@ -354,8 +396,11 @@ line-sticker-generator/
 │   ├── text_renderer.py    # 日本語描画・自動改行・禁則処理
 │   ├── validator.py        # LINE仕様チェック
 │   ├── package_builder.py  # main/tab画像・セット分割・ZIP
+│   ├── pipeline.py         # 原画+セリフ→完成画像（CLIとGUIで共有）
 │   ├── gallery.py          # gallery.html
 │   ├── logger.py           # generation.log / state.json
+│   ├── webapp.py           # ローカルWeb GUI（Flask）
+│   ├── web/                # GUIのHTML / CSS / JS
 │   └── providers/
 │       ├── base.py             # ImageGenerationProvider 抽象基底
 │       ├── openai_provider.py  # OpenAI 実装
@@ -427,6 +472,9 @@ Ctrl+C で中断しても、その時点までの画像は保持されます。
 | `SKIP 001 - already exists` を回避したい | `--force` を付ける |
 | Windowsで日本語が文字化けする | `$env:PYTHONIOENCODING="utf-8"` を設定してから実行 |
 | ZIPが作れない / 枚数が合わない | LINEは8の倍数（最大40）単位です。セクション10を参照 |
+| GUIが起動しない（ポート使用中） | `python -m src.main gui --port 8800` など別のポートを指定 |
+| GUIで「すでに処理が実行中です」 | 生成は同時に1件だけです。進捗バーの「中止」を押すか完了を待ってください |
+| GUIの設定変更がCLIに反映されない | `config/overrides.yaml` に保存されています。削除すれば既定値に戻ります |
 
 ---
 

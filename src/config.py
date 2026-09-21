@@ -21,6 +21,9 @@ class ConfigError(Exception):
     """設定が不正な場合に送出されます。"""
 
 
+OVERRIDES_FILENAME = "overrides.yaml"
+
+
 def _deep_get(data: dict, dotted: str, default: Any = None) -> Any:
     node: Any = data
     for part in dotted.split("."):
@@ -28,6 +31,28 @@ def _deep_get(data: dict, dotted: str, default: Any = None) -> Any:
             return default
         node = node[part]
     return node
+
+
+def _deep_merge(base: dict, patch: dict) -> dict:
+    """patch を base へ再帰的に重ねた新しい辞書を返します。"""
+    merged = dict(base)
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def set_dotted(data: dict, dotted: str, value: Any) -> None:
+    """"font.size" のようなキーへ値を書き込みます（中間の辞書は自動作成）。"""
+    node = data
+    parts = dotted.split(".")
+    for part in parts[:-1]:
+        if not isinstance(node.get(part), dict):
+            node[part] = {}
+        node = node[part]
+    node[parts[-1]] = value
 
 
 @dataclass
@@ -138,6 +163,33 @@ class Config:
     def dir_generated_prompts(self) -> Path:
         return self.root / "prompts" / "generated"
 
+    @property
+    def overrides_path(self) -> Path:
+        """GUIで変更した設定の保存先。
+
+        コメント付きの sticker_config.yaml を書き換えずに済むよう、
+        差分だけを別ファイルに保存して読み込み時にマージします。
+        """
+        return self.path.parent / OVERRIDES_FILENAME
+
+    def save_overrides(self, updates: dict[str, Any]) -> Path:
+        """{"font.size": 48} 形式の差分を overrides.yaml へ保存します。"""
+        path = self.overrides_path
+        current: dict = {}
+        if path.exists():
+            current = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        for dotted, value in updates.items():
+            set_dotted(current, dotted, value)
+            set_dotted(self.raw, dotted, value)  # 実行中の設定にも即反映
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "# このファイルは GUI から自動生成されます。\n"
+            "# sticker_config.yaml の値をここで上書きします。手動編集も可能です。\n"
+            + yaml.safe_dump(current, allow_unicode=True, sort_keys=False),
+            encoding="utf-8",
+        )
+        return path
+
     def ensure_output_dirs(self) -> None:
         for d in (
             self.dir_generated,
@@ -167,6 +219,13 @@ def load_config(path: str | Path | None = None, *, load_env: bool = True) -> Con
         raw = yaml.safe_load(f) or {}
     if not isinstance(raw, dict):
         raise ConfigError(f"設定ファイルの形式が不正です: {cfg_path}")
+
+    # GUI が保存した差分設定を重ねます（元のYAMLのコメントを壊さないため）。
+    overrides_path = cfg_path.parent / OVERRIDES_FILENAME
+    if overrides_path.exists():
+        overrides = yaml.safe_load(overrides_path.read_text(encoding="utf-8")) or {}
+        if isinstance(overrides, dict):
+            raw = _deep_merge(raw, overrides)
 
     root = cfg_path.parent.parent
     if load_env:
