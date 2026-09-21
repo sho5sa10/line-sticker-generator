@@ -689,3 +689,51 @@ def test_package_invalid_selection_is_rejected_without_side_effects(client, tmp_
     assert res.status_code == 400
     assert "あと5枚選ぶと8枚セット" in res.get_json()["error"]
     assert not (tmp_config.dir_main / "main.png").exists()
+
+
+# --- フォント・おまかせ・セリフの改行 ------------------------------------
+def test_fonts_endpoint(client):
+    d = client.get("/api/fonts").get_json()
+    assert any(f["id"] == "biz-ud-gothic" for f in d["fonts"])
+
+
+def test_preview_with_font_id(client, tmp_config):
+    _add_raw(tmp_config, "001")
+    ok = client.post("/api/preview-text", json={"id": "001", "style": {"font_id": "biz-ud-gothic"}})
+    assert ok.status_code == 200
+    bad = client.post("/api/preview-text", json={"id": "001", "style": {"font_id": "nope"}})
+    assert bad.status_code == 400
+
+
+def test_preview_ignores_raw_font_path(client, tmp_config):
+    """画面から任意のファイルパスを渡されても使わない。"""
+    _add_raw(tmp_config, "001")
+    res = client.post("/api/preview-text",
+                      json={"id": "001", "style": {"font_path": "C:/Windows/win.ini"}})
+    assert res.status_code == 200
+
+
+def test_save_font_by_id(client, tmp_config):
+    res = client.post("/api/settings/font", json={"font_id": "biz-ud-gothic", "size": 50})
+    assert res.status_code == 200
+    font = res.get_json()["font"]
+    assert font["path"].endswith("BIZ-UDGothicB.ttc")
+    assert client.get("/api/state").get_json()["font"]["font_id"] == "biz-ud-gothic"
+
+
+def test_design_suggest_endpoint(client, tmp_config):
+    tmp_config.master_image_path.parent.mkdir(parents=True, exist_ok=True)
+    make_character((300, 300), color=(255, 215, 67, 255)).save(tmp_config.master_image_path)
+    d = client.get("/api/design/suggest").get_json()
+    assert d["suggestions"]
+    assert all(s["fill"].startswith("#") for s in d["suggestions"])
+
+
+def test_patch_sticker_text_keeps_line_break(client, tmp_config):
+    res = client.patch("/api/stickers/002", json={"text": "ありがとう\r\nございます"})
+    assert res.status_code == 200
+    entries = {e.id: e for e in load_stickers(tmp_config.csv_path)}
+    assert entries["002"].text == "ありがとう\nございます"
+    assert entries["001"].text == "了解！"  # ほかの行は変わらない
+    assert client.patch("/api/stickers/999", json={"text": "x"}).status_code == 404
+    assert client.patch("/api/stickers/001", json={"text": "  "}).status_code == 400

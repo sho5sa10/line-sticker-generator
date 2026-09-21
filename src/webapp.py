@@ -22,6 +22,8 @@ from flask import Flask, jsonify, request, send_file, send_from_directory
 from PIL import Image
 
 from . import character_profile as cprof
+from . import fonts as fontlib
+from . import style_suggest
 from . import gallery as gallery_mod
 from . import image_processor as ip
 from . import importer
@@ -281,6 +283,7 @@ def create_app(config=None) -> Flask:
                     "max_lines": cfg_.get("font.max_lines"),
                     "band_ratio": cfg_.get("font.band_ratio"),
                     "gap": cfg_.get("font.gap"),
+                    "font_id": fontlib.current_font_id(cfg_),
                 },
                 "stickers": [sticker_status(cfg_, e) for e in entries],
                 "job": jobs.current.to_dict() if jobs.current else None,
@@ -583,6 +586,18 @@ def create_app(config=None) -> Flask:
                 expression=entry.expression, category=entry.category,
             )
 
+        # フォントはIDで受け取り、一覧に載っているものだけを使います（任意のファイルは読みません）。
+        font_id = overrides.pop("font_id", None)
+        font_override = {}
+        if font_id:
+            info = fontlib.find_font(cfg_, str(font_id))
+            if info is None:
+                return jsonify({"error": f"フォントが見つかりません: {font_id}"}), 400
+            font_override = {"font_path": info.path, "font_index": info.index, "variation": info.variation}
+        for key in ("font_path", "font_index", "variation"):
+            overrides.pop(key, None)  # 画面から直接パスを指定させない
+        overrides.update(font_override)
+
         # band_ratio / gap / position は設定側なので一時的に差し替えます。
         patched = {k: overrides.pop(k) for k in ("band_ratio", "gap", "position") if k in overrides}
         saved = {k: cfg_.get(f"font.{k}") for k in patched}
@@ -629,9 +644,15 @@ def create_app(config=None) -> Flask:
         allowed = {
             "size": int, "min_size": int, "stroke_width": int, "max_lines": int,
             "gap": int, "fill": str, "stroke_fill": str, "position": str,
-            "band_ratio": float, "path": str,
+            "band_ratio": float,
         }
         updates = {}
+        if body.get("font_id"):
+            info = fontlib.find_font(current_config(), str(body["font_id"]))
+            if info is None:
+                return jsonify({"error": f"フォントが見つかりません: {body['font_id']}"}), 400
+            updates.update({"font.path": info.path, "font.index": info.index,
+                            "font.variation": info.variation})
         for key, caster in allowed.items():
             if key in body and body[key] is not None:
                 try:
@@ -645,9 +666,47 @@ def create_app(config=None) -> Flask:
         cfg_ = reload_config()
         return jsonify({"saved_to": str(path), "font": cfg_.get("font")})
 
+    @app.get("/api/fonts")
+    def api_fonts():
+        """選べるフォントの一覧と、いま使っているフォント。"""
+        cfg_ = current_config()
+        return jsonify({
+            "fonts": [f.to_dict() for f in fontlib.available_fonts(cfg_)],
+            "current": fontlib.current_font_id(cfg_),
+            "custom_dir": str(fontlib.custom_font_dir(cfg_)),
+        })
+
+    @app.get("/api/design/suggest")
+    def api_design_suggest():
+        """キャラクターに合う文字スタイルの候補（設定は変えません）。"""
+        return jsonify(style_suggest.suggest_styles(current_config()))
+
     # ------------------------------------------------------------------
     # CSV編集
     # ------------------------------------------------------------------
+    @app.patch("/api/stickers/<sticker_id>")
+    def api_sticker_patch(sticker_id: str):
+        """1件のセリフだけを書き換えます（改行も保存できます）。"""
+        body = request.get_json(silent=True) or {}
+        text = str(body.get("text", "")).replace("\r\n", "\n").strip()
+        if not text:
+            return jsonify({"error": "セリフが空です"}), 400
+        cfg_ = current_config()
+        try:
+            entries = entries_or_error()
+        except CsvLoadError as exc:
+            return jsonify({"error": str(exc)}), 400
+        target = next((e for e in entries if e.id == sticker_id), None)
+        if target is None:
+            return jsonify({"error": f"IDが見つかりません: {sticker_id}"}), 404
+        updated = [
+            StickerEntry(id=e.id, text=text, action=e.action, expression=e.expression,
+                         category=e.category) if e.id == sticker_id else e
+            for e in entries
+        ]
+        save_stickers(cfg_.csv_path, updated)
+        entry = next(e for e in updated if e.id == sticker_id)
+        return jsonify({"sticker": sticker_status(cfg_, entry)})
     @app.get("/api/stickers")
     def api_stickers_get():
         try:

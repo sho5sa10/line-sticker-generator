@@ -1070,17 +1070,25 @@ function renderCsvTable() {
   $('#csv-body').innerHTML = state.stickers.map((s) => `
     <tr data-id="${s.id}">
       <td><input data-f="id" value="${escapeHtml(s.id)}"></td>
-      <td><input data-f="text" value="${escapeHtml(s.text)}"></td>
+      <td><textarea data-f="text" rows="1">${escapeHtml(s.text)}</textarea></td>
       <td><input data-f="action" value="${escapeHtml(s.action)}"></td>
       <td><input data-f="expression" value="${escapeHtml(s.expression)}"></td>
       <td><input data-f="category" value="${escapeHtml(s.category)}"></td>
       <td><button class="btn small" data-act="del">削除</button></td>
     </tr>`).join('');
   $('#csv-count').textContent = `${state.stickers.length}件`;
+  $$('#csv-body textarea').forEach(autoGrow);
+}
+
+/** 改行したセリフの行数に合わせて入力欄の高さを変えます。 */
+function autoGrow(el) {
+  el.style.height = 'auto';
+  el.style.height = `${el.scrollHeight}px`;
 }
 
 $('#csv-body').addEventListener('input', (e) => {
-  if (e.target.tagName !== 'INPUT') return;
+  if (e.target.tagName === 'TEXTAREA') autoGrow(e.target);
+  if (e.target.tagName !== 'INPUT' && e.target.tagName !== 'TEXTAREA') return;
   e.target.closest('tr').classList.add('dirty');
   state.csvDirty = true;
 });
@@ -1114,7 +1122,7 @@ $('#btn-row-add').addEventListener('click', () => {
 $('#btn-csv-save').addEventListener('click', async () => {
   const rows = $$('#csv-body tr').map((tr) => {
     const o = {};
-    tr.querySelectorAll('input').forEach((i) => { o[i.dataset.f] = i.value; });
+    tr.querySelectorAll('input, textarea').forEach((i) => { o[i.dataset.f] = i.value; });
     return o;
   });
   try {
@@ -1151,7 +1159,28 @@ function fillDesignControls(font) {
   $('#f-fill').value = font.fill || '#FFFFFF';
   $('#f-stroke_fill').value = font.stroke_fill || '#000000';
   $('#f-position').value = font.position || 'bottom';
+  if (font.font_id) state.fontId = font.font_id;
+  loadFonts();
 }
+
+/** 選べるフォントの一覧を読み込みます。 */
+async function loadFonts() {
+  let d;
+  try { d = await api('/api/fonts'); } catch (e) { return; }
+  state.fonts = d.fonts;
+  const current = state.fontId || d.current;
+  $('#f-font').innerHTML = d.fonts
+    .map((f) => `<option value="${escapeHtml(f.id)}">${escapeHtml(f.label)}</option>`).join('');
+  if (current && d.fonts.some((f) => f.id === current)) $('#f-font').value = current;
+  showFontNote();
+}
+
+function showFontNote() {
+  const f = (state.fonts || []).find((x) => x.id === $('#f-font').value);
+  $('#font-note').textContent = f ? f.note : '';
+}
+
+$('#f-font').addEventListener('change', () => { showFontNote(); schedulePreview(); });
 
 function fillDesignTargets() {
   // 生成済みを先頭に並べますが、未生成もマスター画像で代用してプレビューできます。
@@ -1162,6 +1191,8 @@ function fillDesignTargets() {
     .map((s) => `<option value="${s.id}">${s.id} ${escapeHtml(s.text)}${s.has_raw ? '' : '（未生成）'}</option>`)
     .join('');
   if (keep && state.stickers.some((s) => s.id === keep)) $('#design-target').value = keep;
+  // 書きかけのセリフ（未保存）があるときは上書きしません。
+  if ($('#btn-text-save').disabled) syncDesignText();
 }
 
 function currentStyleOverrides() {
@@ -1174,6 +1205,7 @@ function currentStyleOverrides() {
   o.fill = $('#f-fill').value;
   o.stroke_fill = $('#f-stroke_fill').value;
   o.position = $('#f-position').value;
+  if ($('#f-font').value) o.font_id = $('#f-font').value;
   return o;
 }
 
@@ -1190,7 +1222,7 @@ function schedulePreview() {
 async function refreshPreview() {
   const id = $('#design-target').value;
   if (!id) return;
-  const body = { id, style: currentStyleOverrides(), text: $('#design-text').value.trim() };
+  const body = { id, style: currentStyleOverrides(), text: $('#design-text').value.replace(/^\s+|\s+$/g, '') };
   try {
     const res = await fetch('/api/preview-text', {
       method: 'POST',
@@ -1222,6 +1254,70 @@ async function refreshPreview() {
 ['#design-target', '#design-text', '#f-fill', '#f-stroke_fill', '#f-position']
   .forEach((sel) => $(sel).addEventListener('input', schedulePreview));
 FONT_FIELDS.forEach((k) => $(`#f-${k}`).addEventListener('input', schedulePreview));
+
+/* セリフを直接書き換える（改行も保存） */
+function syncDesignText() {
+  const s = state.stickers.find((x) => x.id === $('#design-target').value);
+  $('#design-text').value = s ? s.text : '';
+  $('#design-text').dataset.original = s ? s.text : '';
+  $('#btn-text-save').disabled = true;
+  $('#text-save-note').textContent = '';
+}
+$('#design-target').addEventListener('change', syncDesignText);
+$('#design-text').addEventListener('input', () => {
+  const changed = $('#design-text').value.trim() !== ($('#design-text').dataset.original || '').trim();
+  $('#btn-text-save').disabled = !changed || !$('#design-text').value.trim();
+  $('#text-save-note').textContent = changed ? '保存するまで、スタンプには反映されません' : '';
+});
+$('#btn-text-save').addEventListener('click', async () => {
+  const id = $('#design-target').value;
+  try {
+    const d = await api(`/api/stickers/${encodeURIComponent(id)}`, {
+      method: 'PATCH', body: { text: $('#design-text').value },
+    });
+    const i = state.stickers.findIndex((x) => x.id === id);
+    if (i >= 0) state.stickers[i] = d.sticker;
+    if (state.info) state.info.stickers = state.stickers;
+    renderCsvTable();
+    renderGrid();
+    syncDesignText();
+    toast(`${id} のセリフを保存しました。スタンプに反映するには「保存して全部に再適用」または「文字のみ」を押してください`);
+  } catch (e) { toast(e.message, true); }
+});
+
+/* おまかせ提案: キャラの色と雰囲気から文字スタイルの候補を出す */
+$('#btn-suggest').addEventListener('click', () => withBusy($('#btn-suggest'), '読み取り中…', async () => {
+  let d;
+  try { d = await api('/api/design/suggest'); } catch (e) { toast(e.message, true); return; }
+  state.suggestions = d.suggestions;
+  $('#suggest-list').innerHTML = d.suggestions.map((sg, i) => `
+    <button type="button" class="sg" data-i="${i}" data-tip="${escapeHtml(sg.reason)}">
+      <span class="sg-sample" style="color:${sg.fill};
+        text-shadow:${[...Array(8)].map((_, k) => {
+          const a = (Math.PI * 2 * k) / 8;
+          return `${(Math.cos(a) * 2).toFixed(1)}px ${(Math.sin(a) * 2).toFixed(1)}px 0 ${sg.stroke_fill}`;
+        }).join(',')}">あア</span>
+      <span><span class="sg-name">${escapeHtml(sg.name)}</span><br>
+        <span class="sg-font">${escapeHtml(sg.font_label)}・縁取り${sg.stroke_width}px</span></span>
+    </button>`).join('');
+  toast(`${d.source || 'キャラクター'} の色から${d.suggestions.length}通り提案しました。押すとプレビューに反映されます`);
+}));
+
+$('#suggest-list').addEventListener('click', (e) => {
+  const b = e.target.closest('.sg');
+  if (!b) return;
+  const sg = state.suggestions[Number(b.dataset.i)];
+  $$('#suggest-list .sg').forEach((x) => x.classList.toggle('on', x === b));
+  $('#f-fill').value = sg.fill.toLowerCase();
+  $('#f-stroke_fill').value = sg.stroke_fill.toLowerCase();
+  $('#f-stroke_width').value = sg.stroke_width;
+  if (sg.font_id && [...$('#f-font').options].some((o) => o.value === sg.font_id)) {
+    $('#f-font').value = sg.font_id;
+    showFontNote();
+  }
+  schedulePreview();
+  toast('プレビューに反映しました。気に入ったら「この設定を保存」を押してください');
+});
 
 $('#btn-swap-colors').addEventListener('click', () => {
   const a = $('#f-fill').value;

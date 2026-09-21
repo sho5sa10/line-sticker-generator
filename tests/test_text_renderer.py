@@ -115,18 +115,16 @@ def _reference_ink_size(text, style, max_w, max_h):
     from src.text_renderer import fit_text
 
     font, lines, lh = fit_text(text, style, max_w, max_h)
-    pad = 200
-    img = Image.new("RGBA", (2000, lh * len(lines) + pad * 2), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    for i, ln in enumerate(lines):
-        d.text((pad, pad + i * lh), ln, font=font, fill="#fff",
-               stroke_width=style.stroke_width, stroke_fill="#000", anchor="la")
-    widest = max(
-        (lambda b: b[2] - b[0])(img.crop((0, pad + i * lh - style.stroke_width - 60,
-                                          2000, pad + (i + 1) * lh + 60)).getbbox() or (0, 0, 0, 0))
-        for i in range(len(lines))
-    )
-    return widest, lines
+
+    def line_ink_width(line: str) -> int:
+        # 1行ずつ、十分に大きいキャンバスに描いて測る（ほかの行と混ざらないように）
+        img = Image.new("RGBA", (2000, lh + 400), (0, 0, 0, 0))
+        ImageDraw.Draw(img).text((200, 200), line, font=font, fill="#fff",
+                                 stroke_width=style.stroke_width, stroke_fill="#000", anchor="la")
+        box = img.getbbox()
+        return box[2] - box[0] if box else 0
+
+    return max(line_ink_width(ln) for ln in lines if ln), lines
 
 
 def test_stroke_is_never_clipped_for_any_bundled_text(real_config, font_path):

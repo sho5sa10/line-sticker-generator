@@ -432,6 +432,52 @@ main { padding: 16px; max-width: 1500px; margin: 0 auto; }
 .result .ERROR { color: var(--danger); }
 .result .WARNING { color: var(--warn); }
 .result .good { color: var(--ok); font-weight: 700; }
+/* おまかせ提案（文字デザイン） */
+.suggest {
+  display: grid; gap: 8px; margin-bottom: 16px; padding: 12px;
+  border: 1px solid var(--accent); border-radius: var(--radius);
+  background: color-mix(in srgb, var(--accent) 7%, var(--surface));
+}
+.suggest-head { display: flex; flex-direction: column; gap: 2px; }
+.suggest .btn { justify-self: start; }
+.suggest-list { display: grid; gap: 6px; }
+.suggest-list:empty { display: none; }
+.sg {
+  display: grid; grid-template-columns: 64px 1fr; gap: 10px; align-items: center;
+  border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px;
+  background: var(--surface); cursor: pointer; text-align: left; font: inherit; color: var(--fg);
+}
+.sg:hover { border-color: var(--muted); }
+.sg.on { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 30%, transparent); }
+.sg-sample {
+  display: grid; place-items: center; height: 38px; border-radius: 6px; font-size: 20px; font-weight: 900;
+  background-image:
+    linear-gradient(45deg, #cfd3da 25%, transparent 25%),
+    linear-gradient(-45deg, #cfd3da 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #cfd3da 75%),
+    linear-gradient(-45deg, transparent 75%, #cfd3da 75%);
+  background-size: 10px 10px; background-position: 0 0, 0 5px, 5px -5px, -5px 0;
+  background-color: #e9ebef;
+}
+.sg-name { font-size: 13px; font-weight: 700; }
+.sg-font { font-size: 11px; color: var(--muted); }
+#design-text {
+  width: 100%; padding: 7px 9px; border-radius: 8px; resize: vertical;
+  border: 1px solid var(--line); background: var(--surface-2); color: var(--fg);
+  font: inherit; line-height: 1.5;
+}
+.text-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
+#f-font { width: 100%; }
+#font-note { display: block; margin-top: 4px; }
+/* スタンプ一覧・セリフ編集で改行を見えるようにする */
+.cell .ctext { white-space: pre-line; }
+.sheet textarea {
+  width: 100%; border: 1px solid transparent; background: transparent; color: var(--fg);
+  font: inherit; padding: 5px 6px; border-radius: 6px; resize: none; overflow: hidden;
+  line-height: 1.45; display: block;
+}
+.sheet textarea:focus { border-color: var(--accent); outline: none; background: var(--surface-2); }
+
 /* セットの作り方 */
 .setmode {
   display: grid; gap: 4px; margin-bottom: 10px; padding: 10px 12px;

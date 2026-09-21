@@ -250,13 +250,37 @@
   <section class="panel" id="panel-design">
     <div class="design">
       <div class="controls">
+        <div class="suggest">
+          <div class="suggest-head">
+            <b>おまかせ</b>
+            <span class="hint">キャラの絵の色と雰囲気から、合う文字を提案します</span>
+          </div>
+          <button class="btn primary" id="btn-suggest"
+                  data-tip="キャラクター画像の色（線・体・差し色）と、かんたん入力で選んだ雰囲気から候補を出します。選ぶまで設定は変わりません">
+            キャラに合わせて提案する</button>
+          <div class="suggest-list" id="suggest-list"></div>
+        </div>
+
         <div class="field">
           <label>プレビュー対象</label>
           <select id="design-target"></select>
         </div>
         <div class="field">
-          <label>プレビュー用セリフ（保存されません）</label>
-          <input type="text" id="design-text" placeholder="CSVのセリフを使用">
+          <label>セリフ（<b>改行したい所で Enter</b>）</label>
+          <textarea id="design-text" rows="2"
+                    placeholder="CSVのセリフを使用"
+                    data-tip="例: 「ありがとう」で Enter を押して「ございます」と書くと2段になります"></textarea>
+          <div class="text-actions">
+            <button class="btn small" id="btn-text-save" disabled
+                    data-tip="このスタンプのセリフを、改行も含めて保存します（セリフ編集タブと同じ内容が変わります）">このセリフを保存</button>
+            <span class="hint" id="text-save-note"></span>
+          </div>
+        </div>
+        <div class="field">
+          <label>フォント</label>
+          <select id="f-font"
+                  data-tip="このPCで使える日本語フォントです。fonts フォルダに .ttf/.otf を置くと、ここに追加されます"></select>
+          <span class="hint" id="font-note"></span>
         </div>
         <div class="field" data-tip="長いセリフは自動で小さくなります。これはその上限です">
           <label>文字サイズ上限 <b id="v-size"></b> px</label>
