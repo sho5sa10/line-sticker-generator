@@ -283,11 +283,25 @@ def test_package_endpoint_and_download(client, tmp_config):
     client.post("/api/render", json={})
     _wait_for_job(client)
 
-    data = client.post("/api/package", json={}).get_json()
+    # 3枚では1セット（最低8枚）にならないので、理由を返して何も作らない
+    res = client.post("/api/package", json={})
+    assert res.status_code == 400
+    assert "最低8枚" in res.get_json()["error"]
+    assert "None" not in res.get_json()["error"]
+
+    # 8枚そろえば main/tab/ZIP ができ、ダウンロードできる
+    tmp_config.csv_path.write_text(
+        "id,text,action,expression,category\n"
+        + "".join(f"{i:03d},セリフ{i},ポーズ,表情,basic\n" for i in range(1, 9)),
+        encoding="utf-8",
+    )
+    _finals(tmp_config, 8)
+    data = client.post("/api/package", json={"set_size": 8}).get_json()
     assert data["main"]["ok"] is True
     assert data["tab"]["ok"] is True
-    # 3枚は 8 の倍数でないため未パッケージ警告が出る
-    assert any(p["warnings"] for p in data["packages"])
+    names = [p["name"] for p in data["packages"] if p["downloadable"]]
+    assert names == ["line_stickers_001_008.zip"]
+    assert client.get(f"/api/download/{names[0]}").status_code == 200
 
 
 def test_gallery_endpoint(client, tmp_config):
@@ -647,3 +661,31 @@ def test_assets_are_revalidated(client):
         res = client.get(path)
         assert res.status_code == 200, path
         assert res.headers.get("Cache-Control") == "no-cache", path
+
+
+# --- セットの作り方 ------------------------------------------------------
+def _finals(tmp_config, n):
+    for i in range(1, n + 1):
+        _add_raw(tmp_config, f"{i:03d}")
+        ip.save_png(make_character((370, 320)), tmp_config.dir_final / f"{i:03d}.png")
+
+
+def test_package_plan_endpoint(client, tmp_config):
+    _finals(tmp_config, 3)
+    d = client.post("/api/package/plan", json={"set_size": None}).get_json()
+    assert d["sets"] == []            # 3枚では8枚セットも作れない
+    assert d["leftover"] == ["001", "002", "003"]
+
+    d = client.post("/api/package/plan", json={"ids": ["001", "002"]}).get_json()
+    assert "あと6枚選ぶと8枚セット" in d["error"]
+    # 見込みを出すだけで、ファイルは作らない
+    assert not list(tmp_config.dir_packages.glob("*.zip"))
+    assert not (tmp_config.dir_main / "main.png").exists()
+
+
+def test_package_invalid_selection_is_rejected_without_side_effects(client, tmp_config):
+    _finals(tmp_config, 3)
+    res = client.post("/api/package", json={"ids": ["001", "002", "003"]})
+    assert res.status_code == 400
+    assert "あと5枚選ぶと8枚セット" in res.get_json()["error"]
+    assert not (tmp_config.dir_main / "main.png").exists()

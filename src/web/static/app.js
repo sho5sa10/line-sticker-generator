@@ -391,7 +391,7 @@ $('#tabs').addEventListener('click', (e) => {
   $$('.tab').forEach((t) => t.classList.toggle('active', t === tab));
   $$('.panel').forEach((p) => p.classList.toggle('active', p.id === `panel-${tab.dataset.tab}`));
   if (tab.dataset.tab === 'design') refreshPreview();
-  if (tab.dataset.tab === 'output') loadAssets();
+  if (tab.dataset.tab === 'output') { loadAssets(); updatePlan(); }
   if (tab.dataset.tab === 'start') loadMaster();
 });
 
@@ -855,7 +855,11 @@ async function costFor(count) {
 
 async function updateSelectionUi() {
   const n = state.selected.size;
-  $('#selection-count').textContent = `${n}枚選択中`;
+  const valid = (state.info && state.info.line_spec.valid_set_sizes) || [8, 16, 24, 32, 40];
+  $('#selection-count').textContent = n && valid.includes(n)
+    ? `${n}枚選択中（このまま1セットにできます）`
+    : `${n}枚選択中`;
+  if (packageMode() === 'selected') updatePlan();
   $('#btn-generate').disabled = n === 0;
   $('#btn-render').disabled = n === 0;
 
@@ -1276,7 +1280,7 @@ $('#btn-package').addEventListener('click', () => withBusy($('#btn-package'), '�
   const box = $('#package-result');
   box.innerHTML = '<div class="line working">main画像・tab画像・ZIPを作っています。100枚分で10秒ほどかかります…</div>';
   try {
-    const d = await api('/api/package', { method: 'POST' });
+    const d = await api('/api/package', { method: 'POST', body: packageOptions() });
     const lines = [
       `<div class="line">main: ${d.main.size_kb}KB ${d.main.ok ? '<span class="good">OK</span>' : '<span class="ERROR">NG</span>'}` +
       ` / tab: ${d.tab.size_kb}KB ${d.tab.ok ? '<span class="good">OK</span>' : '<span class="ERROR">NG</span>'}</div>`,
@@ -1296,6 +1300,7 @@ $('#btn-package').addEventListener('click', () => withBusy($('#btn-package'), '�
       renderGuide();
     }
     loadAssets();
+    updatePlan();
     const zips = d.packages.filter((p) => p.downloadable).length;
     toast(zips ? `ZIPを${zips}個作りました。「ダウンロード」から保存できます` : 'ZIPを作れませんでした。下の警告を確認してください', !zips);
   } catch (e) {
@@ -1304,6 +1309,83 @@ $('#btn-package').addEventListener('click', () => withBusy($('#btn-package'), '�
   }
   box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }));
+
+/* ---------- セットの作り方（何枚ずつZIPにするか） ---------- */
+function packageMode() {
+  const el = document.querySelector('input[name="setmode"]:checked');
+  return el ? el.value : 'auto';
+}
+
+/** サーバーに渡す「セットの作り方」。 */
+function packageOptions() {
+  if (packageMode() === 'selected') return { ids: [...state.selected].sort() };
+  const size = $('#set-size').value;
+  return { set_size: size ? Number(size) : null };
+}
+
+function rangeText(set) {
+  return set.first === set.last ? set.first : `${set.first}〜${set.last}`;
+}
+
+let planTimer = null;
+function updatePlan() {
+  clearTimeout(planTimer);
+  planTimer = setTimeout(async () => {
+    $('#setsize-row').classList.toggle('off', packageMode() !== 'auto');
+    const box = $('#package-plan');
+    let d;
+    try {
+      d = await api('/api/package/plan', { method: 'POST', body: packageOptions() });
+    } catch (e) { box.textContent = e.message; box.classList.add('bad'); return; }
+
+    const lines = [];
+    if (d.sets.length) {
+      // 例: 40枚×2セット＋16枚×1セット
+      const counts = {};
+      d.sets.forEach((s) => { counts[s.count] = (counts[s.count] || 0) + 1; });
+      const summary = Object.keys(counts).map(Number).sort((a, b) => b - a)
+        .map((c) => `${c}枚×${counts[c]}セット`).join('＋');
+      lines.push(`<b>${summary}</b> のZIPを作ります（合計${d.total}枚）`);
+      lines.push(`<small>${d.sets.map(rangeText).join(' ／ ')}</small>`);
+    }
+    if (d.error) lines.push(escapeHtml(d.error));
+    if (d.leftover.length && !d.error) {
+      const ids = d.leftover.length > 8
+        ? `${d.leftover.slice(0, 8).join(', ')} ほか${d.leftover.length - 8}枚`
+        : d.leftover.join(', ');
+      lines.push(`残りの<b>${d.leftover.length}枚</b>はどのセットにも入りません<small>（${escapeHtml(ids)}）</small>`);
+    }
+    if (d.missing.length && packageMode() === 'auto') {
+      lines.push(`<small>まだ完成画像が無い${d.missing.length}枚は含みません</small>`);
+    }
+    box.innerHTML = lines.map((l) => `<div>${l}</div>`).join('');
+    box.classList.toggle('bad', !!d.error || !d.sets.length);
+    $('#btn-package').disabled = !!d.error || !d.sets.length;
+  }, 120);
+}
+
+document.querySelectorAll('input[name="setmode"]').forEach((r) => r.addEventListener('change', () => {
+  writeLS('package.mode', packageMode());
+  updatePlan();
+}));
+$('#set-size').addEventListener('change', () => {
+  writeLS('package.size', $('#set-size').value);
+  updatePlan();
+});
+$('#btn-go-select').addEventListener('click', () => {
+  document.querySelector('input[name="setmode"][value="selected"]').checked = true;
+  writeLS('package.mode', 'selected');
+  switchTab('grid');
+  toast('ZIPに入れたいスタンプにチェックを付けてから、「検証・出力」タブに戻ってください');
+});
+// 前回選んだ作り方を復元
+(function restorePackageChoice() {
+  const mode = readLS('package.mode', 'auto');
+  const radio = document.querySelector(`input[name="setmode"][value="${mode}"]`);
+  if (radio) radio.checked = true;
+  const size = readLS('package.size', '');
+  if ([...$('#set-size').options].some((o) => o.value === size)) $('#set-size').value = size;
+})();
 
 /** main/tab はまだ作っていないことが多いので、404を壊れた画像として見せません。 */
 function loadAssets() {

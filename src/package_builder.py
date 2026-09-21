@@ -186,18 +186,136 @@ def _summarize(ids: list[str], limit: int = 8) -> str:
     return f"{', '.join(ids[:limit])} ほか{len(ids) - limit}件（計{len(ids)}件）"
 
 
-def build_packages(config, entries) -> list[PackageResult]:
-    """完成画像を LINE の許可枚数ごとにZIP化します。"""
-    final_dir = config.dir_final
-    available = [(e, final_dir / f"{e.id}.png") for e in entries]
-    ready = [(e, p) for e, p in available if p.exists()]
-    missing = [e.id for e, p in available if not p.exists()]
+def valid_set_sizes(config) -> list[int]:
+    return sorted(int(v) for v in config.get("package.valid_set_sizes", [8, 16, 24, 32, 40]))
+
+
+def plan_sets(count: int, valid_sizes: list[int], set_size: int | None = None) -> tuple[list[int], int]:
+    """枚数をセットに分けます。
+
+    set_size を指定しなければ「おまかせ」（できるだけ多く使う: 100枚 → 40+40+16）。
+    指定すればその枚数ずつ（100枚・40枚 → 40+40、残り20）。
+    """
+    if set_size is None:
+        return split_into_valid_sets(count, valid_sizes)
+    if set_size not in valid_sizes:
+        raise PackageError(f"1セットの枚数は {valid_sizes} のどれかにしてください（指定: {set_size}）")
+    n = count // set_size
+    return [set_size] * n, count - n * set_size
+
+
+def selection_hint(count: int, valid_sizes: list[int]) -> str | None:
+    """選んだ枚数が1セットにできないとき、あと何枚で何枚セットになるかを案内します。"""
+    if count in valid_sizes:
+        return None
+    sizes = "・".join(str(v) for v in valid_sizes)
+    if count == 0:
+        return "スタンプが選ばれていません。「スタンプ一覧」でチェックを付けてください。"
+    largest = max(valid_sizes)
+    if count > largest:
+        return (f"{count}枚選んでいます。1セットは最大{largest}枚なので、"
+                f"あと{count - largest}枚外すと{largest}枚セットになります。")
+    up = min(v for v in valid_sizes if v > count)
+    down = max((v for v in valid_sizes if v < count), default=None)
+    msg = f"{count}枚選んでいます。1セットは{sizes}枚のどれかです。あと{up - count}枚選ぶと{up}枚セット"
+    if down:
+        msg += f"、{count - down}枚外すと{down}枚セット"
+    return msg + "になります。"
+
+
+@dataclass
+class PackagePlan:
+    """ZIPを作る前の見込み（ファイルは書きません）。"""
+
+    groups: list[list]            # セットごとの StickerEntry のリスト
+    leftover: list                # どのセットにも入らない StickerEntry
+    missing: list[str]            # 完成画像が無いID
+    error: str | None = None      # このままでは作れない理由
+
+    def to_dict(self) -> dict:
+        return {
+            "sets": [
+                {"count": len(g), "first": g[0].id, "last": g[-1].id} for g in self.groups
+            ],
+            "leftover": [e.id for e in self.leftover],
+            "missing": self.missing,
+            "error": self.error,
+            "total": sum(len(g) for g in self.groups),
+        }
+
+
+def plan_packages(config, entries, *, set_size: int | None = None, ids=None) -> PackagePlan:
+    """どのスタンプを何セットに分けるかを決めます。
+
+    Args:
+        set_size: 1セットの枚数。None なら「おまかせ」。
+        ids: 指定すると「選んだスタンプだけで1セット」モードになります。
+    """
+    valid = valid_set_sizes(config)
+    pool = list(entries)
+    if ids is not None:
+        wanted = {int(i) for i in ids if str(i).strip().isdigit()}
+        pool = [e for e in pool if e.index in wanted]
+    ready = [e for e in pool if (config.dir_final / f"{e.id}.png").exists()]
+    missing = [e.id for e in pool if not (config.dir_final / f"{e.id}.png").exists()]
+
+    if ids is not None:
+        hint = selection_hint(len(ready), valid)
+        if missing and hint:
+            hint += f"（完成画像が無い {len(missing)}枚は数に入れていません）"
+        if hint:
+            return PackagePlan([], ready, missing, hint)
+        return PackagePlan([ready], [], missing)
 
     if not ready:
-        raise PackageError(
-            f"完成画像が1枚もありません: {final_dir}\n"
-            "先に `python -m src.main generate` または `render` を実行してください。"
-        )
+        return PackagePlan([], [], missing, "完成画像が1枚もありません。先にスタンプ画像を用意してください。")
+
+    if set_size is None and not bool(config.get("package.auto_split", True)):
+        sizes, _ = [len(ready)], 0
+    else:
+        sizes, _ = plan_sets(len(ready), valid, set_size)
+    groups, cursor = [], 0
+    for n in sizes:
+        groups.append(ready[cursor : cursor + n])
+        cursor += n
+    error = None
+    if not groups:
+        if set_size is None:
+            error = (f"完成画像が{len(ready)}枚しかないため、セットを作れません。"
+                     f"1セットは最低{min(valid)}枚必要です。")
+        else:
+            error = (f"完成画像が{len(ready)}枚しかないため、{set_size}枚のセットを作れません。"
+                     "1セットの枚数を減らしてください。")
+    return PackagePlan(groups, ready[cursor:], missing, error)
+
+
+def archive_old_packages(config) -> Path | None:
+    """前回作ったZIPを output/archive/packages/<日時>/ へ移します（削除はしません）。
+
+    分け方を変えて作り直したとき、古いZIPが混ざって見分けがつかなくなるのを防ぎます。
+    """
+    old = sorted(config.dir_packages.glob("*.zip"))
+    if not old:
+        return None
+    from datetime import datetime
+
+    dest = config.root / "output" / "archive" / "packages" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    dest.mkdir(parents=True, exist_ok=True)
+    for z in old:
+        z.replace(dest / z.name)
+    return dest
+
+
+def build_packages(config, entries, *, set_size: int | None = None, ids=None) -> list[PackageResult]:
+    """完成画像を LINE の許可枚数ごとにZIP化します。
+
+    Args:
+        set_size: 1セットの枚数（8/16/24/32/40）。None なら「おまかせ」。
+        ids: 指定すると、そのスタンプだけで1セットを作ります。
+    """
+    plan = plan_packages(config, entries, set_size=set_size, ids=ids)
+    if plan.error:
+        raise PackageError(plan.error)
 
     main_path = config.dir_main / "main.png"
     tab_path = config.dir_tab / "tab.png"
@@ -206,41 +324,36 @@ def build_packages(config, entries) -> list[PackageResult]:
     if not tab_path.exists():
         tab_path, _ = build_tab_image(config)
 
-    valid_sizes = [int(s) for s in config.get("package.valid_set_sizes", [8, 16, 24, 32, 40])]
-    auto_split = bool(config.get("package.auto_split", True))
-
+    archived = archive_old_packages(config)
+    valid = valid_set_sizes(config)
     results: list[PackageResult] = []
-    if auto_split:
-        sets, leftover = split_into_valid_sets(len(ready), valid_sizes)
-    else:
-        sets, leftover = [len(ready)], 0
-
-    cursor = 0
-    for chunk in sets:
-        group = ready[cursor : cursor + chunk]
-        cursor += chunk
-        first, last = group[0][0].id, group[-1][0].id
-        zip_path = config.dir_packages / f"line_stickers_{first}_{last}.zip"
+    for group in plan.groups:
+        first, last = group[0].id, group[-1].id
+        name = (f"line_stickers_selected_{len(group)}.zip" if ids is not None
+                else f"line_stickers_{first}_{last}.zip")
         result = build_zip(
             config,
-            [p for _, p in group],
-            zip_path,
+            [config.dir_final / f"{e.id}.png" for e in group],
+            config.dir_packages / name,
             main_path=main_path,
             tab_path=tab_path,
         )
-        if missing:
-            result.warnings.append(f"NOTE: 完成画像が無いIDをスキップしました: {_summarize(missing)}")
+        if plan.missing:
+            result.warnings.append(f"NOTE: 完成画像が無いIDをスキップしました: {_summarize(plan.missing)}")
+        if archived:
+            result.warnings.append(f"NOTE: 前回のZIPは {archived.relative_to(config.root)} に移しました")
+            archived = None  # 1回だけ表示
         results.append(result)
 
-    if leftover:
-        leftover_ids = [e.id for e, _ in ready[cursor:]]
+    if plan.leftover:
+        leftover_ids = [e.id for e in plan.leftover]
         results.append(
             PackageResult(
                 path=config.dir_packages / "(未パッケージ)",
-                sticker_count=leftover,
+                sticker_count=len(leftover_ids),
                 size_bytes=0,
                 warnings=[
-                    f"WARNING: {leftover}枚は LINE の許可枚数 {valid_sizes} に分割できず"
+                    f"WARNING: {len(leftover_ids)}枚は LINE の許可枚数 {valid} に分割できず"
                     f"ZIP化していません: {_summarize(leftover_ids)}"
                 ],
             )

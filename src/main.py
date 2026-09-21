@@ -483,7 +483,8 @@ def cmd_package(config, args) -> int:
         for issue in report.issues:
             print(str(issue))
 
-    results = pkg.build_packages(config, entries)
+    set_size = None if args.set_size in (None, "auto") else int(args.set_size)
+    results = pkg.build_packages(config, entries, set_size=set_size)
     print("-" * 72)
     for r in results:
         if r.size_bytes:
@@ -562,6 +563,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("package", help="main/tab画像とLINE提出用ZIPを生成")
     _add_selection_args(p)
+    p.add_argument(
+        "--set-size", choices=["auto", "8", "16", "24", "32", "40"], default="auto",
+        help="1セットの枚数。auto(おまかせ)はできるだけ多く使うよう 40/32/24/16/8 を組み合わせます",
+    )
     p.set_defaults(func=cmd_package)
 
     return parser

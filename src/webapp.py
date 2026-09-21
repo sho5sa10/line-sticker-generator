@@ -937,14 +937,38 @@ def create_app(config=None) -> Flask:
             }
         )
 
+    def _package_options(body: dict) -> dict:
+        """画面から来た「セットの作り方」を build_packages の引数に変換します。"""
+        set_size = body.get("set_size")
+        ids = body.get("ids")
+        return {
+            "set_size": int(set_size) if str(set_size or "").strip().isdigit() else None,
+            "ids": [str(i) for i in ids] if isinstance(ids, list) else None,
+        }
+
+    @app.post("/api/package/plan")
+    def api_package_plan():
+        """ZIPを作る前に、何セットに分かれるか・何枚余るかを返します（ファイルは書きません）。"""
+        try:
+            opts = _package_options(request.get_json(silent=True) or {})
+            plan = pkg.plan_packages(current_config(), entries_or_error(), **opts)
+        except (pkg.PackageError, CsvLoadError) as exc:
+            return jsonify({"error": str(exc), "sets": [], "leftover": [], "missing": [], "total": 0})
+        return jsonify(plan.to_dict())
+
     @app.post("/api/package")
     def api_package():
         cfg_ = current_config()
         try:
+            opts = _package_options(request.get_json(silent=True) or {})
             entries = entries_or_error()
+            # 作れない指定なら、main/tab も作らずに理由だけ返します。
+            plan = pkg.plan_packages(cfg_, entries, **opts)
+            if plan.error:
+                raise pkg.PackageError(plan.error)
             main_path, main_size = pkg.build_main_image(cfg_)
             tab_path, tab_size = pkg.build_tab_image(cfg_)
-            results = pkg.build_packages(cfg_, entries)
+            results = pkg.build_packages(cfg_, entries, **opts)
         except (pkg.PackageError, CsvLoadError) as exc:
             return jsonify({"error": str(exc)}), 400
 

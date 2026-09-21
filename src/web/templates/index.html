@@ -345,7 +345,40 @@
 
       <div class="card">
         <h3>main画像 / tab画像 / ZIP</h3>
-        <p class="hint">提出用ZIPを作成します。LINEの1セットは8/16/24/32/40枚単位です。</p>
+        <p class="hint">
+          LINE Creators Market に提出するZIPを作ります。
+          LINEの1セットは <b>8・16・24・32・40枚</b> のどれかなので、作り方を選んでください。
+        </p>
+
+        <div class="setmode">
+          <label class="radio">
+            <input type="radio" name="setmode" value="auto" checked>
+            <span><b>番号順に分ける</b></span>
+          </label>
+          <div class="setmode-sub" id="setsize-row">
+            1セットの枚数
+            <select id="set-size"
+                    data-tip="「おまかせ」は、できるだけ多くのスタンプを使えるように40・32・24・16・8枚を組み合わせます">
+              <option value="">おまかせ（できるだけ多く使う）</option>
+              <option value="40">40枚</option>
+              <option value="32">32枚</option>
+              <option value="24">24枚</option>
+              <option value="16">16枚</option>
+              <option value="8">8枚</option>
+            </select>
+          </div>
+          <label class="radio">
+            <input type="radio" name="setmode" value="selected">
+            <span><b>選んだスタンプだけで1セット</b></span>
+          </label>
+          <div class="setmode-sub">
+            「スタンプ一覧」でチェックを付けたものだけでZIPを作ります。気に入ったものだけで申請したいときに。
+            <button class="btn small ghost" id="btn-go-select">スタンプ一覧で選ぶ</button>
+          </div>
+        </div>
+
+        <div class="plan" id="package-plan"></div>
+
         <button class="btn primary" id="btn-package"
                 data-tip="LINE Creators Market にそのままアップロードできるZIPを作ります">main・tab・ZIPを作成</button>
         <div class="assets">
