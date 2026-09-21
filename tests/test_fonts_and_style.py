@@ -221,3 +221,23 @@ def test_missing_chars(font_path):
     arial = fontlib._find_file("arial.ttf")
     if arial:
         assert set(fontlib.missing_chars(str(arial), ["了解！OK"])) == {"了", "解", "！"}
+
+
+def test_pick_font_skips_font_without_kanji(tmp_config, font_path):
+    # だるまドロップ（漢字なし）は「元気」系に合うフォントだが、提案には選ばない
+    fontlib.install_free_font(tmp_config, "darumadrop-one", http_get=_fake_http(font_path))
+    fonts = fontlib.available_fonts(tmp_config)
+    assert any(f.id == "darumadrop-one" for f in fonts)
+    picked = ss._pick_font(fonts, "impact")
+    assert picked is not None and picked.id != "darumadrop-one"
+
+
+def test_pick_font_skips_font_missing_sticker_chars(font_path):
+    from src.fonts import FontInfo
+
+    arial = fontlib._find_file("arial.ttf")
+    if not arial:
+        pytest.skip("arial.ttf がありません")
+    no_jp = FontInfo("a", "A", str(arial), 0, "", ("gentle",), "")
+    jp = FontInfo("b", "B", font_path, 0, "", ("gentle",), "")
+    assert ss._pick_font([no_jp, jp], "gentle", ["了解！"]).id == "b"

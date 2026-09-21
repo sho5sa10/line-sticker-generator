@@ -83,6 +83,10 @@ class FreeFont:
         return f"{GOOGLE_FONTS_BASE}/{self.folder}/OFL.txt"
 
 
+# 漢字が入っていないフォントの印。自動の提案では選びません。
+NO_KANJI = "no-kanji"
+
+
 FREE_FONTS: list[FreeFont] = [
     # --- 手書き ---
     FreeFont("hachi-maru-pop", "はちまるポップ", "手書き", "hachimarupop",
@@ -104,9 +108,9 @@ FREE_FONTS: list[FreeFont] = [
              "KiwiMaru-Medium.ttf", 4.9, ("handwritten", "gentle"),
              "やわらかい丸字。ほっこりしたキャラに"),
     FreeFont("darumadrop-one", "だるまドロップ", "手書き", "darumadropone",
-             "DarumadropOne-Regular.ttf", 0.3, ("handwritten", "impact"),
-             "ぽってりした手書き。ファイルが小さく、漢字が入っていない可能性があります"
-             "（追加後に足りない文字をチェックします）"),
+             "DarumadropOne-Regular.ttf", 0.3, ("handwritten", "impact", NO_KANJI),
+             "ぽってりした手書き。漢字が入っていないため、ひらがな・カタカナだけのセリフ向け"
+             "（キャラに合わせた提案では選ばれません）"),
     # --- 丸ゴシック ---
     FreeFont("zen-maru-gothic", "Zen丸ゴシック（極太）", "丸ゴシック", "zenmarugothic",
              "ZenMaruGothic-Black.ttf", 3.5, ("gentle", "rounded"),

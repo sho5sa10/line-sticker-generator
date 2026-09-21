@@ -136,19 +136,41 @@ def mood_font_tag(profile: dict | None) -> tuple[str, str]:
     return "standard", "読みやすい定番のフォント"
 
 
-def _pick_font(fonts: list[FontInfo], tag: str) -> FontInfo | None:
+def _pick_font(fonts: list[FontInfo], tag: str, texts=()) -> FontInfo | None:
     """雰囲気に合うフォントを選びます。
 
     自分で追加した無料フォント（手書きなど）があれば、それを優先します。
     わざわざ追加したフォントは、使いたいフォントのはずだからです。
+    ただし、漢字が入っていないフォントや、セリフの文字が足りないフォントは選びません。
     """
-    from .fonts import free_font
+    from .fonts import NO_KANJI, free_font, missing_chars
+
+    texts = list(texts)
+
+    def usable(f: FontInfo) -> bool:
+        if NO_KANJI in f.tags:
+            return False
+        try:
+            return not (texts and missing_chars(f.path, texts, f.index))
+        except OSError:
+            return False
 
     matches = [f for f in fonts if tag in f.tags]
     added = [f for f in matches if free_font(f.id)]
-    if added:
-        return added[0]
-    return matches[0] if matches else (fonts[0] if fonts else None)
+    for f in added + [f for f in matches if f not in added]:
+        if usable(f):
+            return f
+    return next((f for f in fonts if NO_KANJI not in f.tags), None)
+
+
+def _sticker_texts(config) -> list[str]:
+    """セリフ一覧（読めなければ空）。フォントに足りない文字がないか調べるのに使います。"""
+    from .csv_loader import load_stickers
+
+    try:
+        return [e.text for e in load_stickers(config.csv_path)]
+    except Exception:  # noqa: BLE001 - CSV が壊れていても提案自体は出します
+        return []
 
 
 _STROKE = {"impact": 8, "elegant": 8, "gentle": 7, "cool": 7, "standard": 7, "custom": 7}
@@ -162,8 +184,9 @@ def suggest_styles(config) -> dict:
     fonts = available_fonts(config)
     profile = cprof.load_profile(config.character_profile_path)
     tag, font_reason = mood_font_tag(profile)
-    main_font = _pick_font(fonts, tag)
-    standard_font = _pick_font(fonts, "standard")
+    texts = _sticker_texts(config)
+    main_font = _pick_font(fonts, tag, texts)
+    standard_font = _pick_font(fonts, "standard", texts)
 
     src = _source_image(config)
     if src:
