@@ -74,6 +74,25 @@ async function checkServer() {
 checkServer();
 setInterval(checkServer, 15000);
 
+/**
+ * 時間のかかる処理のあいだ、ボタンを「処理中」の見た目にして押せなくします。
+ * 何も変化がないと、押しても反応していないように見えるためです。
+ */
+async function withBusy(btn, busyLabel, fn) {
+  if (btn.disabled) return undefined;
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.classList.add('busy');
+  btn.textContent = busyLabel;
+  try {
+    return await fn();
+  } finally {
+    btn.disabled = false;
+    btn.classList.remove('busy');
+    btn.textContent = label;
+  }
+}
+
 function openLightbox(src, caption) {
   $('#lb-img').src = src;
   $('#lb-cap').textContent = caption;
@@ -1229,9 +1248,9 @@ $('#btn-design-apply').addEventListener('click', async () => {
 /* ------------------------------------------------------------------ */
 /* 検証・出力                                                          */
 /* ------------------------------------------------------------------ */
-$('#btn-validate').addEventListener('click', async () => {
+$('#btn-validate').addEventListener('click', () => withBusy($('#btn-validate'), '検証中…', async () => {
   const box = $('#validate-result');
-  box.textContent = '検証中…';
+  box.innerHTML = '<div class="line working">全スタンプを検証しています。数秒かかります…</div>';
   try {
     const d = await api('/api/validate', { method: 'POST' });
     if (!d.checked) { box.innerHTML = '<div class="line">完成画像がまだありません。</div>'; return; }
@@ -1245,12 +1264,17 @@ $('#btn-validate').addEventListener('click', async () => {
     box.innerHTML = lines.join('');
     state.validated = d.checked > 0 && d.errors === 0;
     renderGuide();
-  } catch (e) { box.innerHTML = `<div class="line ERROR">${escapeHtml(e.message)}</div>`; }
-});
+    toast(d.errors ? `検証しました: エラー ${d.errors}件` : `${d.checked}件を検証しました。エラーはありません`, d.errors > 0);
+  } catch (e) {
+    box.innerHTML = `<div class="line ERROR">${escapeHtml(e.message)}</div>`;
+    toast(e.message, true);
+  }
+  box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}));
 
-$('#btn-package').addEventListener('click', async () => {
+$('#btn-package').addEventListener('click', () => withBusy($('#btn-package'), '作成中…', async () => {
   const box = $('#package-result');
-  box.textContent = '作成中…';
+  box.innerHTML = '<div class="line working">main画像・tab画像・ZIPを作っています。100枚分で10秒ほどかかります…</div>';
   try {
     const d = await api('/api/package', { method: 'POST' });
     const lines = [
@@ -1259,8 +1283,8 @@ $('#btn-package').addEventListener('click', async () => {
     ];
     d.packages.forEach((p) => {
       if (p.downloadable) {
-        lines.push(`<div class="line"><a href="/api/download/${encodeURIComponent(p.name)}" download>${escapeHtml(p.name)}</a>` +
-                   ` — ${p.count}枚 / ${p.size_mb}MB</div>`);
+        lines.push(`<div class="line dl"><a class="btn small primary" href="/api/download/${encodeURIComponent(p.name)}" download>ダウンロード</a>` +
+                   ` ${escapeHtml(p.name)} — ${p.count}枚 / ${p.size_mb}MB</div>`);
       }
       p.warnings.forEach((w) => lines.push(`<div class="line WARNING">${escapeHtml(w)}</div>`));
     });
@@ -1272,8 +1296,14 @@ $('#btn-package').addEventListener('click', async () => {
       renderGuide();
     }
     loadAssets();
-  } catch (e) { box.innerHTML = `<div class="line ERROR">${escapeHtml(e.message)}</div>`; }
-});
+    const zips = d.packages.filter((p) => p.downloadable).length;
+    toast(zips ? `ZIPを${zips}個作りました。「ダウンロード」から保存できます` : 'ZIPを作れませんでした。下の警告を確認してください', !zips);
+  } catch (e) {
+    box.innerHTML = `<div class="line ERROR">${escapeHtml(e.message)}</div>`;
+    toast(e.message, true);
+  }
+  box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}));
 
 /** main/tab はまだ作っていないことが多いので、404を壊れた画像として見せません。 */
 function loadAssets() {
@@ -1289,12 +1319,16 @@ function loadAssets() {
   });
 }
 
-$('#btn-gallery').addEventListener('click', async () => {
+$('#btn-gallery').addEventListener('click', () => withBusy($('#btn-gallery'), '生成中…', async () => {
   try {
     const d = await api('/api/gallery', { method: 'POST' });
     $('#gallery-result').innerHTML = `<div class="line good">生成しました</div><div class="line">${escapeHtml(d.path)}</div>`;
-  } catch (e) { $('#gallery-result').innerHTML = `<div class="line ERROR">${escapeHtml(e.message)}</div>`; }
-});
+    toast('gallery.html を生成しました');
+  } catch (e) {
+    $('#gallery-result').innerHTML = `<div class="line ERROR">${escapeHtml(e.message)}</div>`;
+    toast(e.message, true);
+  }
+}));
 
 $('#btn-log').addEventListener('click', async () => {
   const d = await api('/api/log');

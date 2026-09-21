@@ -312,6 +312,17 @@ main { padding: 16px; max-width: 1500px; margin: 0 auto; }
 .btn.danger { background: var(--danger); border-color: var(--danger); color: #fff; }
 .btn.ghost { background: var(--surface-2); }
 .btn.small { padding: 4px 10px; font-size: 12px; }
+/* 処理中のボタン: 回転マーク付きで押せない状態にする */
+.btn.busy { opacity: .85; cursor: progress; }
+.btn.busy::before {
+  content: ""; display: inline-block; width: 11px; height: 11px; margin-right: 7px;
+  border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%;
+  vertical-align: -1px; animation: spin .7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.result .working { color: var(--muted); }
+.result .dl { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.result .dl .btn { text-decoration: none; }
 
 /* ---------- grid ---------- */
 .grid {
