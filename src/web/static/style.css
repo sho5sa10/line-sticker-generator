@@ -12,6 +12,8 @@
   --ok: #1b8f4d;
   --radius: 10px;
   --shadow: 0 1px 2px rgba(0,0,0,.05), 0 4px 14px rgba(0,0,0,.05);
+  /* ヘッダーの実寸。JS が実際の高さに合わせて更新します（チップが折り返すと変わるため） */
+  --topbar-h: 54px;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
@@ -114,6 +116,59 @@ body {
 .next.finished { border-color: var(--ok); background: color-mix(in srgb, var(--ok) 9%, var(--surface)); }
 .next.finished .next-label { color: var(--ok); }
 
+/* ---------- はじめに（準備・キャラクター） ---------- */
+.checklist { display: grid; gap: 7px; }
+.checklist .item {
+  display: flex; gap: 9px; align-items: flex-start;
+  border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px;
+  background: var(--surface-2); font-size: 13px;
+}
+.checklist .mark { flex: none; font-weight: 800; }
+.checklist .item.ok .mark { color: var(--ok); }
+.checklist .item.ng .mark { color: var(--danger); }
+.checklist .item .how { display: block; font-size: 12px; color: var(--muted); }
+.checklist code {
+  background: var(--bg); padding: 1px 5px; border-radius: 4px;
+  font-family: ui-monospace, Consolas, monospace; font-size: 12px;
+}
+
+.master { display: grid; grid-template-columns: 260px 1fr; gap: 18px; align-items: start; }
+@media (max-width: 800px) { .master { grid-template-columns: 1fr; } }
+.master-box {
+  display: grid; place-items: center; min-height: 210px; border-radius: 8px; padding: 8px;
+  background-image:
+    linear-gradient(45deg, #cfd3da 25%, transparent 25%),
+    linear-gradient(-45deg, #cfd3da 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #cfd3da 75%),
+    linear-gradient(-45deg, transparent 75%, #cfd3da 75%);
+  background-size: 16px 16px;
+  background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+  background-color: #e9ebef;
+}
+.master-box img { max-width: 100%; max-height: 210px; }
+.master-meta { font-size: 11px; color: var(--muted); margin-top: 6px; word-break: break-all; }
+.master-actions { display: grid; gap: 14px; align-content: start; }
+.master-actions .field { margin: 0; display: grid; gap: 6px; }
+.master-actions input[type=file] { font-size: 12px; }
+.master-actions .btn { justify-self: start; }
+
+.warn-box {
+  margin-top: 14px; border: 1px solid var(--warn); border-radius: var(--radius);
+  background: color-mix(in srgb, var(--warn) 10%, var(--surface));
+  padding: 11px 13px; font-size: 13px; line-height: 1.6;
+}
+.warn-box .btn { margin-top: 8px; }
+
+.promptbox { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 12px; }
+.promptbox summary { cursor: pointer; font-size: 13px; font-weight: 700; }
+.promptbox textarea {
+  width: 100%; min-height: 220px; margin: 8px 0; padding: 10px;
+  border: 1px solid var(--line); border-radius: 8px;
+  background: var(--surface-2); color: var(--fg);
+  font-family: ui-monospace, Consolas, monospace; font-size: 12px; line-height: 1.6;
+  resize: vertical;
+}
+
 /* ---------- empty state ---------- */
 .empty-state {
   text-align: center; padding: 40px 20px;
@@ -136,7 +191,7 @@ body {
 .tabs {
   display: flex; gap: 4px; padding: 10px 16px 0;
   border-bottom: 1px solid var(--line); background: var(--surface);
-  position: sticky; top: 53px; z-index: 4; overflow-x: auto;
+  position: sticky; top: var(--topbar-h); z-index: 4; overflow-x: auto;
 }
 .tab {
   border: 1px solid transparent; border-bottom: none; background: none; cursor: pointer;

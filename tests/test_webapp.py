@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+from pathlib import Path
 
 import pytest
 from PIL import Image
@@ -297,6 +298,126 @@ def test_gallery_endpoint(client, tmp_config):
 
 def test_log_endpoint(client):
     assert "lines" in client.get("/api/log").get_json()
+
+
+# --- ステップ2: キャラクターマスター画像 --------------------------------
+def _png_bytes(img) -> bytes:
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def test_master_info_when_missing(client):
+    d = client.get("/api/master").get_json()
+    assert d["exists"] is False
+    assert d["backups"] == []
+    assert "Japanese cute chibi office worker mascot." in d["prompt"]
+
+
+def test_master_upload_and_backup(client, tmp_config):
+    first = _png_bytes(make_character((300, 300)))
+    res = client.post(
+        "/api/master/upload",
+        data={"file": (io.BytesIO(first), "hero.png")},
+        content_type="multipart/form-data",
+    )
+    assert res.status_code == 200
+    assert res.get_json()["backup"] is None
+    assert tmp_config.master_image_path.exists()
+
+    # 2回目は前の画像が履歴として残ること（上書きで消さない）
+    second = _png_bytes(make_character((320, 320), color=(10, 200, 90, 255)))
+    res = client.post(
+        "/api/master/upload",
+        data={"file": (io.BytesIO(second), "hero2.png")},
+        content_type="multipart/form-data",
+    )
+    assert res.status_code == 200
+    backup = res.get_json()["backup"]
+    assert backup and backup.startswith("character_master_")
+    assert (tmp_config.master_image_path.parent / backup).exists()
+
+    info = client.get("/api/master").get_json()
+    assert info["exists"] is True
+    assert backup in info["backups"]
+
+
+def test_master_upload_rejects_non_image(client):
+    res = client.post(
+        "/api/master/upload",
+        data={"file": (io.BytesIO(b"not an image at all"), "x.png")},
+        content_type="multipart/form-data",
+    )
+    assert res.status_code == 400
+    assert "画像として読み込めません" in res.get_json()["error"]
+
+
+def test_master_upload_rejects_blank_image(client):
+    blank = _png_bytes(Image.new("RGBA", (64, 64), (0, 0, 0, 0)))
+    res = client.post(
+        "/api/master/upload",
+        data={"file": (io.BytesIO(blank), "blank.png")},
+        content_type="multipart/form-data",
+    )
+    assert res.status_code == 400
+
+
+def test_master_upload_requires_file(client):
+    res = client.post("/api/master/upload", data={}, content_type="multipart/form-data")
+    assert res.status_code == 400
+
+
+def test_master_restore(client, tmp_config):
+    for _ in range(2):
+        client.post(
+            "/api/master/upload",
+            data={"file": (io.BytesIO(_png_bytes(make_character((300, 300)))), "a.png")},
+            content_type="multipart/form-data",
+        )
+    backups = client.get("/api/master").get_json()["backups"]
+    res = client.post("/api/master/restore", json={"name": backups[0]})
+    assert res.status_code == 200
+    assert tmp_config.master_image_path.exists()
+
+
+def test_master_restore_rejects_traversal(client):
+    for name in ("../../config/sticker_config.yaml", "character_master_../x.png", "nope.png"):
+        assert client.post("/api/master/restore", json={"name": name}).status_code == 404
+
+
+def test_master_prompt_save(client, tmp_config):
+    res = client.post("/api/master/prompt", json={"prompt": "A friendly robot mascot."})
+    assert res.status_code == 200
+    assert "A friendly robot mascot." in tmp_config.master_prompt_path.read_text(encoding="utf-8")
+    assert client.post("/api/master/prompt", json={"prompt": "  "}).status_code == 400
+
+
+def test_master_generate_without_key(client, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    res = client.post("/api/master/generate", json={})
+    assert res.status_code == 400
+    assert "OPENAI_API_KEY" in res.get_json()["error"]
+
+
+# --- 退避（削除はしない） -----------------------------------------------
+def test_archive_moves_files_without_deleting(client, tmp_config):
+    _add_raw(tmp_config, "001")
+    client.post("/api/render", json={"ids": ["001"]})
+    _wait_for_job(client)
+    assert (tmp_config.dir_final / "001.png").exists()
+
+    d = client.post("/api/generated/archive", json={}).get_json()
+    assert d["moved"] == {"generated": 1, "final": 1}
+    assert not list(tmp_config.dir_generated.glob("*.png"))
+    assert not list(tmp_config.dir_final.glob("*.png"))
+
+    archived = Path(d["archived_to"])
+    assert (archived / "generated" / "001.png").exists()
+    assert (archived / "final" / "001.png").exists()
+
+
+def test_archive_without_files(client):
+    assert client.post("/api/generated/archive", json={}).status_code == 400
 
 
 # --- 起動時の案内 -------------------------------------------------------

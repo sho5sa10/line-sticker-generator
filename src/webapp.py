@@ -19,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 
 from flask import Flask, jsonify, request, send_file, send_from_directory
+from PIL import Image
 
 from . import gallery as gallery_mod
 from . import image_processor as ip
@@ -137,6 +138,7 @@ def create_app(config=None) -> Flask:
         static_url_path="/static",
     )
     app.config["STICKER_CONFIG"] = cfg
+    app.config["MAX_CONTENT_LENGTH"] = 24 * 1024 * 1024  # アップロード上限
     jobs = JobManager()
     app.config["JOBS"] = jobs
 
@@ -299,6 +301,180 @@ def create_app(config=None) -> Flask:
     def img_master():
         cfg_ = current_config()
         return _serve(cfg_.master_image_path.parent, cfg_.master_image_path.name)
+
+    # ------------------------------------------------------------------
+    # ステップ2: キャラクターマスター画像
+    # ------------------------------------------------------------------
+    @app.get("/api/master")
+    def api_master_get():
+        cfg_ = current_config()
+        p = cfg_.master_image_path
+        info = {
+            "path": str(p),
+            "exists": p.exists(),
+            "prompt": "",
+            "prompt_path": str(cfg_.master_prompt_path),
+            "raw_count": len(list(cfg_.dir_generated.glob("*.png"))),
+            "final_count": len(list(cfg_.dir_final.glob("*.png"))),
+            "backups": sorted(b.name for b in p.parent.glob("character_master_*.png")),
+        }
+        if p.exists():
+            try:
+                with Image.open(p) as im:
+                    info.update(width=im.width, height=im.height, mode=im.mode)
+                info["mtime"] = int(p.stat().st_mtime)
+                info["size_kb"] = round(p.stat().st_size / 1024, 1)
+            except Exception as exc:  # noqa: BLE001
+                info["error"] = f"画像を読み込めません: {exc}"
+        # ファイルが無くても組み込みの既定プロンプトを返し、編集欄が空にならないようにします。
+        from .prompt_generator import load_master_prompt
+
+        info["prompt"] = load_master_prompt(cfg_.master_prompt_path)
+        return jsonify(info)
+
+    @app.post("/api/master/prompt")
+    def api_master_prompt():
+        cfg_ = current_config()
+        body = request.get_json(silent=True) or {}
+        text = str(body.get("prompt", "")).strip()
+        if not text:
+            return jsonify({"error": "プロンプトが空です"}), 400
+        path = cfg_.master_prompt_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text + "\n", encoding="utf-8")
+        return jsonify({"saved_to": str(path)})
+
+    def _backup_master(path: Path) -> str | None:
+        """既存のマスター画像を退避します（削除はしません）。"""
+        if not path.exists():
+            return None
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup = path.with_name(f"character_master_{stamp}.png")
+        path.replace(backup)
+        return backup.name
+
+    @app.post("/api/master/upload")
+    def api_master_upload():
+        """自分で用意した画像をマスターとして設定します。"""
+        cfg_ = current_config()
+        file = request.files.get("file")
+        if file is None or not file.filename:
+            return jsonify({"error": "ファイルが選ばれていません"}), 400
+
+        data = file.read()
+        if not data:
+            return jsonify({"error": "ファイルが空です"}), 400
+
+        # 拡張子ではなく中身で判定します（PNG以外もPNGへ変換して受け入れます）。
+        try:
+            with Image.open(io.BytesIO(data)) as im:
+                im.load()
+                rgba = im.convert("RGBA")
+        except Exception:  # noqa: BLE001
+            return jsonify({"error": "画像として読み込めませんでした"}), 400
+
+        if not ip.has_transparency(rgba):
+            rgba = ip.make_background_transparent(rgba)
+        if ip.is_blank(rgba):
+            return jsonify({"error": "画像の中身が空です（全ピクセルが透明）"}), 400
+
+        target = cfg_.master_image_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        backup = _backup_master(target)
+        rgba.save(target, format="PNG")
+        return jsonify(
+            {
+                "saved_to": str(target),
+                "backup": backup,
+                "width": rgba.width,
+                "height": rgba.height,
+            }
+        )
+
+    @app.post("/api/master/restore")
+    def api_master_restore():
+        """退避したマスター画像を戻します。"""
+        cfg_ = current_config()
+        name = str((request.get_json(silent=True) or {}).get("name", ""))
+        target = cfg_.master_image_path
+        source = (target.parent / name).resolve()
+        if (
+            not name.startswith("character_master_")
+            or source.suffix != ".png"
+            or target.parent.resolve() not in source.parents
+            or not source.exists()
+        ):
+            return jsonify({"error": "指定された履歴が見つかりません"}), 404
+        _backup_master(target)
+        source.replace(target)
+        return jsonify({"restored": name})
+
+    def _run_master(job: Job) -> None:
+        from .prompt_generator import CONSISTENCY_RULE, NO_TEXT_RULE, load_master_prompt
+        from .providers import create_provider
+
+        cfg_ = current_config()
+        prompt = "\n\n".join(
+            [
+                load_master_prompt(cfg_.master_prompt_path),
+                "POSE: standing straight and relaxed, facing forward, arms down naturally.\n"
+                "FACIAL EXPRESSION: calm friendly smile.\n"
+                "This is the reference sheet image that defines the character design.",
+                CONSISTENCY_RULE,
+                NO_TEXT_RULE,
+            ]
+        )
+        job.log("info", "キャラクターマスター画像を生成します")
+        provider = create_provider(cfg_)
+        target = cfg_.master_image_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        backup = _backup_master(target)
+        if backup:
+            job.log("info", f"前のマスター画像を {backup} として残しました")
+        try:
+            provider.generate(prompt=prompt, reference_image=None, output_path=str(target))
+        except Exception:
+            # 失敗したら退避した画像を戻します。
+            if backup and (target.parent / backup).exists():
+                (target.parent / backup).replace(target)
+                job.log("warn", "生成に失敗したため、前のマスター画像を戻しました")
+            raise
+        job.api_calls += 1
+        job.done = 1
+        job.log("ok", "マスター画像を作成しました")
+
+    @app.post("/api/master/generate")
+    def api_master_generate():
+        cfg_ = current_config()
+        if not cfg_.api_key:
+            return jsonify({"error": "OPENAI_API_KEY が未設定です。.env に記入してください。"}), 400
+        if jobs.is_running():
+            return jsonify({"error": "すでに処理が実行中です"}), 409
+        job = jobs.start("master", 1, _run_master)
+        return jsonify(job.to_dict())
+
+    @app.post("/api/generated/archive")
+    def api_generated_archive():
+        """生成済み画像を退避します（削除はしません）。
+
+        キャラクターを変えたあと、古い絵柄の画像が混ざらないようにするためのものです。
+        """
+        cfg_ = current_config()
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = cfg_.root / "output" / "archive" / stamp
+        moved = {"generated": 0, "final": 0}
+        for kind, src_dir in (("generated", cfg_.dir_generated), ("final", cfg_.dir_final)):
+            files = sorted(src_dir.glob("*.png"))
+            if not files:
+                continue
+            dest = base / kind
+            dest.mkdir(parents=True, exist_ok=True)
+            for f in files:
+                f.replace(dest / f.name)
+                moved[kind] += 1
+        if not any(moved.values()):
+            return jsonify({"error": "退避する画像がありません"}), 400
+        return jsonify({"archived_to": str(base), "moved": moved})
 
     # ------------------------------------------------------------------
     # 文字デザインのライブプレビュー（APIを呼ばない＝無料）

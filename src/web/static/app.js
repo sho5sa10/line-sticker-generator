@@ -13,6 +13,9 @@ const state = {
   poller: null,
   csvDirty: false,
   validated: false,
+  steps: [],
+  pinnedStep: null,   // ユーザーが明示的に選んだステップ（自動判定より優先）
+  master: null,
 };
 
 /* ------------------------------------------------------------------ */
@@ -50,6 +53,18 @@ $('#lightbox').addEventListener('click', () => $('#lightbox').classList.remove('
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') $('#lightbox').classList.remove('open');
 });
+
+/* ------------------------------------------------------------------ */
+/* ヘッダーの高さをCSS変数へ反映（チップが折り返しても タブ が重ならない） */
+/* ------------------------------------------------------------------ */
+(function trackTopbarHeight() {
+  const bar = document.querySelector('.topbar');
+  const apply = () => document.documentElement.style.setProperty(
+    '--topbar-h', `${Math.round(bar.getBoundingClientRect().height)}px`);
+  apply();
+  if (window.ResizeObserver) new ResizeObserver(apply).observe(bar);
+  else window.addEventListener('resize', apply);
+})();
 
 /* ------------------------------------------------------------------ */
 /* ツールチップ（data-tip 属性を持つ要素にホバーで説明を出す）          */
@@ -103,6 +118,12 @@ function switchTab(name) {
   if (tab) tab.click();
 }
 
+/** 各ステップが属するタブ。ステップをクリックするとここへ移動します。 */
+const STEP_TAB = {
+  setup: 'start', character: 'start', try: 'grid', design: 'design',
+  rest: 'grid', validate: 'output', package: 'output',
+};
+
 /** いまの状態から各ステップの達成状況を判定します。 */
 function computeSteps(info) {
   const total = info.stickers.length;
@@ -118,18 +139,19 @@ function computeSteps(info) {
         : [!info.api_key_set && 'APIキー未設定', info.font_error && 'フォント未検出',
            info.csv_error && 'CSVエラー'].filter(Boolean).join(' / '),
       done: ready, blocked: !ready,
-      action: null,
+      action: { label: '準備の状態を見る', run: () => switchTab('start') },
       help: '.env に OPENAI_API_KEY を書いてから、このページを再読み込みしてください。',
     },
     {
       n: 2, key: 'character', title: 'キャラクターを決める',
       desc: info.master_ok
-        ? 'マスター画像あり。全スタンプがこの絵柄で作られます'
-        : 'data/character/character_master.png がまだありません',
-      done: info.master_ok, blocked: !info.master_ok && ready,
-      action: null,
-      help: 'ターミナルで python -m src.main init-character を実行するか、'
-          + '透過PNGを data/character/character_master.png に置いてください。',
+        ? 'マスター画像あり。差し替えれば別キャラのセットも作れます'
+        : 'まだありません。画像を用意するか、AIに作ってもらえます',
+      done: info.master_ok, blocked: false,
+      action: { label: info.master_ok ? 'キャラクターを見直す' : 'キャラクターを用意する',
+                run: () => switchTab('start') },
+      help: '画像をアップロードするか、AIに1枚だけ作らせることができます。'
+          + 'いまの画像は履歴として残るので、いつでも戻せます。',
     },
     {
       n: 3, key: 'try', title: 'まず1枚だけ試す',
@@ -175,12 +197,20 @@ function renderGuide() {
   const info = state.info;
   if (!info) return;
   const steps = computeSteps(info);
-  const current = steps.find((s) => !s.done && !s.optional) || null;
+  state.steps = steps;
+
+  // 自動判定した「いまのステップ」。ユーザーが明示的に選んだ場合はそちらを優先します。
+  const auto = steps.find((s) => !s.done && !s.optional) || null;
+  const pinned = state.pinnedStep
+    ? steps.find((s) => s.key === state.pinnedStep) || null
+    : null;
+  const shown = pinned || auto;
 
   $('#steps').innerHTML = steps.map((s) => {
-    const cls = s.done ? 'done' : s.blocked ? 'blocked'
-      : (current && s.key === current.key) ? 'current' : 'todo';
-    return `<li class="step ${cls}" data-step="${s.key}" data-tip="${escapeHtml(s.help || s.desc)}">
+    const cls = (shown && s.key === shown.key) ? 'current'
+      : s.done ? 'done' : s.blocked ? 'blocked' : 'todo';
+    return `<li class="step ${cls}" data-step="${s.key}"
+        data-tip="${escapeHtml(s.help || s.desc)}${s.done ? '（完了済み。クリックでやり直せます）' : ''}">
       <span class="num"><span>${s.n}</span></span>
       <span>
         <span class="st">${escapeHtml(s.title)}${s.optional ? '<span class="sd">（任意）</span>' : ''}</span>
@@ -191,39 +221,77 @@ function renderGuide() {
 
   const box = $('#next-action');
   box.className = 'next';
-  if (!current) {
+  $('#btn-step-auto').hidden = !pinned;
+  $('#next-label').textContent = pinned ? '選んだステップ' : '次にやること';
+
+  const idx = shown ? steps.indexOf(shown) : steps.length;
+  $('#btn-step-prev').disabled = idx <= 0;
+  $('#btn-step-next').disabled = idx >= steps.length - 1;
+
+  if (!shown) {
     box.classList.add('finished');
+    $('#next-label').textContent = '完了';
     $('#next-title').textContent = 'すべて完了しました';
-    $('#next-desc').textContent = '「検証・出力」タブからZIPをダウンロードして、LINE Creators Market に申請できます。';
+    $('#next-desc').textContent =
+      '「検証・出力」タブからZIPをダウンロードして、LINE Creators Market に申請できます。'
+      + 'やり直したいステップは、上のカードをクリックすればいつでも戻れます。';
+    $('#btn-next').style.display = '';
     $('#btn-next').textContent = 'ZIPを確認する';
     $('#btn-next').onclick = () => switchTab('output');
     return;
   }
-  if (current.blocked) box.classList.add('blocked');
-  $('#next-title').textContent = `${current.n}. ${current.title}`;
-  $('#next-desc').textContent = current.blocked ? (current.help || current.desc) : current.desc;
+
+  if (shown.blocked) box.classList.add('blocked');
+  else if (pinned && shown.done) box.classList.add('finished');
+
+  $('#next-title').textContent = `${shown.n}. ${shown.title}`;
+  $('#next-desc').textContent = shown.blocked ? (shown.help || shown.desc) : shown.desc;
+
   const btn = $('#btn-next');
-  if (current.action && !current.blocked) {
+  if (shown.action && !shown.blocked) {
     btn.style.display = '';
-    btn.textContent = current.action.label;
-    btn.onclick = current.action.run;
+    btn.textContent = shown.action.label;
+    btn.onclick = shown.action.run;
   } else {
     btn.style.display = 'none';
   }
 }
 
+/** ステップを選んで、そのタブへ移動します（完了済みでも戻れます）。 */
+function goToStep(key) {
+  state.pinnedStep = key;
+  renderGuide();
+  switchTab(STEP_TAB[key] || 'grid');
+  if (key === 'rest') selectMissing();
+}
+
 $('#steps').addEventListener('click', (e) => {
   const li = e.target.closest('.step');
-  if (!li) return;
-  ({
-    setup: () => toast('.env の OPENAI_API_KEY を設定してページを再読み込みしてください'),
-    character: () => toast('python -m src.main init-character でマスター画像を作れます'),
-    try: () => switchTab('grid'),
-    design: () => switchTab('design'),
-    rest: () => selectMissing(),
-    validate: () => switchTab('output'),
-    package: () => switchTab('output'),
-  }[li.dataset.step] || (() => {}))();
+  if (li) goToStep(li.dataset.step);
+});
+
+$('#btn-step-prev').addEventListener('click', () => {
+  const steps = state.steps || [];
+  const shown = state.pinnedStep
+    ? steps.find((s) => s.key === state.pinnedStep)
+    : steps.find((s) => !s.done && !s.optional);
+  const idx = shown ? steps.indexOf(shown) : steps.length;
+  if (idx > 0) goToStep(steps[idx - 1].key);
+});
+
+$('#btn-step-next').addEventListener('click', () => {
+  const steps = state.steps || [];
+  const shown = state.pinnedStep
+    ? steps.find((s) => s.key === state.pinnedStep)
+    : steps.find((s) => !s.done && !s.optional);
+  const idx = shown ? steps.indexOf(shown) : -1;
+  if (idx >= 0 && idx < steps.length - 1) goToStep(steps[idx + 1].key);
+});
+
+$('#btn-step-auto').addEventListener('click', () => {
+  state.pinnedStep = null;
+  renderGuide();
+  toast('いまの状態に合わせた表示に戻しました');
 });
 
 $('#btn-guide-toggle').addEventListener('click', () => {
@@ -261,6 +329,7 @@ $('#tabs').addEventListener('click', (e) => {
   $$('.panel').forEach((p) => p.classList.toggle('active', p.id === `panel-${tab.dataset.tab}`));
   if (tab.dataset.tab === 'design') refreshPreview();
   if (tab.dataset.tab === 'output') loadAssets();
+  if (tab.dataset.tab === 'start') loadMaster();
 });
 
 /* ------------------------------------------------------------------ */
@@ -277,6 +346,7 @@ async function loadState() {
   fillDesignTargets();
   $('#guide').hidden = readLS('guide.hidden', '0') === '1';
   renderGuide();
+  await loadMaster();
   if (info.job && info.job.status === 'running') startPolling();
   const notes = [];
   if (info.csv_error) notes.push(`CSVエラー: ${info.csv_error}`);
@@ -304,6 +374,176 @@ function renderChips(info) {
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+/* ------------------------------------------------------------------ */
+/* はじめに: 1 準備チェック / 2 キャラクター                            */
+/* ------------------------------------------------------------------ */
+function renderSetupChecklist() {
+  const info = state.info;
+  if (!info) return;
+  const items = [
+    {
+      ok: info.api_key_set,
+      label: 'APIキー',
+      good: '設定済み（値は画面には出しません）',
+      bad: '未設定',
+      how: '<code>.env</code> に <code>OPENAI_API_KEY=...</code> を書いて、このページを再読み込みしてください。'
+         + '未設定でも dry-run と文字合成は使えます。',
+    },
+    {
+      ok: !info.font_error,
+      label: '日本語フォント',
+      good: info.font_path,
+      bad: info.font_error || '未検出',
+      how: '<code>config/sticker_config.yaml</code> の <code>font.path</code> に .ttf / .ttc の絶対パスを設定してください。',
+    },
+    {
+      ok: !info.csv_error,
+      label: 'セリフCSV',
+      good: `${info.stickers.length}件 読み込み済み`,
+      bad: info.csv_error || 'エラー',
+      how: '「セリフ編集」タブで内容を確認・修正できます。',
+    },
+    {
+      ok: true,
+      label: '生成の設定',
+      good: `${info.model} / 画質 ${info.quality}`,
+      bad: '',
+      how: '画質は <code>.env</code> の <code>IMAGE_QUALITY</code>（low / medium / high）で変えられます。'
+         + ' low が最も安価です。',
+    },
+  ];
+  $('#setup-list').innerHTML = items.map((i) => `
+    <div class="item ${i.ok ? 'ok' : 'ng'}">
+      <span class="mark">${i.ok ? '✓' : '!'}</span>
+      <span>
+        <b>${escapeHtml(i.label)}</b>: ${escapeHtml(i.ok ? i.good : i.bad)}
+        ${!i.ok || i.label === '生成の設定' ? `<span class="how">${i.how}</span>` : ''}
+      </span>
+    </div>`).join('');
+}
+
+async function loadMaster() {
+  renderSetupChecklist();
+  let m;
+  try { m = await api('/api/master'); } catch (e) { toast(e.message, true); return; }
+  state.master = m;
+
+  const img = $('#master-img');
+  const empty = $('#master-empty');
+  if (m.exists && !m.error) {
+    img.onload = () => { img.hidden = false; empty.hidden = true; };
+    img.onerror = () => { img.hidden = true; empty.hidden = false; };
+    img.src = `/img/master.png?t=${m.mtime}`;
+    $('#master-meta').textContent = `${m.width}×${m.height} ${m.mode} / ${m.size_kb}KB\n${m.path}`;
+  } else {
+    img.hidden = true; empty.hidden = false;
+    $('#master-meta').textContent = m.error || m.path;
+  }
+
+  if ($('#master-prompt') !== document.activeElement) $('#master-prompt').value = m.prompt;
+
+  // 履歴
+  const field = $('#master-history-field');
+  field.hidden = m.backups.length === 0;
+  $('#master-history').innerHTML = m.backups
+    .slice().reverse()
+    .map((b) => `<option value="${escapeHtml(b)}">${escapeHtml(b)}</option>`).join('');
+
+  // 既存画像との食い違い警告
+  const warn = $('#master-warn');
+  if (m.raw_count > 0) {
+    warn.hidden = false;
+    warn.innerHTML = `
+      <b>既に ${m.raw_count}枚のスタンプ画像があります。</b><br>
+      キャラクターを変えても、作成済みの画像は自動では作り直されません（勝手に消さない方針です）。
+      絵柄を揃えるには、作り直すか、いまの画像をいったん退避してください。
+      <button class="btn" id="btn-archive"
+              data-tip="output/archive/日時/ へ移動します。削除はしません">
+        いまの画像を退避する（${m.raw_count + m.final_count}ファイル）
+      </button>`;
+  } else {
+    warn.hidden = true;
+  }
+
+  const cost = await costFor(1);
+  $('#master-cost').textContent = `概算コスト: ${cost}`;
+}
+
+$('#master-file').addEventListener('change', (e) => {
+  $('#btn-master-upload').disabled = !e.target.files.length;
+});
+
+$('#btn-master-upload').addEventListener('click', async () => {
+  const file = $('#master-file').files[0];
+  if (!file) return;
+  const form = new FormData();
+  form.append('file', file);
+  try {
+    const res = await fetch('/api/master/upload', { method: 'POST', body: form });
+    const d = await res.json();
+    if (!res.ok) throw new Error(d.error || 'アップロードに失敗しました');
+    toast(d.backup
+      ? `マスター画像を差し替えました（前の画像は ${d.backup} として保存）`
+      : 'マスター画像を設定しました');
+    $('#master-file').value = '';
+    $('#btn-master-upload').disabled = true;
+    await afterMasterChanged();
+  } catch (e) { toast(e.message, true); }
+});
+
+$('#btn-master-generate').addEventListener('click', async () => {
+  const cost = await costFor(1);
+  if (!confirm(`AIにキャラクターマスター画像を1枚作らせます。\n概算コスト: ${cost}\n\n`
+    + 'いまの画像は履歴として残るので、気に入らなければ戻せます。\n実行しますか？')) return;
+  try {
+    resetJobUi('キャラクターマスター画像を作成しています');
+    await api('/api/master/generate', { method: 'POST', body: {} });
+    startPolling();
+  } catch (e) { toast(e.message, true); closeJobBar(); }
+});
+
+$('#btn-master-restore').addEventListener('click', async () => {
+  const name = $('#master-history').value;
+  if (!name) return;
+  if (!confirm(`${name} をマスター画像に戻します。\nいまの画像も履歴として残ります。`)) return;
+  try {
+    await api('/api/master/restore', { method: 'POST', body: { name } });
+    toast('マスター画像を戻しました');
+    await afterMasterChanged();
+  } catch (e) { toast(e.message, true); }
+});
+
+$('#btn-prompt-save').addEventListener('click', async () => {
+  try {
+    await api('/api/master/prompt', { method: 'POST', body: { prompt: $('#master-prompt').value } });
+    toast('プロンプトを保存しました');
+  } catch (e) { toast(e.message, true); }
+});
+
+$('#card-character').addEventListener('click', async (e) => {
+  if (e.target.id !== 'btn-archive') return;
+  const m = state.master;
+  if (!confirm(`作成済みの ${m.raw_count + m.final_count}ファイルを output/archive/ へ移動します。\n`
+    + '削除はしないので、あとから戻せます。実行しますか？')) return;
+  try {
+    const d = await api('/api/generated/archive', { method: 'POST', body: {} });
+    toast(`退避しました: ${d.archived_to}`);
+    await refreshStickers();
+    await loadMaster();
+  } catch (e) { toast(e.message, true); }
+});
+
+/** マスター画像が変わったあとの再読み込み。 */
+async function afterMasterChanged() {
+  const info = await api('/api/state');
+  state.info = info;
+  state.stickers = info.stickers;
+  renderChips(info);
+  renderGuide();
+  await loadMaster();
+  refreshPreview();
 }
 
 /* ------------------------------------------------------------------ */
@@ -499,7 +739,8 @@ async function pollJob() {
     }[job.status] || job.status;
     toast(job.status === 'finished' ? '処理が完了しました' : `処理が${$('#job-title').textContent}`,
           job.status === 'failed');
-    await refreshStickers();
+    if (job.kind === 'master') await afterMasterChanged();
+    else await refreshStickers();
   }
 }
 

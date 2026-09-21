@@ -27,24 +27,94 @@
   <ol class="steps" id="steps"></ol>
   <div class="next" id="next-action">
     <div class="next-text">
-      <span class="next-label">次にやること</span>
+      <span class="next-label" id="next-label">次にやること</span>
       <strong id="next-title"></strong>
       <span id="next-desc"></span>
     </div>
+    <button class="btn ghost" id="btn-step-prev" data-tip="ひとつ前のステップに戻ります">← 前のステップ</button>
+    <button class="btn ghost" id="btn-step-next" data-tip="次のステップへ進みます">次のステップ →</button>
+    <button class="btn ghost" id="btn-step-auto" hidden
+            data-tip="いまの状態から自動で判定したステップに戻します">自動判定に戻す</button>
     <button class="btn primary" id="btn-next"></button>
   </div>
 </section>
 
 <nav class="tabs" id="tabs">
-  <button class="tab active" data-tab="grid">スタンプ一覧</button>
+  <button class="tab active" data-tab="start">はじめに</button>
+  <button class="tab" data-tab="grid">スタンプ一覧</button>
   <button class="tab" data-tab="csv">セリフ編集</button>
   <button class="tab" data-tab="design">文字デザイン</button>
   <button class="tab" data-tab="output">検証・出力</button>
 </nav>
 
 <main>
+  <!-- ============ はじめに（ステップ1・2） ============ -->
+  <section class="panel active" id="panel-start">
+    <div class="cards">
+      <div class="card" id="card-setup">
+        <h3>1. 準備を整える</h3>
+        <p class="hint">APIキー・日本語フォント・セリフCSVが揃っているかを確認します。</p>
+        <div id="setup-list" class="checklist"></div>
+      </div>
+
+      <div class="card wide" id="card-character">
+        <h3>2. キャラクターを決める</h3>
+        <p class="hint">
+          ここで決めた1枚が、全スタンプの絵柄の基準になります。
+          この画像を差し替えるだけで、別キャラクターのスタンプセットを作れます。
+        </p>
+
+        <div class="master">
+          <div class="master-view">
+            <div class="master-box">
+              <img id="master-img" alt="キャラクターマスター画像" hidden>
+              <div class="asset-empty" id="master-empty">まだありません</div>
+            </div>
+            <div class="master-meta" id="master-meta"></div>
+          </div>
+
+          <div class="master-actions">
+            <div class="field">
+              <label>自分で用意した画像を使う</label>
+              <input type="file" id="master-file" accept="image/*"
+                     data-tip="透過PNGが理想です。背景が不透明な画像は自動で透過を試みます">
+              <button class="btn" id="btn-master-upload" disabled
+                      data-tip="いまのマスター画像は履歴として残るので、いつでも戻せます">この画像をマスターにする</button>
+            </div>
+
+            <div class="field">
+              <label>AIに作ってもらう</label>
+              <button class="btn primary" id="btn-master-generate"
+                      data-tip="下のプロンプトを使って画像を1枚だけ生成します">
+                AIでマスター画像を作る（API 1回）
+              </button>
+              <span class="hint" id="master-cost"></span>
+            </div>
+
+            <div class="field" id="master-history-field" hidden>
+              <label>履歴から戻す</label>
+              <select id="master-history"></select>
+              <button class="btn" id="btn-master-restore">この画像に戻す</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="warn-box" id="master-warn" hidden></div>
+
+        <details class="promptbox">
+          <summary>キャラクターの指定（マスタープロンプト）を編集する</summary>
+          <p class="hint">
+            AIでマスター画像を作るときに使われる指示です。髪型・服装・頭身などを変えたいときはここを書き換えてください。
+          </p>
+          <textarea id="master-prompt" spellcheck="false"></textarea>
+          <button class="btn" id="btn-prompt-save">プロンプトを保存</button>
+        </details>
+      </div>
+    </div>
+  </section>
+
   <!-- ============ スタンプ一覧 ============ -->
-  <section class="panel active" id="panel-grid">
+  <section class="panel" id="panel-grid">
     <div class="toolbar">
       <div class="group">
         <button class="btn" data-select="all" data-tip="CSVの全スタンプを選びます">全選択</button>
