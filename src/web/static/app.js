@@ -139,9 +139,8 @@ function computeSteps(info) {
     },
     {
       n: 4, key: 'design', title: '文字の見た目を整える',
-      desc: raw
-        ? '大きさ・色・縁取りをその場で確認できます（APIを使わないので無料）'
-        : '1枚作るとプレビューできるようになります',
+      desc: '大きさ・色・縁取りをその場で確認できます（APIを使わないので無料）'
+        + (raw ? '' : '。生成前でもマスター画像で試せます'),
       done: final >= 1, blocked: false, optional: true,
       action: { label: '文字デザインを開く', run: () => switchTab('design') },
     },
@@ -605,11 +604,14 @@ function fillDesignControls(font) {
 }
 
 function fillDesignTargets() {
+  // 生成済みを先頭に並べますが、未生成もマスター画像で代用してプレビューできます。
   const withRaw = state.stickers.filter((s) => s.has_raw);
-  const list = withRaw.length ? withRaw : state.stickers;
-  $('#design-target').innerHTML = list
-    .map((s) => `<option value="${s.id}">${s.id} ${escapeHtml(s.text)}</option>`)
+  const without = state.stickers.filter((s) => !s.has_raw);
+  const keep = $('#design-target').value;
+  $('#design-target').innerHTML = [...withRaw, ...without]
+    .map((s) => `<option value="${s.id}">${s.id} ${escapeHtml(s.text)}${s.has_raw ? '' : '（未生成）'}</option>`)
     .join('');
+  if (keep && state.stickers.some((s) => s.id === keep)) $('#design-target').value = keep;
 }
 
 function currentStyleOverrides() {
@@ -648,9 +650,13 @@ async function refreshPreview() {
     if (!res.ok) {
       const d = await res.json().catch(() => ({}));
       $('#design-error').textContent = d.error || 'プレビューを作成できませんでした';
+      $('#design-source').textContent = '';
       return;
     }
     $('#design-error').textContent = '';
+    $('#design-source').textContent = res.headers.get('X-Preview-Source') === 'master'
+      ? 'このスタンプはまだ生成していないため、キャラクターはマスター画像で代用しています。文字の大きさ・配置はそのまま本番に使われます。'
+      : '';
     const url = URL.createObjectURL(await res.blob());
     ['#design-preview', '#design-preview-1x', '#design-preview-sm'].forEach((sel) => {
       const img = $(sel);
@@ -732,18 +738,28 @@ $('#btn-package').addEventListener('click', async () => {
       p.warnings.forEach((w) => lines.push(`<div class="line WARNING">${escapeHtml(w)}</div>`));
     });
     box.innerHTML = lines.join('');
-    loadAssets();
     if (state.info) {
+      state.info.has_main = true;
+      state.info.has_tab = true;
       state.info.packages = d.packages.filter((p) => p.downloadable).map((p) => p.name);
       renderGuide();
     }
+    loadAssets();
   } catch (e) { box.innerHTML = `<div class="line ERROR">${escapeHtml(e.message)}</div>`; }
 });
 
+/** main/tab はまだ作っていないことが多いので、404を壊れた画像として見せません。 */
 function loadAssets() {
   const t = Date.now();
-  $('#asset-main').src = `/img/main.png?t=${t}`;
-  $('#asset-tab').src = `/img/tab.png?t=${t}`;
+  [['main', '#asset-main'], ['tab', '#asset-tab']].forEach(([name, sel]) => {
+    const img = $(sel);
+    const empty = $(`${sel}-empty`);
+    const has = state.info && state.info[`has_${name}`];
+    if (!has) { img.hidden = true; empty.hidden = false; return; }
+    img.onload = () => { img.hidden = false; empty.hidden = true; };
+    img.onerror = () => { img.hidden = true; empty.hidden = false; };
+    img.src = `/img/${name}.png?t=${t}`;
+  });
 }
 
 $('#btn-gallery').addEventListener('click', async () => {

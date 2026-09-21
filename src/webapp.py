@@ -328,11 +328,26 @@ def create_app(config=None) -> Flask:
         saved = {k: cfg_.get(f"font.{k}") for k in patched}
         for k, v in patched.items():
             cfg_.raw.setdefault("font", {})[k] = v
+        # まだ生成していないスタンプでも、マスター画像を代役にしてプレビューできます。
+        # これにより、1円も使う前に文字デザインを決められます。
+        raw = cfg_.dir_generated / f"{entry.id}.png"
+        if raw.exists():
+            source, source_kind = raw, "raw"
+        elif cfg_.master_image_path.exists():
+            source, source_kind = cfg_.master_image_path, "master"
+        else:
+            for k, v in saved.items():
+                cfg_.raw["font"][k] = v
+            return jsonify(
+                {
+                    "error": "プレビューに使える画像がありません。"
+                    "キャラクターマスター画像を用意すると、生成前でも文字の見た目を確認できます。"
+                }
+            ), 404
+
         try:
             style = style_or_error(overrides)
-            if not (cfg_.dir_generated / f"{entry.id}.png").exists():
-                return jsonify({"error": "この番号の原画がまだありません"}), 404
-            result = pipeline.compose_final_image(cfg_, entry, style)
+            result = pipeline.compose_final_image(cfg_, entry, style, source=source)
         except (FontNotFoundError, ip.ImageProcessingError) as exc:
             return jsonify({"error": str(exc)}), 400
         finally:
@@ -344,6 +359,7 @@ def create_app(config=None) -> Flask:
         buf.seek(0)
         response = send_file(buf, mimetype="image/png")
         response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Preview-Source"] = source_kind
         return response
 
     @app.post("/api/settings/font")
@@ -654,24 +670,68 @@ def create_app(config=None) -> Flask:
     return app
 
 
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def is_loopback(host: str) -> bool:
+    """このPCからしか接続できないアドレスかどうか。"""
+    return host in LOOPBACK_HOSTS
+
+
+def startup_banner(host: str, port: int) -> list[str]:
+    """起動時に表示する案内。
+
+    Flask 既定の「This is a development server...」は、公開Webサイトの運用に
+    使うなという一般的な注意書きで、ローカル専用のこのツールには当てはまりません。
+    代わりに、実際に注意が必要な場合（外部から接続できるアドレスを指定したとき）
+    だけ具体的な警告を出します。
+    """
+    line = "=" * 66
+    banner = [
+        line,
+        "  LINEスタンプ生成 GUI",
+        f"  http://{host}:{port}/",
+        "",
+    ]
+    if is_loopback(host):
+        banner.append("  このPCからのみ接続できます（外部には公開されていません）。")
+    else:
+        banner += [
+            "  ⚠ 警告: このアドレスは同じネットワーク上の他の端末からも接続できます。",
+            "     GUIからは画像生成API（課金）を実行できるため、",
+            "     共有ネットワークでの使用は推奨しません。",
+            "     通常は --host を付けず 127.0.0.1 のまま使ってください。",
+        ]
+    banner += ["  終了するには Ctrl+C を押してください。", line]
+    return banner
+
+
 def run_server(config, host: str = "127.0.0.1", port: int = 8765, open_browser: bool = True) -> None:
-    """GUI サーバーを起動します（ローカル専用）。"""
+    """GUI サーバーを起動します（既定ではこのPC専用）。"""
     # Flask は app.run() の際に CWD から .env を探して読み込みます。
     # どの .env を使うかは load_config() 側で決めたいので、その挙動は止めます。
     os.environ.setdefault("FLASK_SKIP_DOTENV", "1")
 
+    from werkzeug.serving import make_server
+
     app = create_app(config)
     url = f"http://{host}:{port}/"
 
-    print("=" * 66)
-    print("  LINEスタンプ生成 GUI")
-    print(f"  {url}")
-    print("  終了するには Ctrl+C を押してください。")
-    print("=" * 66)
+    # app.run() ではなく make_server を使います。動作は同じですが、
+    # 本番運用向けの定型警告バナーが出ないぶん、案内が読みやすくなります。
+    server = make_server(host, port, app, threaded=True)
+
+    for row in startup_banner(host, port):
+        print(row, flush=True)
 
     if open_browser:
         import webbrowser
 
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
 
-    app.run(host=host, port=port, debug=False, threaded=True, use_reloader=False)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n終了しました。生成済みの画像はすべて残っています。")
+    finally:
+        server.server_close()

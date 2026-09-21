@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>LINEスタンプ生成</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2306c755'/%3E%3Ctext x='16' y='23' font-size='19' font-family='sans-serif' font-weight='bold' fill='white' text-anchor='middle'%3ES%3C/text%3E%3C/svg%3E">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -173,6 +174,7 @@
         </p>
       </div>
       <div class="preview">
+        <div class="source-note" id="design-source"></div>
         <div class="preview-box">
           <img id="design-preview" alt="プレビュー">
         </div>
@@ -208,8 +210,16 @@
         <button class="btn primary" id="btn-package"
                 data-tip="LINE Creators Market にそのままアップロードできるZIPを作ります">main・tab・ZIPを作成</button>
         <div class="assets">
-          <figure><img id="asset-main" alt="main"><figcaption>main 240×240</figcaption></figure>
-          <figure><img id="asset-tab" alt="tab"><figcaption>tab 96×74</figcaption></figure>
+          <figure>
+            <img id="asset-main" alt="main" hidden>
+            <div class="asset-empty" id="asset-main-empty">未作成</div>
+            <figcaption>main 240×240</figcaption>
+          </figure>
+          <figure>
+            <img id="asset-tab" alt="tab" hidden>
+            <div class="asset-empty" id="asset-tab-empty">未作成</div>
+            <figcaption>tab 96×74</figcaption>
+          </figure>
         </div>
         <div id="package-result" class="result"></div>
       </div>

@@ -31,13 +31,18 @@ def render_final(
     return _render(config, entry, style, output_path=output_path)
 
 
-def compose_final_image(config, entry: StickerEntry, style: TextStyle):
-    """保存せずに合成結果の Image を返します（ライブプレビュー用）。"""
+def compose_final_image(config, entry: StickerEntry, style: TextStyle, source: Path | None = None):
+    """保存せずに合成結果の Image を返します（ライブプレビュー用）。
+
+    Args:
+        source: キャラクター画像のパス。省略すると output/generated/<id>.png。
+            まだ生成していないスタンプをプレビューしたい場合に、
+            キャラクターマスター画像を渡すことができます。
+    """
     canvas_w, canvas_h = config.sticker_size
     margin = config.margin
-    character = ip.make_background_transparent(
-        ip.load_rgba(config.dir_generated / f"{entry.id}.png")
-    )
+    src = source or (config.dir_generated / f"{entry.id}.png")
+    character = ip.make_background_transparent(ip.load_rgba(src))
     text_img = render_text_image(
         entry.text,
         style,

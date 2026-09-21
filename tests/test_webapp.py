@@ -128,9 +128,37 @@ def test_save_csv_rejects_empty_text(client):
 
 
 # --- 文字デザイン ------------------------------------------------------
-def test_preview_text_requires_raw_image(client):
+def test_preview_without_raw_or_master_is_404(client):
+    """原画もマスター画像も無ければ、理由を添えて404を返します。"""
     res = client.post("/api/preview-text", json={"id": "001", "style": {}})
     assert res.status_code == 404
+    assert "マスター画像" in res.get_json()["error"]
+
+
+def test_preview_falls_back_to_master_image(client, tmp_config):
+    """原画が無くても、マスター画像を代役にして文字デザインを確認できます。"""
+    master = tmp_config.master_image_path
+    master.parent.mkdir(parents=True, exist_ok=True)
+    make_character((512, 512)).save(master)
+
+    res = client.post("/api/preview-text", json={"id": "001", "style": {"size": 50}})
+    assert res.status_code == 200
+    assert res.headers["X-Preview-Source"] == "master"
+    with Image.open(io.BytesIO(res.data)) as im:
+        assert im.size == tuple(tmp_config.sticker_size)
+    # 代用プレビューで完成画像を作ってしまわないこと
+    assert not (tmp_config.dir_final / "001.png").exists()
+
+
+def test_preview_prefers_raw_over_master(client, tmp_config):
+    master = tmp_config.master_image_path
+    master.parent.mkdir(parents=True, exist_ok=True)
+    make_character((512, 512)).save(master)
+    _add_raw(tmp_config, "001")
+
+    res = client.post("/api/preview-text", json={"id": "001", "style": {}})
+    assert res.status_code == 200
+    assert res.headers["X-Preview-Source"] == "raw"
 
 
 def test_preview_text_returns_png(client, tmp_config):
@@ -153,7 +181,16 @@ def test_preview_does_not_write_final(client, tmp_config):
 
 def test_preview_unknown_id(client, tmp_config):
     _add_raw(tmp_config, "001")
-    assert client.post("/api/preview-text", json={"id": "999"}).status_code == 404
+    res = client.post("/api/preview-text", json={"id": "999"})
+    assert res.status_code == 404
+    assert "IDが見つかりません" in res.get_json()["error"]
+
+
+def test_favicon_is_inlined(client):
+    """/favicon.ico への無駄なリクエストが出ないよう data URI を埋め込みます。"""
+    html = client.get("/").get_data(as_text=True)
+    assert 'rel="icon"' in html
+    assert "data:image/svg+xml" in html
 
 
 def test_save_font_settings_writes_overrides(client, tmp_config):
@@ -260,3 +297,32 @@ def test_gallery_endpoint(client, tmp_config):
 
 def test_log_endpoint(client):
     assert "lines" in client.get("/api/log").get_json()
+
+
+# --- 起動時の案内 -------------------------------------------------------
+def test_banner_is_quiet_on_loopback():
+    from src.webapp import startup_banner
+
+    text = "\n".join(startup_banner("127.0.0.1", 8765))
+    assert "http://127.0.0.1:8765/" in text
+    assert "このPCからのみ接続できます" in text
+    assert "警告" not in text
+    # Flask 既定の紛らわしい定型警告は出しません
+    assert "development server" not in text
+
+
+def test_banner_warns_when_exposed():
+    from src.webapp import startup_banner
+
+    text = "\n".join(startup_banner("0.0.0.0", 8765))
+    assert "警告" in text
+    assert "課金" in text
+
+
+def test_is_loopback():
+    from src.webapp import is_loopback
+
+    assert is_loopback("127.0.0.1")
+    assert is_loopback("localhost")
+    assert not is_loopback("0.0.0.0")
+    assert not is_loopback("192.168.1.5")
