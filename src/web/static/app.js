@@ -286,7 +286,7 @@ function renderGuide() {
         data-tip="${escapeHtml(s.help || s.desc)}${s.done ? '（完了済み。クリックでやり直せます）' : ''}">
       <span class="num"><span>${s.n}</span></span>
       <span>
-        <span class="st">${escapeHtml(s.title)}${s.optional ? '<span class="sd">（任意）</span>' : ''}</span>
+        <span class="st">${escapeHtml(s.title)}${s.optional ? '<span class="opt-tag">（任意）</span>' : ''}</span>
         <span class="sd">${escapeHtml(s.desc)}</span>
       </span>
     </li>`;
