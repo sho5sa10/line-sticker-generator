@@ -21,9 +21,14 @@ from pathlib import Path
 from flask import Flask, jsonify, request, send_file, send_from_directory
 from PIL import Image
 
+from . import character_profile as cprof
+from . import fonts as fontlib
+from . import style_suggest
 from . import gallery as gallery_mod
 from . import image_processor as ip
 from . import importer
+from . import sales as sales_mod
+from . import listing as listing_mod
 from . import package_builder as pkg
 from . import pipeline
 from . import validator as vd
@@ -159,6 +164,13 @@ def create_app(config=None) -> Flask:
     def server_outdated() -> bool:
         return code_fingerprint() > started_code + 0.001
 
+    @app.after_request
+    def no_stale_assets(response):
+        """画面（HTML/CSS/JS）は毎回サーバーに確認させ、古いものが使われないようにします。"""
+        if request.path == "/" or request.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-cache"
+        return response
+
     # ------------------------------------------------------------------
     # ヘルパ
     # ------------------------------------------------------------------
@@ -191,7 +203,9 @@ def create_app(config=None) -> Flask:
                 setattr(style, key, type(getattr(style, key))(value))
         return style
 
-    def sticker_status(cfg_, entry: StickerEntry) -> dict:
+    def sticker_status(cfg_, entry: StickerEntry, sales: dict | None = None) -> dict:
+        if sales is None:
+            sales = sales_mod.load_sales(cfg_)
         raw = cfg_.dir_generated / f"{entry.id}.png"
         final = cfg_.dir_final / f"{entry.id}.png"
         return {
@@ -205,7 +219,27 @@ def create_app(config=None) -> Flask:
             "final_mtime": int(final.stat().st_mtime) if final.exists() else 0,
             "raw_mtime": int(raw.stat().st_mtime) if raw.exists() else 0,
             "size_kb": round(final.stat().st_size / 1024, 1) if final.exists() else 0,
+            "sale": sales.get(entry.id, ""),
         }
+
+    def packages_status(cfg_) -> dict:
+        """ZIPがいまの完成画像から作られたものか。
+
+        ZIPより新しい完成画像がある、または完成画像が1枚も無いときは「古い」とみなします
+        （キャラクターを作り直したあとに、前のキャラのZIPを完了扱いしないため）。
+        """
+        zips = list(cfg_.dir_packages.glob("*.zip"))
+        finals = list(cfg_.dir_final.glob("*.png"))
+        if not zips:
+            return {"count": 0, "latest": 0, "stale": False}
+        latest_zip = max(z.stat().st_mtime for z in zips)
+        latest_final = max((f.stat().st_mtime for f in finals), default=0)
+        stale = not finals or latest_final > latest_zip
+        return {"count": len(zips), "latest": int(latest_zip), "stale": stale}
+
+    def statuses(cfg_, entries) -> list[dict]:
+        sales = sales_mod.load_sales(cfg_)
+        return [sticker_status(cfg_, e, sales) for e in entries]
 
     # ------------------------------------------------------------------
     # 画面
@@ -254,6 +288,8 @@ def create_app(config=None) -> Flask:
                 "has_main": (cfg_.dir_main / "main.png").exists(),
                 "has_tab": (cfg_.dir_tab / "tab.png").exists(),
                 "packages": packages,
+                "packages_status": packages_status(cfg_),
+                "validation": vd.load_result(cfg_),
                 "line_spec": {
                     "sticker": list(cfg_.sticker_size),
                     "main": list(cfg_.main_size),
@@ -273,8 +309,9 @@ def create_app(config=None) -> Flask:
                     "max_lines": cfg_.get("font.max_lines"),
                     "band_ratio": cfg_.get("font.band_ratio"),
                     "gap": cfg_.get("font.gap"),
+                    "font_id": fontlib.current_font_id(cfg_),
                 },
-                "stickers": [sticker_status(cfg_, e) for e in entries],
+                "stickers": statuses(cfg_, entries),
                 "job": jobs.current.to_dict() if jobs.current else None,
             }
         )
@@ -385,9 +422,62 @@ def create_app(config=None) -> Flask:
         path = cfg_.master_prompt_ja_path
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text + "\n", encoding="utf-8")
+        if isinstance(body.get("profile"), dict):
+            cprof.save_profile(cfg_.character_profile_path, body["profile"])
         body = {"saved_to": str(path)}
         body.update(_prompt_info(cfg_))
         return jsonify(body)
+
+    @app.get("/api/master/profile")
+    def api_master_profile():
+        """かんたん入力の選択肢・ひな形と、保存済みの選択内容を返します。"""
+        cfg_ = current_config()
+        ja_path = cfg_.master_prompt_ja_path
+        text = ja_path.read_text(encoding="utf-8").strip() if ja_path.exists() else ""
+        profile = cprof.load_profile(cfg_.character_profile_path)
+        if profile is None and text:
+            # 保存された選択内容が無くても、説明文がひな形と同じなら選択状態を復元します。
+            profile = cprof.infer_profile(text)
+        return jsonify({
+            "groups": cprof.GROUPS,
+            "presets": cprof.PRESETS,
+            "preset_info": cprof.PRESET_INFO,
+            "preset_categories": cprof.PRESET_CATEGORIES,
+            # JSONの辞書はキーが並べ替えられるので、表示順は別に渡します。
+            "preset_order": list(cprof.PRESETS),
+            "profile": profile,
+            # 説明文が選択内容から作った文章と違う＝手で書き換えてある
+            "text_matches_profile": bool(profile) and cprof.compose(profile) == text,
+        })
+
+    @app.get("/api/master/random")
+    def api_master_random():
+        """おまかせで組み合わせたキャラクターを返します（シャッフル用。保存はしません）。"""
+        import random
+
+        try:
+            n = min(max(int(request.args.get("n", 4)), 1), 12)
+        except ValueError:
+            n = 4
+        rng = random.Random()
+        out, seen = [], set()
+        for _ in range(n * 5):
+            p = cprof.random_profile(rng)
+            name = cprof.profile_name(p)
+            if name in seen or name in cprof.PRESETS:
+                continue
+            seen.add(name)
+            out.append({"name": name, "profile": p, "text": cprof.compose(p)})
+            if len(out) >= n:
+                break
+        return jsonify({"characters": out})
+
+    @app.post("/api/master/compose")
+    def api_master_compose():
+        """選択内容から説明文を組み立てます（保存はしません）。"""
+        body = request.get_json(silent=True) or {}
+        profile = cprof.normalize(body.get("profile"))
+        return jsonify({"text": cprof.compose(profile), "profile": profile})
 
     def _backup_master(path: Path) -> str | None:
         """既存のマスター画像を退避します（削除はしません）。"""
@@ -544,6 +634,18 @@ def create_app(config=None) -> Flask:
                 expression=entry.expression, category=entry.category,
             )
 
+        # フォントはIDで受け取り、一覧に載っているものだけを使います（任意のファイルは読みません）。
+        font_id = overrides.pop("font_id", None)
+        font_override = {}
+        if font_id:
+            info = fontlib.find_font(cfg_, str(font_id))
+            if info is None:
+                return jsonify({"error": f"フォントが見つかりません: {font_id}"}), 400
+            font_override = {"font_path": info.path, "font_index": info.index, "variation": info.variation}
+        for key in ("font_path", "font_index", "variation"):
+            overrides.pop(key, None)  # 画面から直接パスを指定させない
+        overrides.update(font_override)
+
         # band_ratio / gap / position は設定側なので一時的に差し替えます。
         patched = {k: overrides.pop(k) for k in ("band_ratio", "gap", "position") if k in overrides}
         saved = {k: cfg_.get(f"font.{k}") for k in patched}
@@ -590,9 +692,15 @@ def create_app(config=None) -> Flask:
         allowed = {
             "size": int, "min_size": int, "stroke_width": int, "max_lines": int,
             "gap": int, "fill": str, "stroke_fill": str, "position": str,
-            "band_ratio": float, "path": str,
+            "band_ratio": float,
         }
         updates = {}
+        if body.get("font_id"):
+            info = fontlib.find_font(current_config(), str(body["font_id"]))
+            if info is None:
+                return jsonify({"error": f"フォントが見つかりません: {body['font_id']}"}), 400
+            updates.update({"font.path": info.path, "font.index": info.index,
+                            "font.variation": info.variation})
         for key, caster in allowed.items():
             if key in body and body[key] is not None:
                 try:
@@ -606,9 +714,84 @@ def create_app(config=None) -> Flask:
         cfg_ = reload_config()
         return jsonify({"saved_to": str(path), "font": cfg_.get("font")})
 
+    @app.get("/api/fonts")
+    def api_fonts():
+        """選べるフォントの一覧と、いま使っているフォント、追加できる無料フォント。"""
+        cfg_ = current_config()
+        installed = {f.id for f in fontlib.available_fonts(cfg_)}
+        return jsonify({
+            "fonts": [f.to_dict() for f in fontlib.available_fonts(cfg_)],
+            "current": fontlib.current_font_id(cfg_),
+            "custom_dir": str(fontlib.custom_font_dir(cfg_)),
+            "free_categories": fontlib.FREE_FONT_CATEGORIES,
+            "free_fonts": [
+                {"id": f.id, "label": f.label, "category": f.category, "size_mb": f.size_mb,
+                 "note": f.note, "installed": f.id in installed}
+                for f in fontlib.FREE_FONTS
+            ],
+        })
+
+    @app.get("/api/fonts/check")
+    def api_fonts_check():
+        """選んだフォントに、セリフで使っている文字がそろっているか調べます。"""
+        cfg_ = current_config()
+        info = fontlib.find_font(cfg_, str(request.args.get("font_id", "")))
+        if info is None:
+            return jsonify({"error": "フォントが見つかりません"}), 404
+        try:
+            texts = [e.text for e in entries_or_error()]
+        except CsvLoadError as exc:
+            return jsonify({"error": str(exc)}), 400
+        missing = fontlib.missing_chars(info.path, texts, info.index)
+        affected = [e.id for e in entries_or_error() if any(ch in e.text for ch in missing)]
+        return jsonify({"font_id": info.id, "missing": missing, "affected_ids": affected})
+
+    @app.post("/api/fonts/install")
+    def api_fonts_install():
+        """一覧にある無料フォントをダウンロードして追加します（ボタンを押したときだけ）。"""
+        cfg_ = current_config()
+        font_id = str((request.get_json(silent=True) or {}).get("id", ""))
+        if jobs.is_running():
+            return jsonify({"error": "ほかの処理が実行中です。終わってから追加してください"}), 409
+        try:
+            path = fontlib.install_free_font(cfg_, font_id)
+        except fontlib.FontInstallError as exc:
+            return jsonify({"error": str(exc)}), 400
+        info = fontlib.find_font(cfg_, font_id)
+        return jsonify({"installed": font_id, "path": str(path),
+                        "font": info.to_dict() if info else None})
+
+    @app.get("/api/design/suggest")
+    def api_design_suggest():
+        """キャラクターに合う文字スタイルの候補（設定は変えません）。"""
+        return jsonify(style_suggest.suggest_styles(current_config()))
+
     # ------------------------------------------------------------------
     # CSV編集
     # ------------------------------------------------------------------
+    @app.patch("/api/stickers/<sticker_id>")
+    def api_sticker_patch(sticker_id: str):
+        """1件のセリフだけを書き換えます（改行も保存できます）。"""
+        body = request.get_json(silent=True) or {}
+        text = str(body.get("text", "")).replace("\r\n", "\n").strip()
+        if not text:
+            return jsonify({"error": "セリフが空です"}), 400
+        cfg_ = current_config()
+        try:
+            entries = entries_or_error()
+        except CsvLoadError as exc:
+            return jsonify({"error": str(exc)}), 400
+        target = next((e for e in entries if e.id == sticker_id), None)
+        if target is None:
+            return jsonify({"error": f"IDが見つかりません: {sticker_id}"}), 404
+        updated = [
+            StickerEntry(id=e.id, text=text, action=e.action, expression=e.expression,
+                         category=e.category) if e.id == sticker_id else e
+            for e in entries
+        ]
+        save_stickers(cfg_.csv_path, updated)
+        entry = next(e for e in updated if e.id == sticker_id)
+        return jsonify({"sticker": sticker_status(cfg_, entry)})
     @app.get("/api/stickers")
     def api_stickers_get():
         try:
@@ -616,7 +799,8 @@ def create_app(config=None) -> Flask:
         except CsvLoadError as exc:
             return jsonify({"error": str(exc)}), 400
         cfg_ = current_config()
-        return jsonify({"stickers": [sticker_status(cfg_, e) for e in entries]})
+        return jsonify({"stickers": statuses(cfg_, entries), "validation": vd.load_result(cfg_),
+                        "packages_status": packages_status(cfg_)})
 
     @app.post("/api/stickers")
     def api_stickers_post():
@@ -646,7 +830,7 @@ def create_app(config=None) -> Flask:
             {
                 "saved_to": str(path),
                 "count": len(entries),
-                "stickers": [sticker_status(cfg_, e) for e in entries],
+                "stickers": statuses(cfg_, entries),
             }
         )
 
@@ -847,7 +1031,7 @@ def create_app(config=None) -> Flask:
             "imported": sum(1 for r in results if r["ok"]),
             "results": results,
             "skipped": skipped,
-            "stickers": [sticker_status(cfg_, e) for e in entries_or_error()],
+            "stickers": statuses(cfg_, entries_or_error()),
         })
 
     @app.get("/api/job")
@@ -889,23 +1073,116 @@ def create_app(config=None) -> Flask:
             }
             for r in reports
         ]
+        errors = sum(len(r.errors) for r in reports)
+        warnings = sum(len(r.warnings) for r in reports)
+        # 再起動しても「検証済み」が分かるように結果を残します（画像が変われば自動で無効）
+        validation = vd.record_result(cfg_, len(reports), errors, warnings)
         return jsonify(
             {
                 "checked": len(reports),
-                "errors": sum(len(r.errors) for r in reports),
-                "warnings": sum(len(r.warnings) for r in reports),
+                "errors": errors,
+                "warnings": warnings,
                 "items": items,
+                "validation": validation,
             }
         )
+
+    def _package_options(body: dict) -> dict:
+        """画面から来た「セットの作り方」を build_packages の引数に変換します。"""
+        set_size = body.get("set_size")
+        ids = body.get("ids")
+        return {
+            "set_size": int(set_size) if str(set_size or "").strip().isdigit() else None,
+            "ids": [str(i) for i in ids] if isinstance(ids, list) else None,
+        }
+
+    # ---------- 販売状況 ----------
+    @app.post("/api/sales")
+    def api_sales():
+        """選んだスタンプに「申請中」「販売中」などの印を付けます。"""
+        cfg_ = current_config()
+        body = request.get_json(silent=True) or {}
+        ids = [str(i) for i in body.get("ids") or []]
+        if not ids:
+            return jsonify({"error": "スタンプが選ばれていません"}), 400
+        try:
+            sales = sales_mod.set_status(cfg_, ids, str(body.get("status", "")))
+        except sales_mod.SalesError as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"sales": sales, "labels": sales_mod.STATUS_LABELS})
+
+    # ---------- 申請用のタイトル・説明文 ----------
+    def _listing_payload(data: dict) -> dict:
+        return {
+            "listing": data,
+            "issues": listing_mod.check_listing(data),
+            "limits": listing_mod.LIMITS,
+            "labels": listing_mod.FIELD_LABELS,
+        }
+
+    @app.get("/api/listing")
+    def api_listing_get():
+        return jsonify(_listing_payload(listing_mod.load_listing(current_config())))
+
+    @app.put("/api/listing")
+    def api_listing_put():
+        body = request.get_json(silent=True) or {}
+        data = listing_mod.save_listing(current_config(), body.get("listing") or {})
+        return jsonify(_listing_payload(data))
+
+    @app.post("/api/listing/check")
+    def api_listing_check():
+        body = request.get_json(silent=True) or {}
+        return jsonify({"issues": listing_mod.check_listing(body.get("listing") or {})})
+
+    @app.post("/api/listing/suggest")
+    def api_listing_suggest():
+        """キャラの特徴とセリフから、タイトル・説明文の案を作ります（APIは使いません）。"""
+        cfg_ = current_config()
+        body = request.get_json(silent=True) or {}
+        try:
+            entries = entries_or_error()
+        except CsvLoadError as exc:
+            return jsonify({"error": str(exc)}), 400
+        ids = {str(i) for i in body.get("ids") or []}
+        if ids:
+            entries = [e for e in entries if e.id in ids] or entries
+        profile = cprof.load_profile(cfg_.character_profile_path) or {}
+        creator = str(body.get("creator") or listing_mod.load_listing(cfg_).get("creator", ""))
+        try:
+            volume = max(1, int(body.get("volume") or 1))
+        except (TypeError, ValueError):
+            volume = 1
+        candidates = listing_mod.suggest(profile, entries, creator=creator, volume=volume)
+        return jsonify({
+            "candidates": [{**c, "issues": listing_mod.check_listing(c)} for c in candidates],
+            "count": len(entries),
+            "has_profile": bool(profile),
+        })
+
+    @app.post("/api/package/plan")
+    def api_package_plan():
+        """ZIPを作る前に、何セットに分かれるか・何枚余るかを返します（ファイルは書きません）。"""
+        try:
+            opts = _package_options(request.get_json(silent=True) or {})
+            plan = pkg.plan_packages(current_config(), entries_or_error(), **opts)
+        except (pkg.PackageError, CsvLoadError) as exc:
+            return jsonify({"error": str(exc), "sets": [], "leftover": [], "missing": [], "total": 0})
+        return jsonify(plan.to_dict())
 
     @app.post("/api/package")
     def api_package():
         cfg_ = current_config()
         try:
+            opts = _package_options(request.get_json(silent=True) or {})
             entries = entries_or_error()
+            # 作れない指定なら、main/tab も作らずに理由だけ返します。
+            plan = pkg.plan_packages(cfg_, entries, **opts)
+            if plan.error:
+                raise pkg.PackageError(plan.error)
             main_path, main_size = pkg.build_main_image(cfg_)
             tab_path, tab_size = pkg.build_tab_image(cfg_)
-            results = pkg.build_packages(cfg_, entries)
+            results = pkg.build_packages(cfg_, entries, **opts)
         except (pkg.PackageError, CsvLoadError) as exc:
             return jsonify({"error": str(exc)}), 400
 
@@ -925,6 +1202,7 @@ def create_app(config=None) -> Flask:
                     }
                     for r in results
                 ],
+                "packages_status": packages_status(cfg_),
             }
         )
 

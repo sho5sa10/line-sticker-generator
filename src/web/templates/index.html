@@ -112,16 +112,50 @@
         <div class="warn-box" id="master-warn" hidden></div>
 
         <details class="promptbox" open>
-          <summary>キャラクターの特徴（日本語で書けます）</summary>
+          <summary>キャラクターの特徴</summary>
           <p class="hint">
-            AIで画像を作るときに使われる、キャラクターの説明です。髪型・服装・頭身・雰囲気などを、
-            <b>1行に1つずつ日本語で</b>書いてください。マスター画像にも、100枚のスタンプすべてにも使われます。
+            AIで画像を作るときに使われる、キャラクターの説明です。マスター画像にも、100枚のスタンプすべてにも使われます。
+            <b>下のボタンを選ぶだけで説明文ができあがります。</b>
           </p>
+
+          <div class="easy">
+            <div class="easy-row">
+              <span class="easy-label">ひな形から始める<small>LINE人気ランキングの傾向を参考にしています</small></span>
+              <div class="preset-area">
+                <div class="preset-tools">
+                  <button type="button" class="btn small" id="btn-preset-shuffle"
+                          data-tip="ひな形と、選択肢をおまかせで組み合わせたキャラクターを入れ替えて表示します">シャッフル</button>
+                  <button type="button" class="btn small ghost" id="btn-preset-all"
+                          data-tip="用意してあるひな形をすべて、種類ごとに表示します">すべて表示</button>
+                </div>
+                <div id="preset-row"></div>
+              </div>
+            </div>
+            <div id="profile-groups"></div>
+            <div class="easy-row">
+              <span class="easy-label">そのほかの特徴</span>
+              <input type="text" id="profile-extra" maxlength="500"
+                     placeholder="選択肢に無いものを自由に（例: 左目の下にほくろ。）"
+                     data-tip="ここに書いた内容は説明文の最後に追加されます">
+            </div>
+          </div>
+
+          <div class="result-head">
+            <b>できあがった説明文</b>
+            <span class="hint">直接書き換えてもかまいません</span>
+            <button class="btn small ghost" id="btn-recompose" hidden
+                    data-tip="手で書き換えた内容を捨てて、上の選択内容から説明文を作り直します">選択内容で作り直す</button>
+          </div>
+          <div class="manual-note" id="manual-note" hidden>
+            説明文を手で書き換えたので、上の選択を変えても説明文は自動で変わりません。
+            選択内容に合わせたいときは「選択内容で作り直す」を押してください。
+          </div>
           <textarea id="master-prompt" spellcheck="false"
                     placeholder="例）&#10;20代くらいの女性。&#10;茶色のボブヘア。&#10;黄色いパーカー。&#10;2頭身のちびキャラ。"></textarea>
           <div class="prompt-actions">
             <button class="btn primary" id="btn-prompt-save"
                     data-tip="保存すると、これから作る画像から使われます。作成済みの画像は変わりません">この内容で保存</button>
+            <span class="unsaved" id="prompt-unsaved" hidden>未保存の変更があります（保存するまで画像づくりには使われません）</span>
             <span class="hint" id="prompt-mode"></span>
           </div>
 
@@ -141,6 +175,8 @@
 
   <!-- ============ スタンプ一覧 ============ -->
   <section class="panel" id="panel-grid">
+    <button type="button" id="selection-float" hidden
+            data-tip="クリックすると、選択ボタンのある一番上に戻ります">0枚選択中</button>
     <div class="toolbar">
       <div class="group">
         <button class="btn" data-select="all" data-tip="CSVの全スタンプを選びます">全選択</button>
@@ -165,6 +201,26 @@
                 data-tip="APIを呼ばずに、既にある画像の文字だけを貼り直します。無料です">文字だけ再合成（無料）</button>
         <button class="btn primary" id="btn-generate"
                 data-tip="選択したスタンプの画像をAPIで生成します。実行前に料金の確認が出ます">選択した画像を生成</button>
+      </div>
+      <div class="group sales-row">
+        <label class="inline" data-tip="販売状況で絞り込みます">表示
+          <select id="grid-filter">
+            <option value="all">すべて</option>
+            <option value="unsold">未販売だけ</option>
+            <option value="review">申請中だけ</option>
+            <option value="selling">販売中だけ</option>
+          </select></label>
+        <label class="check" data-tip="CSVの category 列ごとに見出しを付けて並べます">
+          <input type="checkbox" id="grid-by-genre" checked> ジャンル別に表示</label>
+        <span class="sep"></span>
+        <span class="hint">選んだスタンプを</span>
+        <button class="btn small" data-sale="review"
+                data-tip="LINE Creators Market で審査に出したスタンプに付けます">申請中にする</button>
+        <button class="btn small" data-sale="selling"
+                data-tip="販売が始まったスタンプに付けます。一覧で「販売中」の印が付きます">販売中にする</button>
+        <button class="btn small ghost" data-sale=""
+                data-tip="印を外して未販売に戻します">未販売に戻す</button>
+        <span class="sale-summary" id="sale-summary"></span>
       </div>
       <div class="group import-row">
         <button class="btn" id="btn-bulk-import"
@@ -225,13 +281,49 @@
   <section class="panel" id="panel-design">
     <div class="design">
       <div class="controls">
+        <div class="suggest">
+          <div class="suggest-head">
+            <b>おまかせ</b>
+            <span class="hint">キャラの絵の色と雰囲気から、合う文字を提案します</span>
+          </div>
+          <button class="btn primary" id="btn-suggest"
+                  data-tip="キャラクター画像の色（線・体・差し色）と、かんたん入力で選んだ雰囲気から候補を出します。選ぶまで設定は変わりません">
+            キャラに合わせて提案する</button>
+          <div class="suggest-list" id="suggest-list"></div>
+        </div>
+
         <div class="field">
           <label>プレビュー対象</label>
           <select id="design-target"></select>
         </div>
         <div class="field">
-          <label>プレビュー用セリフ（保存されません）</label>
-          <input type="text" id="design-text" placeholder="CSVのセリフを使用">
+          <label>セリフ（<b>改行したい所で Enter</b>）</label>
+          <textarea id="design-text" rows="2"
+                    placeholder="CSVのセリフを使用"
+                    data-tip="例: 「ありがとう」で Enter を押して「ございます」と書くと2段になります"></textarea>
+          <div class="text-actions">
+            <button class="btn small" id="btn-text-save" disabled
+                    data-tip="このスタンプのセリフを、改行も含めて保存します（セリフ編集タブと同じ内容が変わります）">このセリフを保存</button>
+            <span class="hint" id="text-save-note"></span>
+          </div>
+        </div>
+        <div class="field">
+          <label>フォント</label>
+          <select id="f-font"
+                  data-tip="このPCで使える日本語フォントです。fonts フォルダに .ttf/.otf を置くと、ここに追加されます"></select>
+          <span class="hint" id="font-note"></span>
+          <div class="font-missing" id="font-missing" hidden></div>
+          <button class="btn small ghost" id="btn-font-store"
+                  data-tip="手書き風・丸ゴシック・ポップ体などの無料フォントを追加できます">
+            ＋ フォントを増やす（無料）</button>
+          <div class="font-store" id="font-store" hidden>
+            <p class="hint">
+              Google Fonts の無料フォントです（SIL Open Font License）。
+              <b>スタンプとして販売する画像に使えます。</b>
+              「追加」を押したときだけダウンロードします（1つ 0.3〜8.5MB）。
+            </p>
+            <div id="font-store-list"></div>
+          </div>
         </div>
         <div class="field" data-tip="長いセリフは自動で小さくなります。これはその上限です">
           <label>文字サイズ上限 <b id="v-size"></b> px</label>
@@ -320,7 +412,40 @@
 
       <div class="card">
         <h3>main画像 / tab画像 / ZIP</h3>
-        <p class="hint">提出用ZIPを作成します。LINEの1セットは8/16/24/32/40枚単位です。</p>
+        <p class="hint">
+          LINE Creators Market に提出するZIPを作ります。
+          LINEの1セットは <b>8・16・24・32・40枚</b> のどれかなので、作り方を選んでください。
+        </p>
+
+        <div class="setmode">
+          <label class="radio">
+            <input type="radio" name="setmode" value="auto" checked>
+            <span><b>番号順に分ける</b></span>
+          </label>
+          <div class="setmode-sub" id="setsize-row">
+            1セットの枚数
+            <select id="set-size"
+                    data-tip="「おまかせ」は、できるだけ多くのスタンプを使えるように40・32・24・16・8枚を組み合わせます">
+              <option value="">おまかせ（できるだけ多く使う）</option>
+              <option value="40">40枚</option>
+              <option value="32">32枚</option>
+              <option value="24">24枚</option>
+              <option value="16">16枚</option>
+              <option value="8">8枚</option>
+            </select>
+          </div>
+          <label class="radio">
+            <input type="radio" name="setmode" value="selected">
+            <span><b>選んだスタンプだけで1セット</b></span>
+          </label>
+          <div class="setmode-sub">
+            「スタンプ一覧」でチェックを付けたものだけでZIPを作ります。気に入ったものだけで申請したいときに。
+            <button class="btn small ghost" id="btn-go-select">スタンプ一覧で選ぶ</button>
+          </div>
+        </div>
+
+        <div class="plan" id="package-plan"></div>
+
         <button class="btn primary" id="btn-package"
                 data-tip="LINE Creators Market にそのままアップロードできるZIPを作ります">main・tab・ZIPを作成</button>
         <div class="assets">
@@ -336,6 +461,100 @@
           </figure>
         </div>
         <div id="package-result" class="result"></div>
+      </div>
+
+      <div class="card wide" id="card-listing">
+        <h3>タイトル・説明文（申請用）</h3>
+        <p class="hint">LINE Creators Market で入力するタイトルや説明文を、キャラクターの特徴とセリフから自動で作ります（無料・APIは使いません）。
+          英語は必須、日本語は「言語を追加」で登録します。文字数やLINEのルールもその場でチェックします。</p>
+        <div class="lst-actions">
+          <label>どのセリフから作る？
+            <select id="lst-target" data-tip="複数のセットを申請するときは、セットごとに作ってタイトルを変えてください"></select></label>
+          <button type="button" class="btn primary" id="btn-listing-suggest">自動で作る</button>
+          <button type="button" class="btn" id="btn-listing-save" data-tip="data/listing.json に保存します">保存</button>
+        </div>
+        <p class="hint" id="lst-profile-hint" hidden>キャラクターの特徴が未入力のため、呼び名が「キャラクター」になっています。
+          「はじめに」タブの「かんたん入力」で選ぶと、キャラに合った文章になります。</p>
+        <div class="lst-candidates-row" id="lst-candidates-row" hidden>
+          <span class="hint">案を選ぶ：</span><span id="lst-candidates"></span>
+        </div>
+        <div class="lst-form" id="listing-form">
+          <div class="lst-row">
+            <div class="lst-head">
+              <label for="lst-creator" data-tip="あなたの名前やペンネーム（日本語でもOK）。案の作成時にコピーライトにも使います">クリエイター名</label>
+              <span class="lst-count" data-count="creator"></span>
+              <button type="button" class="btn small ghost" data-copy="creator" data-tip="この欄をコピーします。LINE Creators Market の入力欄に貼り付けてください">コピー</button>
+            </div>
+            <input id="lst-creator" type="text">
+            <div class="lst-issues" data-issues="creator" hidden></div>
+          </div>
+          <div class="lst-row">
+            <div class="lst-head">
+              <label for="lst-copyright" data-tip="半角英数字だけ。例: (C)2026 yourname">コピーライト</label>
+              <span class="lst-count" data-count="copyright"></span>
+              <button type="button" class="btn small ghost" data-copy="copyright" data-tip="この欄をコピーします。LINE Creators Market の入力欄に貼り付けてください">コピー</button>
+            </div>
+            <input id="lst-copyright" type="text">
+            <div class="lst-issues" data-issues="copyright" hidden></div>
+          </div>
+          <div class="lst-row">
+            <div class="lst-head">
+              <label for="lst-title_en" data-tip="英語は必須です。半角のみ">タイトル（英語・必須）</label>
+              <span class="lst-count" data-count="title_en"></span>
+              <button type="button" class="btn small ghost" data-copy="title_en" data-tip="この欄をコピーします。LINE Creators Market の入力欄に貼り付けてください">コピー</button>
+            </div>
+            <input id="lst-title_en" type="text">
+            <div class="lst-issues" data-issues="title_en" hidden></div>
+          </div>
+          <div class="lst-row">
+            <div class="lst-head">
+              <label for="lst-title_ja" data-tip="「言語を追加」で日本語を選ぶと入力できます。全角は2文字として数えます（全角20文字まで）">タイトル（日本語）</label>
+              <span class="lst-count" data-count="title_ja"></span>
+              <button type="button" class="btn small ghost" data-copy="title_ja" data-tip="この欄をコピーします。LINE Creators Market の入力欄に貼り付けてください">コピー</button>
+            </div>
+            <input id="lst-title_ja" type="text">
+            <div class="lst-issues" data-issues="title_ja" hidden></div>
+          </div>
+          <div class="lst-row">
+            <div class="lst-head">
+              <label for="lst-desc_en" data-tip="英語は必須です。半角のみ">説明文（英語・必須）</label>
+              <span class="lst-count" data-count="desc_en"></span>
+              <button type="button" class="btn small ghost" data-copy="desc_en" data-tip="この欄をコピーします。LINE Creators Market の入力欄に貼り付けてください">コピー</button>
+            </div>
+            <textarea id="lst-desc_en" rows="3"></textarea>
+            <div class="lst-issues" data-issues="desc_en" hidden></div>
+          </div>
+          <div class="lst-row">
+            <div class="lst-head">
+              <label for="lst-desc_ja" data-tip="全角は2文字として数えます（全角80文字まで）">説明文（日本語）</label>
+              <span class="lst-count" data-count="desc_ja"></span>
+              <button type="button" class="btn small ghost" data-copy="desc_ja" data-tip="この欄をコピーします。LINE Creators Market の入力欄に貼り付けてください">コピー</button>
+            </div>
+            <textarea id="lst-desc_ja" rows="3"></textarea>
+            <div class="lst-issues" data-issues="desc_ja" hidden></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" id="card-submit">
+        <h3>LINEに登録・申請</h3>
+        <p class="hint">ZIPができたら、LINE Creators Market（公式サイト）で販売の手続きをします。</p>
+        <ol class="submit-steps">
+          <li>LINEアカウントでログインし、クリエイター登録をする（初回のみ）</li>
+          <li>マイページでスタンプを新規登録し、タイトル・説明文などを入力する
+            <span class="hint">（上の「タイトル・説明文（申請用）」で作った文をコピーして貼り付けられます）</span></li>
+          <li>画像の登録で、上で作ったZIPをまとめてアップロードする
+            <span class="hint">（ZIPは「ダウンロード」ボタン、または output/packages フォルダにあります）</span></li>
+          <li>審査をリクエストする。承認されたら「リリース」で販売開始</li>
+        </ol>
+        <div class="submit-links">
+          <a class="btn primary" href="https://creator.line.me/ja/" target="_blank" rel="noopener"
+             data-submit-link data-tip="LINE Creators Market のトップページを別タブで開きます">LINE Creators Market を開く</a>
+          <a class="btn" href="https://creator.line.me/ja/howto/" target="_blank" rel="noopener"
+             data-submit-link data-tip="公式の「販売までの流れ」を別タブで開きます">販売までの流れ（公式）</a>
+          <a class="btn" href="https://creator.line.me/ja/review_guideline/" target="_blank" rel="noopener"
+             data-submit-link data-tip="審査で落ちないためのルールです。申請前に一度目を通しておくと安心です">審査ガイドライン（公式）</a>
+        </div>
       </div>
 
       <div class="card">

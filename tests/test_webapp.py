@@ -283,11 +283,25 @@ def test_package_endpoint_and_download(client, tmp_config):
     client.post("/api/render", json={})
     _wait_for_job(client)
 
-    data = client.post("/api/package", json={}).get_json()
+    # 3枚では1セット（最低8枚）にならないので、理由を返して何も作らない
+    res = client.post("/api/package", json={})
+    assert res.status_code == 400
+    assert "最低8枚" in res.get_json()["error"]
+    assert "None" not in res.get_json()["error"]
+
+    # 8枚そろえば main/tab/ZIP ができ、ダウンロードできる
+    tmp_config.csv_path.write_text(
+        "id,text,action,expression,category\n"
+        + "".join(f"{i:03d},セリフ{i},ポーズ,表情,basic\n" for i in range(1, 9)),
+        encoding="utf-8",
+    )
+    _finals(tmp_config, 8)
+    data = client.post("/api/package", json={"set_size": 8}).get_json()
     assert data["main"]["ok"] is True
     assert data["tab"]["ok"] is True
-    # 3枚は 8 の倍数でないため未パッケージ警告が出る
-    assert any(p["warnings"] for p in data["packages"])
+    names = [p["name"] for p in data["packages"] if p["downloadable"]]
+    assert names == ["line_stickers_001_008.zip"]
+    assert client.get(f"/api/download/{names[0]}").status_code == 200
 
 
 def test_gallery_endpoint(client, tmp_config):
@@ -437,6 +451,59 @@ def test_server_outdated_after_code_change(tmp_config, monkeypatch):
     assert client.get("/api/server").get_json() == {"outdated": True}
 
 
+# --- かんたん入力 ------------------------------------------------------
+def test_profile_options_returned(client):
+    d = client.get("/api/master/profile").get_json()
+    assert {g["key"] for g in d["groups"]} >= {"kind", "gender", "hair", "outfit", "mood"}
+    assert "会社員（男性）" in d["presets"]
+    assert d["profile"] is None  # 何も保存されていない
+
+
+def test_profile_inferred_from_bundled_text(client, tmp_config):
+    """選択内容の保存が無くても、説明文がひな形と同じなら選択状態を復元します。"""
+    from src.prompt_generator import DEFAULT_CHARACTER_JA
+
+    tmp_config.master_prompt_ja_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_config.master_prompt_ja_path.write_text(DEFAULT_CHARACTER_JA + "\n", encoding="utf-8")
+    d = client.get("/api/master/profile").get_json()
+    assert d["profile"]["job"] == "会社員"
+    assert d["text_matches_profile"] is True
+
+
+def test_compose_endpoint(client):
+    d = client.post("/api/master/compose", json={
+        "profile": {"kind": "動物", "animal": "うさぎ", "hair": "ボブ", "palette": "パステル"},
+    }).get_json()
+    assert d["text"].splitlines()[0] == "うさぎのキャラクター。"
+    assert "ボブ" not in d["text"]          # 動物には髪型を使わない
+    assert "hair" not in d["profile"]
+
+
+def test_save_prompt_with_profile(client, tmp_config):
+    from src import character_profile as cp
+
+    profile = cp.PRESETS["学生"]
+    text = cp.compose(profile)
+    res = client.post("/api/master/prompt", json={"prompt_ja": text, "profile": profile})
+    assert res.status_code == 200
+    assert cp.load_profile(tmp_config.character_profile_path) == profile
+
+    d = client.get("/api/master/profile").get_json()
+    assert d["profile"] == profile
+    assert d["text_matches_profile"] is True
+
+
+def test_manual_edit_is_detected(client, tmp_config):
+    from src import character_profile as cp
+
+    profile = cp.PRESETS["学生"]
+    client.post("/api/master/prompt",
+                json={"prompt_ja": cp.compose(profile) + "\n手で足した一文。", "profile": profile})
+    d = client.get("/api/master/profile").get_json()
+    assert d["profile"] == profile
+    assert d["text_matches_profile"] is False  # 画面は「手で書き換えた」扱いにする
+
+
 def test_master_prompt_rejects_empty(client):
     assert client.post("/api/master/prompt", json={"prompt_ja": "  "}).status_code == 400
 
@@ -564,3 +631,232 @@ def test_is_loopback():
     assert is_loopback("localhost")
     assert not is_loopback("0.0.0.0")
     assert not is_loopback("192.168.1.5")
+
+
+def test_profile_returns_preset_categories(client):
+    d = client.get("/api/master/profile").get_json()
+    assert d["preset_categories"] == ["人", "動物", "そのほか"]
+    assert d["preset_info"]["ハシビロコウ"]["category"] == "動物"
+    assert "ランキング" in d["preset_info"]["ふわふわ子ねこ"]["note"]
+    # 表示順は定義順（JSONのキー並べ替えの影響を受けない）
+    assert d["preset_order"][0] == "会社員（男性）"
+
+
+# --- 画面の表示・キャッシュ ---------------------------------------------
+def test_css_hidden_attribute_always_wins():
+    """hidden を付けた要素は、個別の display 指定より優先して必ず隠す。
+
+    以前は .assets img { display: block } が hidden を打ち消し、
+    まだ無い main/tab 画像が壊れた画像として表示されていました。
+    """
+    from src.webapp import WEB_DIR
+
+    css = (WEB_DIR / "static" / "style.css").read_text(encoding="utf-8")
+    assert "[hidden] { display: none !important; }" in css
+
+
+def test_assets_are_revalidated(client):
+    """画面のファイルは毎回サーバーに確認させ、古いCSS/JSが使われないようにする。"""
+    for path in ("/", "/static/style.css", "/static/app.js"):
+        res = client.get(path)
+        assert res.status_code == 200, path
+        assert res.headers.get("Cache-Control") == "no-cache", path
+
+
+# --- セットの作り方 ------------------------------------------------------
+def _finals(tmp_config, n):
+    for i in range(1, n + 1):
+        _add_raw(tmp_config, f"{i:03d}")
+        ip.save_png(make_character((370, 320)), tmp_config.dir_final / f"{i:03d}.png")
+
+
+def test_package_plan_endpoint(client, tmp_config):
+    _finals(tmp_config, 3)
+    d = client.post("/api/package/plan", json={"set_size": None}).get_json()
+    assert d["sets"] == []            # 3枚では8枚セットも作れない
+    assert d["leftover"] == ["001", "002", "003"]
+
+    d = client.post("/api/package/plan", json={"ids": ["001", "002"]}).get_json()
+    assert "あと6枚選ぶと8枚セット" in d["error"]
+    # 見込みを出すだけで、ファイルは作らない
+    assert not list(tmp_config.dir_packages.glob("*.zip"))
+    assert not (tmp_config.dir_main / "main.png").exists()
+
+
+def test_package_invalid_selection_is_rejected_without_side_effects(client, tmp_config):
+    _finals(tmp_config, 3)
+    res = client.post("/api/package", json={"ids": ["001", "002", "003"]})
+    assert res.status_code == 400
+    assert "あと5枚選ぶと8枚セット" in res.get_json()["error"]
+    assert not (tmp_config.dir_main / "main.png").exists()
+
+
+# --- フォント・おまかせ・セリフの改行 ------------------------------------
+def test_fonts_endpoint(client):
+    d = client.get("/api/fonts").get_json()
+    assert any(f["id"] == "biz-ud-gothic" for f in d["fonts"])
+
+
+def test_preview_with_font_id(client, tmp_config):
+    _add_raw(tmp_config, "001")
+    ok = client.post("/api/preview-text", json={"id": "001", "style": {"font_id": "biz-ud-gothic"}})
+    assert ok.status_code == 200
+    bad = client.post("/api/preview-text", json={"id": "001", "style": {"font_id": "nope"}})
+    assert bad.status_code == 400
+
+
+def test_preview_ignores_raw_font_path(client, tmp_config):
+    """画面から任意のファイルパスを渡されても使わない。"""
+    _add_raw(tmp_config, "001")
+    res = client.post("/api/preview-text",
+                      json={"id": "001", "style": {"font_path": "C:/Windows/win.ini"}})
+    assert res.status_code == 200
+
+
+def test_save_font_by_id(client, tmp_config):
+    res = client.post("/api/settings/font", json={"font_id": "biz-ud-gothic", "size": 50})
+    assert res.status_code == 200
+    font = res.get_json()["font"]
+    assert font["path"].endswith("BIZ-UDGothicB.ttc")
+    assert client.get("/api/state").get_json()["font"]["font_id"] == "biz-ud-gothic"
+
+
+def test_design_suggest_endpoint(client, tmp_config):
+    tmp_config.master_image_path.parent.mkdir(parents=True, exist_ok=True)
+    make_character((300, 300), color=(255, 215, 67, 255)).save(tmp_config.master_image_path)
+    d = client.get("/api/design/suggest").get_json()
+    assert d["suggestions"]
+    assert all(s["fill"].startswith("#") for s in d["suggestions"])
+
+
+def test_patch_sticker_text_keeps_line_break(client, tmp_config):
+    res = client.patch("/api/stickers/002", json={"text": "ありがとう\r\nございます"})
+    assert res.status_code == 200
+    entries = {e.id: e for e in load_stickers(tmp_config.csv_path)}
+    assert entries["002"].text == "ありがとう\nございます"
+    assert entries["001"].text == "了解！"  # ほかの行は変わらない
+    assert client.patch("/api/stickers/999", json={"text": "x"}).status_code == 404
+    assert client.patch("/api/stickers/001", json={"text": "  "}).status_code == 400
+
+
+def test_font_store_and_install(client, tmp_config, font_path, monkeypatch):
+    d = client.get("/api/fonts").get_json()
+    item = next(f for f in d["free_fonts"] if f["id"] == "hachi-maru-pop")
+    assert item["installed"] is False and item["category"] == "手書き"
+
+    import httpx
+
+    data = open(font_path, "rb").read()
+
+    class Res:
+        def __init__(self, content):
+            self.content = content
+
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(httpx, "get", lambda url, **kw: Res(b"OFL" if url.endswith("OFL.txt") else data))
+    res = client.post("/api/fonts/install", json={"id": "hachi-maru-pop"})
+    assert res.status_code == 200
+    d = client.get("/api/fonts").get_json()
+    assert any(f["id"] == "hachi-maru-pop" for f in d["fonts"])
+    assert next(f for f in d["free_fonts"] if f["id"] == "hachi-maru-pop")["installed"] is True
+
+    assert client.post("/api/fonts/install", json={"id": "nope"}).status_code == 400
+
+
+def test_font_check_endpoint(client):
+    d = client.get("/api/fonts/check?font_id=biz-ud-gothic").get_json()
+    assert d["missing"] == [] and d["affected_ids"] == []
+    assert client.get("/api/fonts/check?font_id=nope").status_code == 404
+
+
+# --- 申請用のタイトル・説明文 ---------------------------------------------
+def test_listing_suggest_save_and_check(client):
+    r = client.post("/api/listing/suggest", json={"creator": "yourname"})
+    assert r.status_code == 200
+    d = r.get_json()
+    assert d["count"] == 3 and d["candidates"]
+    first = d["candidates"][0]
+    assert first["title_en"] and first["copyright"].endswith("yourname")
+
+    r = client.post("/api/listing/suggest", json={"ids": ["002"]})
+    assert r.get_json()["count"] == 1
+
+    r = client.put("/api/listing", json={"listing": {**first, "title_en": "x" * 50}})
+    d = r.get_json()
+    assert any("長すぎ" in i for i in d["issues"]["title_en"])
+    assert client.get("/api/listing").get_json()["listing"]["creator"] == "yourname"
+
+    r = client.post("/api/listing/check", json={"listing": {"title_ja": "LINEのねこ"}})
+    assert r.get_json()["issues"]["title_ja"]
+
+
+# --- 販売状況 ------------------------------------------------------------
+def test_sales_status_roundtrip(client):
+    stickers = client.get("/api/state").get_json()["stickers"]
+    assert all(s["sale"] == "" for s in stickers)
+    assert {s["category"] for s in stickers} == {"basic", "thanks", "misc"}
+
+    r = client.post("/api/sales", json={"ids": ["001", "003"], "status": "selling"})
+    assert r.status_code == 200 and r.get_json()["sales"] == {"001": "selling", "003": "selling"}
+    sale = {s["id"]: s["sale"] for s in client.get("/api/state").get_json()["stickers"]}
+    assert sale == {"001": "selling", "002": "", "003": "selling"}
+
+    assert client.post("/api/sales", json={"ids": ["001"], "status": ""}).get_json()["sales"] == {"003": "selling"}
+    assert client.post("/api/sales", json={"ids": [], "status": "selling"}).status_code == 400
+    assert client.post("/api/sales", json={"ids": ["001"], "status": "bogus"}).status_code == 400
+
+
+# --- 検証結果は再起動しても残る ---------------------------------------------
+def test_validation_result_survives_restart(app, tmp_config):
+    import os
+
+    from src.webapp import create_app
+
+    client = app.test_client()
+    assert client.get("/api/state").get_json()["validation"]["passed"] is False
+
+    ip.save_png(make_character((370, 320)), tmp_config.dir_final / "001.png")
+    d = client.post("/api/validate").get_json()
+    v = d["validation"]
+    assert v["checked"] == 1 and v["at"]
+    assert v["passed"] is (d["errors"] == 0)
+
+    # サーバーを作り直しても（=GUIの再起動）結果が残る
+    again = create_app(tmp_config).test_client().get("/api/state").get_json()["validation"]
+    assert again["at"] == v["at"] and again["passed"] == v["passed"] and not again["stale"]
+
+    # 検証後に画像が変わったら「検証済み」は外れる
+    final = tmp_config.dir_final / "001.png"
+    st = final.stat()
+    os.utime(final, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
+    after = client.get("/api/stickers").get_json()["validation"]
+    assert after["stale"] is True and after["passed"] is False
+
+
+# --- 作り直し後の古いZIPは「完了」にしない ---------------------------------
+def test_packages_become_stale_when_images_change(client, tmp_config):
+    import os
+
+    st = lambda: client.get("/api/state").get_json()["packages_status"]  # noqa: E731
+    assert st() == {"count": 0, "latest": 0, "stale": False}
+
+    ip.save_png(make_character((370, 320)), tmp_config.dir_final / "001.png")
+    zp = tmp_config.dir_packages / "line_stickers_001_008.zip"
+    zp.parent.mkdir(parents=True, exist_ok=True)
+    zp.write_bytes(b"PK")
+    final = tmp_config.dir_final / "001.png"
+    t = final.stat().st_mtime
+    os.utime(zp, (t + 10, t + 10))
+    assert st()["stale"] is False and st()["count"] == 1
+
+    # 完成画像がZIPより新しくなった（作り直した）
+    os.utime(final, (t + 20, t + 20))
+    assert st()["stale"] is True
+    assert client.get("/api/stickers").get_json()["packages_status"]["stale"] is True
+
+    # 完成画像を退避して1枚も無い
+    os.utime(final, (t, t))
+    final.unlink()
+    assert st()["stale"] is True

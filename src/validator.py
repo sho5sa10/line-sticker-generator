@@ -243,3 +243,59 @@ def validate_all(config, entries=None) -> list[ValidationReport]:
         reports.append(validate_tab(tab_png, config))
 
     return reports
+
+
+# ---------------------------------------------------------------------------
+# 検証結果の記録（GUI の「進め方」で、再起動しても検証済みかどうかが分かるように）
+# ---------------------------------------------------------------------------
+def result_path(config) -> Path:
+    return config.root / "output" / "validation.json"
+
+
+def final_fingerprint(config) -> str:
+    """完成画像の一覧・サイズ・更新日時から作る目印。画像が1枚でも変われば別の値になります。"""
+    import hashlib
+
+    h = hashlib.sha256()
+    for p in sorted(Path(config.dir_final).glob("*.png")):
+        st = p.stat()
+        h.update(f"{p.name}:{st.st_size}:{st.st_mtime_ns}\n".encode())
+    return h.hexdigest()
+
+
+def record_result(config, checked: int, errors: int, warnings: int) -> dict:
+    import json
+    from datetime import datetime
+
+    result = {
+        "checked": checked,
+        "errors": errors,
+        "warnings": warnings,
+        "at": datetime.now().isoformat(timespec="seconds"),
+        "fingerprint": final_fingerprint(config),
+    }
+    path = result_path(config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    return load_result(config)
+
+
+def load_result(config) -> dict:
+    """前回の検証結果。passed は「エラーなしで、その後画像が変わっていない」ときだけ True。"""
+    import json
+
+    path = result_path(config)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"passed": False, "stale": False, "at": ""}
+    stale = data.get("fingerprint") != final_fingerprint(config)
+    passed = data.get("checked", 0) > 0 and data.get("errors", 1) == 0 and not stale
+    return {
+        "passed": passed,
+        "stale": stale,
+        "at": data.get("at", ""),
+        "checked": data.get("checked", 0),
+        "errors": data.get("errors", 0),
+        "warnings": data.get("warnings", 0),
+    }

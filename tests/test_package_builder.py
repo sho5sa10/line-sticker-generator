@@ -154,6 +154,13 @@ def test_build_packages_splits_and_names_files(tmp_config):
         assert r.path.exists()
 
 
+def test_too_few_for_any_set_has_readable_message(tmp_config):
+    entries = _populate(tmp_config, 3)
+    plan = pkg.plan_packages(tmp_config, entries)
+    assert plan.error and "None" not in plan.error
+    assert "最低8枚" in plan.error
+
+
 def test_build_packages_reports_leftover(tmp_config):
     entries = _populate(tmp_config, 10)
     results = pkg.build_packages(tmp_config, entries)
@@ -173,3 +180,94 @@ def test_summarize_shortens_long_id_lists():
 def test_build_packages_without_final_raises(tmp_config):
     with pytest.raises(pkg.PackageError):
         pkg.build_packages(tmp_config, _entries(3))
+
+
+# --- セットの作り方を選ぶ -------------------------------------------------
+@pytest.mark.parametrize(
+    "count,set_size,expected_sets,expected_leftover",
+    [
+        (100, None, [40, 40, 16], 4),   # おまかせ
+        (100, 40, [40, 40], 20),
+        (100, 32, [32, 32, 32], 4),
+        (100, 8, [8] * 12, 4),
+        (30, 40, [], 30),                # 足りない
+    ],
+)
+def test_plan_sets(count, set_size, expected_sets, expected_leftover):
+    sets, leftover = pkg.plan_sets(count, [8, 16, 24, 32, 40], set_size)
+    assert sets == expected_sets
+    assert leftover == expected_leftover
+
+
+def test_plan_sets_rejects_invalid_size():
+    with pytest.raises(pkg.PackageError):
+        pkg.plan_sets(100, [8, 16, 24, 32, 40], 30)
+
+
+@pytest.mark.parametrize(
+    "count,expected",
+    [
+        (40, None),
+        (8, None),
+        (0, "選ばれていません"),
+        (37, "あと3枚選ぶと40枚セット、5枚外すと32枚セット"),
+        (5, "あと3枚選ぶと8枚セット"),
+        (45, "5枚外すと40枚セット"),
+    ],
+)
+def test_selection_hint(count, expected):
+    hint = pkg.selection_hint(count, [8, 16, 24, 32, 40])
+    if expected is None:
+        assert hint is None
+    else:
+        assert expected in hint
+
+
+def test_build_packages_with_fixed_size(tmp_config):
+    entries = _populate(tmp_config, 20)
+    results = pkg.build_packages(tmp_config, entries, set_size=8)
+    zipped = [r for r in results if r.size_bytes]
+    assert [r.sticker_count for r in zipped] == [8, 8]
+    assert [r.path.name for r in zipped] == ["line_stickers_001_008.zip", "line_stickers_009_016.zip"]
+    leftover = [r for r in results if not r.size_bytes]
+    assert "4枚" in leftover[0].warnings[0]
+
+
+def test_build_packages_from_selection(tmp_config):
+    entries = _populate(tmp_config, 12)
+    picked = ["002", "003", "005", "007", "008", "010", "011", "012"]
+    results = pkg.build_packages(tmp_config, entries, ids=picked)
+    assert len(results) == 1
+    r = results[0]
+    assert r.sticker_count == 8
+    assert r.path.name == "line_stickers_selected_8.zip"
+    with zipfile.ZipFile(r.path) as zf:
+        assert sorted(n for n in zf.namelist() if n[0].isdigit()) == [f"{i:02d}.png" for i in range(1, 9)]
+
+
+def test_build_packages_rejects_invalid_selection(tmp_config):
+    entries = _populate(tmp_config, 12)
+    with pytest.raises(pkg.PackageError, match="あと1枚選ぶと8枚セット"):
+        pkg.build_packages(tmp_config, entries, ids=["001", "002", "003", "004", "005", "006", "007"])
+
+
+def test_old_zips_are_archived_not_deleted(tmp_config):
+    entries = _populate(tmp_config, 16)
+    pkg.build_packages(tmp_config, entries, set_size=16)
+    first = tmp_config.dir_packages / "line_stickers_001_016.zip"
+    assert first.exists()
+
+    # 分け方を変えて作り直すと、前回のZIPは archive へ移る（消えない）
+    pkg.build_packages(tmp_config, entries, set_size=8)
+    current = sorted(p.name for p in tmp_config.dir_packages.glob("*.zip"))
+    assert current == ["line_stickers_001_008.zip", "line_stickers_009_016.zip"]
+    archived = list((tmp_config.root / "output" / "archive" / "packages").rglob("*.zip"))
+    assert [p.name for p in archived] == ["line_stickers_001_016.zip"]
+
+
+def test_plan_packages_does_not_write_files(tmp_config):
+    entries = _populate(tmp_config, 10)
+    plan = pkg.plan_packages(tmp_config, entries, set_size=8)
+    assert plan.to_dict()["sets"] == [{"count": 8, "first": "001", "last": "008"}]
+    assert plan.to_dict()["leftover"] == ["009", "010"]
+    assert not list(tmp_config.dir_packages.glob("*.zip"))

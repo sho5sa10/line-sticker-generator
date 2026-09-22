@@ -12,10 +12,15 @@ const state = {
   eventOffset: 0,
   poller: null,
   csvDirty: false,
-  validated: false,
   steps: [],
   pinnedStep: null,   // ユーザーが明示的に選んだステップ（自動判定より優先）
   master: null,
+  // かんたん入力
+  groups: [],
+  presets: {},
+  profile: {},
+  manualEdit: false,   // 説明文を手で書き換えたら true（選択を変えても上書きしない）
+  promptDirty: false,  // 保存していない変更がある
 };
 
 /* ------------------------------------------------------------------ */
@@ -68,6 +73,25 @@ async function checkServer() {
 checkServer();
 setInterval(checkServer, 15000);
 
+/**
+ * 時間のかかる処理のあいだ、ボタンを「処理中」の見た目にして押せなくします。
+ * 何も変化がないと、押しても反応していないように見えるためです。
+ */
+async function withBusy(btn, busyLabel, fn) {
+  if (btn.disabled) return undefined;
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.classList.add('busy');
+  btn.textContent = busyLabel;
+  try {
+    return await fn();
+  } finally {
+    btn.disabled = false;
+    btn.classList.remove('busy');
+    btn.textContent = label;
+  }
+}
+
 function openLightbox(src, caption) {
   $('#lb-img').src = src;
   $('#lb-cap').textContent = caption;
@@ -83,11 +107,21 @@ document.addEventListener('keydown', (e) => {
 /* ------------------------------------------------------------------ */
 (function trackTopbarHeight() {
   const bar = document.querySelector('.topbar');
-  const apply = () => document.documentElement.style.setProperty(
-    '--topbar-h', `${Math.round(bar.getBoundingClientRect().height)}px`);
+  const tabs = document.querySelector('.tabs');
+  const apply = () => {
+    const root = document.documentElement.style;
+    root.setProperty('--topbar-h', `${Math.round(bar.getBoundingClientRect().height)}px`);
+    // タブの高さも測り、付いてくるプレビューがタブの下に止まるようにします。
+    root.setProperty('--tabs-h', `${Math.round(tabs.getBoundingClientRect().height)}px`);
+  };
   apply();
-  if (window.ResizeObserver) new ResizeObserver(apply).observe(bar);
-  else window.addEventListener('resize', apply);
+  if (window.ResizeObserver) {
+    const ro = new ResizeObserver(apply);
+    ro.observe(bar);
+    ro.observe(tabs);
+  } else {
+    window.addEventListener('resize', apply);
+  }
 })();
 
 /* ------------------------------------------------------------------ */
@@ -145,7 +179,7 @@ function switchTab(name) {
 /** 各ステップが属するタブ。ステップをクリックするとここへ移動します。 */
 const STEP_TAB = {
   setup: 'start', character: 'start', try: 'grid', design: 'design',
-  rest: 'grid', validate: 'output', package: 'output',
+  rest: 'grid', validate: 'output', package: 'output', submit: 'output',
 };
 
 /** いまの状態から各ステップの達成状況を判定します。 */
@@ -156,6 +190,12 @@ function computeSteps(info) {
   // APIキーは必須ではありません（手持ち画像の取り込みだけでも最後まで進められます）。
   const ready = !info.font_error && !info.csv_error;
   const aiReady = info.api_key_set && info.master_ok;
+  // ZIPは「いまの完成画像から作ったもの」だけを完了とみなします（作り直し後の古いZIPは数えない）
+  const pkg = info.packages_status || { count: info.packages.length, latest: 0, stale: false };
+  const pkgStale = info.packages.length > 0 && pkg.stale;
+  const pkgReady = info.packages.length > 0 && !pkg.stale;
+  // LINEを開いたのが、いまのZIPを作ったあとなら完了
+  const submitted = pkgReady && Number(readLS('submit.opened', '0')) >= pkg.latest && pkg.latest > 0;
 
   return [
     {
@@ -214,21 +254,55 @@ function computeSteps(info) {
     },
     {
       n: 6, key: 'validate', title: 'LINE仕様を検証',
-      desc: state.validated
-        ? '検証に通りました'
-        : 'サイズ・透過・容量・余白をまとめてチェックします',
-      done: !!state.validated, blocked: false,
+      desc: validationDesc(info.validation),
+      done: !!(info.validation && info.validation.passed), blocked: false,
       action: { label: '検証する', run: () => { switchTab('output'); $('#btn-validate').click(); } },
     },
     {
       n: 7, key: 'package', title: '提出用ZIPを作る',
-      desc: info.packages.length
-        ? `${info.packages.length}個のZIPができています`
-        : 'main画像・tab画像も一緒に作ります',
-      done: info.packages.length > 0, blocked: false,
+      desc: !info.packages.length
+        ? 'main画像・tab画像も一緒に作ります'
+        : pkgStale
+          ? 'いまあるZIPは前の画像で作ったものです。作り直してください'
+          : `${info.packages.length}個のZIPができています`,
+      done: pkgReady, blocked: false,
       action: { label: 'ZIPを作る', run: () => { switchTab('output'); $('#btn-package').click(); } },
     },
+    {
+      n: 8, key: 'submit', title: 'LINEに登録・申請',
+      desc: submitted
+        ? 'LINE Creators Market を開きました。審査に出したら完了です'
+        : pkgReady
+          ? 'LINE Creators Market を開いて、ZIPをアップロードします'
+          : 'ZIPができたら、LINE Creators Market で登録・申請します',
+      done: submitted, blocked: false,
+      action: { label: 'LINE Creators Market を開く', run: () => openLineCreators() },
+      help: 'LINE Creators Market（公式サイト）を別タブで開きます。'
+          + '登録に使うタイトル・説明文は「検証・出力」タブで自動作成できます。'
+          + 'クリエイター登録 → タイトル等の入力と画像アップロード → 審査リクエスト → 承認後にリリース、の順に進みます。',
+    },
   ];
+}
+
+const LINE_CREATORS_URL = 'https://creator.line.me/ja/';
+
+function openLineCreators(url = LINE_CREATORS_URL) {
+  window.open(url, '_blank', 'noopener');
+  markSubmitOpened();
+}
+
+function markSubmitOpened() {
+  writeLS('submit.opened', String(Math.floor(Date.now() / 1000)));
+  renderGuide();
+}
+
+/** 前回の検証結果の説明。結果はサーバーに保存されるので、再起動しても残ります。 */
+function validationDesc(v) {
+  if (!v || !v.at) return 'サイズ・透過・容量・余白をまとめてチェックします';
+  const when = v.at.replace('T', ' ').slice(5, 16);  // 例: 09-22 14:05
+  if (v.stale) return `前回（${when}）のあとに画像が変わりました。もう一度検証してください`;
+  if (v.errors) return `前回（${when}）の検証でエラーが${v.errors}件ありました`;
+  return `${when} に${v.checked}件を検証し、エラーなし`;
 }
 
 function renderGuide() {
@@ -251,7 +325,7 @@ function renderGuide() {
         data-tip="${escapeHtml(s.help || s.desc)}${s.done ? '（完了済み。クリックでやり直せます）' : ''}">
       <span class="num"><span>${s.n}</span></span>
       <span>
-        <span class="st">${escapeHtml(s.title)}${s.optional ? '<span class="sd">（任意）</span>' : ''}</span>
+        <span class="st">${escapeHtml(s.title)}${s.optional ? '<span class="opt-tag">（任意）</span>' : ''}</span>
         <span class="sd">${escapeHtml(s.desc)}</span>
       </span>
     </li>`;
@@ -366,7 +440,7 @@ $('#tabs').addEventListener('click', (e) => {
   $$('.tab').forEach((t) => t.classList.toggle('active', t === tab));
   $$('.panel').forEach((p) => p.classList.toggle('active', p.id === `panel-${tab.dataset.tab}`));
   if (tab.dataset.tab === 'design') refreshPreview();
-  if (tab.dataset.tab === 'output') loadAssets();
+  if (tab.dataset.tab === 'output') { loadAssets(); updatePlan(); loadListing(); }
   if (tab.dataset.tab === 'start') loadMaster();
 });
 
@@ -480,8 +554,13 @@ async function loadMaster() {
     $('#master-meta').textContent = m.error || m.path;
   }
 
-  if ($('#master-prompt') !== document.activeElement) $('#master-prompt').value = m.prompt_ja;
+  state.savedPrompt = m.prompt_ja || '';
+  if (!state.promptDirty && $('#master-prompt') !== document.activeElement) {
+    $('#master-prompt').value = m.prompt_ja;
+    await loadProfile();
+  }
   renderPromptInfo(m);
+  updatePromptUnsaved();
 
   // 履歴
   const field = $('#master-history-field');
@@ -534,9 +613,12 @@ $('#btn-master-upload').addEventListener('click', async () => {
 
 $('#btn-master-generate').addEventListener('click', async () => {
   const cost = await costFor(1);
+  const unsaved = promptUnsaved();
   if (!confirm(`AIにキャラクターマスター画像を1枚作らせます。\n概算コスト: ${cost}\n\n`
+    + (unsaved ? '※ キャラクターの説明に保存していない変更があります。いまの説明を保存してから作ります。\n\n' : '')
     + 'いまの画像は履歴として残るので、気に入らなければ戻せます。\n実行しますか？')) return;
   try {
+    if (unsaved) await savePrompt();
     resetJobUi('キャラクターマスター画像を作成しています');
     await api('/api/master/generate', { method: 'POST', body: {} });
     startPolling();
@@ -554,6 +636,207 @@ $('#btn-master-restore').addEventListener('click', async () => {
   } catch (e) { toast(e.message, true); }
 });
 
+/* ---------- かんたん入力（選択肢から説明文を作る） ---------- */
+async function loadProfile() {
+  let d;
+  try { d = await api('/api/master/profile'); } catch (e) { return; }
+  state.groups = d.groups;
+  state.presets = d.presets;
+  state.presetInfo = d.preset_info || {};
+  state.presetCategories = d.preset_categories || [];
+  state.presetOrder = d.preset_order || Object.keys(d.presets);
+  state.profile = d.profile || {};
+  // 保存された選択内容と説明文が食い違う＝手で書き換えてある
+  setManualEdit(!d.text_matches_profile && !!$('#master-prompt').value.trim());
+  $('#profile-extra').value = state.profile.extra || '';
+  if (!state.presetMode) state.presetMode = readLS('preset.mode', 'shuffle');
+  renderProfile();
+  if (!state.shuffled) shufflePresets({ keepMode: true });
+}
+
+function isGroupVisible(g, profile) {
+  return Object.entries(g.when || {}).every(([k, allowed]) => allowed.includes(profile[k]));
+}
+
+/** 表示されなくなった項目（例: 動物にしたときの髪型）の選択を外します。 */
+function pruneProfile() {
+  for (const g of state.groups) {
+    if (!isGroupVisible(g, state.profile)) delete state.profile[g.key];
+  }
+}
+
+function renderProfile() {
+  // ひな形は「人／動物／そのほか」に分けて並べ、選んだ理由をツールチップで出します。
+  const btn = (name) => {
+    const note = (state.presetInfo[name] || {}).note || '';
+    return `<button type="button" class="opt preset" data-preset="${escapeHtml(name)}"
+      ${note ? `data-tip="${escapeHtml(note)}"` : ''}>${escapeHtml(name)}</button>`;
+  };
+  const names = state.presetOrder || Object.keys(state.presets);
+  const cats = state.presetCategories.length ? state.presetCategories : [''];
+  $('#btn-preset-all').textContent = state.presetMode === 'all' ? 'シャッフル表示に戻す' : 'すべて表示';
+  if (state.presetMode !== 'all' && state.shuffled) {
+    // シャッフル表示: ひな形の一部 ＋ おまかせで組み合わせたキャラ
+    const randoms = (state.randomChars || []).map((c, i) =>
+      `<button type="button" class="opt preset random" data-random="${i}"
+        data-tip="${escapeHtml(c.text.split('\n').join(' '))}">${escapeHtml(c.name)}</button>`);
+    $('#preset-row').innerHTML = `<div class="chips-row">${[...state.shuffled.map(btn), ...randoms].join('')}</div>`;
+  } else {
+  $('#preset-row').innerHTML = cats.map((cat) => {
+    const inCat = names.filter((n) => !cat || (state.presetInfo[n] || {}).category === cat);
+    if (!inCat.length) return '';
+    return `<div class="preset-cat">${cat ? `<span class="preset-cat-name">${escapeHtml(cat)}</span>` : ''}
+            <div class="chips-row">${inCat.map(btn).join('')}</div></div>`;
+  }).join('');
+  }
+
+  $('#profile-groups').innerHTML = state.groups
+    .filter((g) => isGroupVisible(g, state.profile))
+    .map((g) => {
+      const cur = state.profile[g.key];
+      const chips = g.options.map((o) => {
+        const on = g.type === 'multi' ? (cur || []).includes(o) : cur === o;
+        return `<button type="button" class="opt${on ? ' on' : ''}" data-key="${g.key}" data-val="${escapeHtml(o)}">${escapeHtml(o)}</button>`;
+      }).join('');
+      const note = g.type === 'multi' ? '<small>いくつでも</small>' : '<small>もう一度押すと解除</small>';
+      return `<div class="easy-row"><span class="easy-label">${escapeHtml(g.label)}${note}</span>
+              <div class="chips-row">${chips}</div></div>`;
+    }).join('');
+}
+
+function setManualEdit(on) {
+  state.manualEdit = on;
+  $('#manual-note').hidden = !on;
+  $('#btn-recompose').hidden = !on;
+}
+
+let composeTimer = null;
+function onProfileChange() {
+  state.promptDirty = true;
+  pruneProfile();
+  renderProfile();
+  if (state.manualEdit) return;   // 手で書き換えた説明文は勝手に上書きしません
+  clearTimeout(composeTimer);
+  composeTimer = setTimeout(composeFromProfile, 120);
+}
+
+async function composeFromProfile() {
+  try {
+    const d = await api('/api/master/compose', { method: 'POST', body: { profile: state.profile } });
+    $('#master-prompt').value = d.text;
+    updatePromptUnsaved();
+  } catch (e) { toast(e.message, true); }
+}
+
+$('#preset-row').addEventListener('click', (e) => {
+  const rnd = e.target.closest('[data-random]');
+  if (rnd) {
+    const c = state.randomChars[Number(rnd.dataset.random)];
+    if (state.manualEdit && !confirm(`「${c.name}」の内容で説明文を作り直します。手で書き換えた部分は消えますがよろしいですか？`)) return;
+    state.profile = JSON.parse(JSON.stringify(c.profile));
+    $('#profile-extra').value = '';
+    setManualEdit(false);
+    onProfileChange();
+    toast(`「${c.name}」を読み込みました。気になるところだけ変えてください`);
+    return;
+  }
+  const name = e.target.dataset.preset;
+  if (!name) return;
+  if (state.manualEdit && !confirm(`「${name}」の内容で説明文を作り直します。手で書き換えた部分は消えますがよろしいですか？`)) return;
+  state.profile = JSON.parse(JSON.stringify(state.presets[name]));
+  $('#profile-extra').value = '';
+  setManualEdit(false);
+  onProfileChange();
+  toast(`「${name}」を読み込みました。気になるところだけ変えてください`);
+});
+
+$('#profile-groups').addEventListener('click', (e) => {
+  const { key, val } = e.target.dataset;
+  if (!key) return;
+  const g = state.groups.find((x) => x.key === key);
+  if (g.type === 'multi') {
+    const list = new Set(state.profile[key] || []);
+    if (list.has(val)) list.delete(val); else list.add(val);
+    // 選択肢の並び順にそろえる（説明文の語順が安定するように）
+    const ordered = g.options.filter((o) => list.has(o));
+    if (ordered.length) state.profile[key] = ordered; else delete state.profile[key];
+  } else if (state.profile[key] === val) {
+    delete state.profile[key];   // もう一度押すと解除
+  } else {
+    state.profile[key] = val;
+  }
+  onProfileChange();
+});
+
+$('#profile-extra').addEventListener('input', (e) => {
+  const v = e.target.value;
+  if (v.trim()) state.profile.extra = v; else delete state.profile.extra;
+  onProfileChange();
+});
+
+$('#master-prompt').addEventListener('input', () => {
+  state.promptDirty = true;
+  setManualEdit(true);
+  updatePromptUnsaved();
+});
+
+/** 説明文の欄が、保存済みの内容と違うか（＝画像づくりにまだ使われていないか）。 */
+function promptUnsaved() {
+  return state.savedPrompt !== undefined
+    && $('#master-prompt').value.trim() !== state.savedPrompt.trim();
+}
+
+function updatePromptUnsaved() {
+  $('#prompt-unsaved').hidden = !promptUnsaved();
+}
+
+/** 説明文を保存します。AIで画像を作る前にも呼ばれます。 */
+async function savePrompt() {
+  const d = await api('/api/master/prompt', {
+    method: 'POST', body: { prompt_ja: $('#master-prompt').value, profile: state.profile },
+  });
+  state.promptDirty = false;
+  state.savedPrompt = $('#master-prompt').value;
+  renderPromptInfo(d);
+  updatePromptUnsaved();
+  return d;
+}
+
+/** ひな形を入れ替えます: 用意したひな形から4つ ＋ おまかせで組み合わせたキャラ4人。 */
+async function shufflePresets({ keepMode = false } = {}) {
+  const names = [...(state.presetOrder || Object.keys(state.presets || {}))];
+  for (let i = names.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [names[i], names[j]] = [names[j], names[i]];
+  }
+  state.shuffled = names.slice(0, 4);
+  try {
+    state.randomChars = (await api('/api/master/random?n=4')).characters;
+  } catch (e) { state.randomChars = []; }
+  if (!keepMode) {
+    state.presetMode = 'shuffle';
+    writeLS('preset.mode', 'shuffle');
+  }
+  renderProfile();
+}
+
+$('#btn-preset-shuffle').addEventListener('click', (e) => withBusy(e.currentTarget, 'シャッフル中…', () => shufflePresets()));
+$('#btn-preset-all').addEventListener('click', () => {
+  if (state.presetMode === 'all' && state.shuffled) {
+    state.presetMode = 'shuffle';
+  } else {
+    state.presetMode = 'all';
+  }
+  writeLS('preset.mode', state.presetMode);
+  renderProfile();
+});
+
+$('#btn-recompose').addEventListener('click', () => {
+  if (!confirm('手で書き換えた説明文を捨てて、選択内容から作り直します。よろしいですか？')) return;
+  setManualEdit(false);
+  onProfileChange();
+});
+
 /** 日本語版が使われているか、実際にAIへ送る全文はどうなるかを表示します。 */
 function renderPromptInfo(m) {
   $('#prompt-mode').textContent = m.prompt_mode === 'ja'
@@ -564,10 +847,7 @@ function renderPromptInfo(m) {
 
 $('#btn-prompt-save').addEventListener('click', async () => {
   try {
-    const d = await api('/api/master/prompt', {
-      method: 'POST', body: { prompt_ja: $('#master-prompt').value },
-    });
-    renderPromptInfo(d);
+    await savePrompt();
     toast('キャラクターの説明を保存しました。これから作る画像に使われます');
   } catch (e) { toast(e.message, true); }
 });
@@ -599,44 +879,120 @@ async function afterMasterChanged() {
 /* ------------------------------------------------------------------ */
 /* スタンプ一覧                                                        */
 /* ------------------------------------------------------------------ */
+/** CSV の category 列の表示名。ここに無いものは、そのまま表示します。 */
+const GENRE_LABELS = {
+  basic: '基本の返事', reply: '返事', thanks: 'お礼', apology: 'おわび', request: 'お願い',
+  work: '仕事', move: '移動・連絡', greeting: 'あいさつ', joy: 'よろこび', surprise: 'おどろき',
+  think: '考え中', trouble: 'こまった', tired: 'つかれた', care: '気づかい', life: '生活',
+  misc: 'その他',
+};
+const SALE_LABELS = { review: '申請中', selling: '販売中' };
+
+function genreLabel(cat) {
+  return GENRE_LABELS[cat] || cat || 'その他';
+}
+
+function gridFilter() {
+  const v = $('#grid-filter').value;
+  return state.stickers.filter((s) => v === 'all'
+    || (v === 'unsold' ? !s.sale : s.sale === v));
+}
+
+function cellHtml(s) {
+  const sel = state.selected.has(s.id);
+  let thumb = '<span class="empty">未生成</span>';
+  let tag = '';
+  if (s.has_final) {
+    thumb = `<img loading="lazy" src="/img/final/${s.id}.png?t=${s.final_mtime}" alt="${escapeHtml(s.text)}">`;
+    tag = '<span class="tag final">完成</span>';
+  } else if (s.has_raw) {
+    thumb = `<img loading="lazy" src="/img/generated/${s.id}.png?t=${s.raw_mtime}" alt="${escapeHtml(s.text)}">`;
+    tag = '<span class="tag raw">原画のみ</span>';
+  }
+  const sale = s.sale ? `<span class="sale-badge ${s.sale}">${SALE_LABELS[s.sale]}</span>` : '';
+  return `
+    <div class="cell ${sel ? 'selected' : ''} ${s.sale ? `sale-${s.sale}` : ''}" data-id="${s.id}">
+      <input class="pick" type="checkbox" ${sel ? 'checked' : ''} aria-label="選択">
+      ${sale}${tag}
+      <div class="thumb" data-zoom="${s.id}">${thumb}</div>
+      <div class="cid">${s.id}${s.size_kb ? ` · ${s.size_kb}KB` : ''}</div>
+      <div class="ctext">${escapeHtml(s.text)}</div>
+      <div class="meta">${escapeHtml(s.action || '')}</div>
+      <div class="rowbtns">
+        <button class="btn" data-act="upload"
+                data-tip="この番号に手持ちの画像を入れます。文字入れ・検証まで自動で行います（無料）">画像を入れる</button>
+      </div>
+      <div class="rowbtns">
+        <button class="btn" data-act="regen"
+                data-tip="この1枚だけAIで作り直します（課金されます）。前の画像は退避されます">AIで作り直す</button>
+        <button class="btn" data-act="rerender"
+                data-tip="APIを使わず文字だけ貼り直します（無料）">文字のみ</button>
+      </div>
+    </div>`;
+}
+
 function renderGrid() {
-  const html = state.stickers.map((s) => {
-    const sel = state.selected.has(s.id);
-    let thumb = '<span class="empty">未生成</span>';
-    let tag = '';
-    if (s.has_final) {
-      thumb = `<img loading="lazy" src="/img/final/${s.id}.png?t=${s.final_mtime}" alt="${escapeHtml(s.text)}">`;
-      tag = '<span class="tag final">完成</span>';
-    } else if (s.has_raw) {
-      thumb = `<img loading="lazy" src="/img/generated/${s.id}.png?t=${s.raw_mtime}" alt="${escapeHtml(s.text)}">`;
-      tag = '<span class="tag raw">原画のみ</span>';
-    }
-    return `
-      <div class="cell ${sel ? 'selected' : ''}" data-id="${s.id}">
-        <input class="pick" type="checkbox" ${sel ? 'checked' : ''} aria-label="選択">
-        ${tag}
-        <div class="thumb" data-zoom="${s.id}">${thumb}</div>
-        <div class="cid">${s.id}${s.size_kb ? ` · ${s.size_kb}KB` : ''}</div>
-        <div class="ctext">${escapeHtml(s.text)}</div>
-        <div class="meta">${escapeHtml(s.action || '')}</div>
-        <div class="rowbtns">
-          <button class="btn" data-act="upload"
-                  data-tip="この番号に手持ちの画像を入れます。文字入れ・検証まで自動で行います（無料）">画像を入れる</button>
-        </div>
-        <div class="rowbtns">
-          <button class="btn" data-act="regen"
-                  data-tip="この1枚だけAIで作り直します（課金されます）。前の画像は退避されます">AIで作り直す</button>
-          <button class="btn" data-act="rerender"
-                  data-tip="APIを使わず文字だけ貼り直します（無料）">文字のみ</button>
-        </div>
-      </div>`;
-  }).join('');
-  $('#grid').innerHTML = html;
+  const shown = gridFilter();
+  let html;
+  if ($('#grid-by-genre').checked) {
+    // CSV に最初に出てきた順にジャンルを並べます
+    const groups = new Map();
+    shown.forEach((s) => {
+      const key = s.category || 'misc';
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(s);
+    });
+    html = [...groups].map(([cat, items]) => {
+      const selling = items.filter((s) => s.sale === 'selling').length;
+      const review = items.filter((s) => s.sale === 'review').length;
+      const extra = [selling && `販売中${selling}`, review && `申請中${review}`].filter(Boolean).join('・');
+      return `<div class="genre-head">
+          <h4>${escapeHtml(genreLabel(cat))}</h4>
+          <span class="gcount">${items.length}枚${extra ? `（${extra}）` : ''}</span>
+          <button type="button" class="btn small ghost" data-genre="${escapeHtml(cat)}"
+                  data-tip="このジャンルのスタンプをまとめて選択に加えます">このジャンルを選ぶ</button>
+        </div>` + items.map(cellHtml).join('');
+    }).join('');
+  } else {
+    html = shown.map(cellHtml).join('');
+  }
+  $('#grid').innerHTML = html || '<p class="hint">この条件に合うスタンプはありません。</p>';
   $('#grid-empty').hidden = state.stickers.some((s) => s.has_raw || s.has_final);
+  updateSaleSummary();
   updateSelectionUi();
 }
 
+function updateSaleSummary() {
+  const count = (v) => state.stickers.filter((s) => (v ? s.sale === v : !s.sale)).length;
+  $('#sale-summary').innerHTML = `販売中 <b>${count('selling')}</b> ・ 申請中 <b>${count('review')}</b> ・ 未販売 <b>${count('')}</b>`;
+}
+
+$('#grid-filter').addEventListener('change', () => { writeLS('grid.filter', $('#grid-filter').value); renderGrid(); });
+$('#grid-by-genre').addEventListener('change', () => { writeLS('grid.genre', $('#grid-by-genre').checked ? '1' : '0'); renderGrid(); });
+$('#grid-filter').value = readLS('grid.filter', 'all');
+$('#grid-by-genre').checked = readLS('grid.genre', '1') === '1';
+
+document.querySelectorAll('[data-sale]').forEach((btn) => btn.addEventListener('click', async () => {
+  const ids = [...state.selected].sort();
+  if (!ids.length) { toast('先にスタンプを選んでください', true); return; }
+  const status = btn.dataset.sale;
+  const label = status ? SALE_LABELS[status] : '未販売';
+  try {
+    const d = await api('/api/sales', { method: 'POST', body: { ids, status } });
+    state.stickers.forEach((s) => { s.sale = d.sales[s.id] || ''; });
+    renderGrid();
+    toast(`${ids.length}枚を「${label}」にしました`);
+  } catch (err) { toast(err.message, true); }
+}));
+
 $('#grid').addEventListener('click', async (e) => {
+  const genreBtn = e.target.closest('[data-genre]');
+  if (genreBtn) {
+    gridFilter().filter((s) => (s.category || 'misc') === genreBtn.dataset.genre)
+      .forEach((s) => state.selected.add(s.id));
+    renderGrid();
+    return;
+  }
   const cell = e.target.closest('.cell');
   if (!cell) return;
   const id = cell.dataset.id;
@@ -674,17 +1030,29 @@ $('#grid').addEventListener('click', async (e) => {
   }
 });
 
+// ボタンの帯が画面の外に出たら、選択数だけを右上に出します
+function updateSelectionFloat() {
+  const tabs = document.querySelector('.tabs').getBoundingClientRect();
+  $('#selection-float').hidden = $('#selection-count').getBoundingClientRect().bottom > tabs.bottom;
+}
+window.addEventListener('scroll', updateSelectionFloat, { passive: true });
+window.addEventListener('resize', updateSelectionFloat);
+document.querySelector('.tabs').addEventListener('click', () => setTimeout(updateSelectionFloat, 0));
+$('#selection-float').addEventListener('click', () => {
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
 $('.toolbar').addEventListener('click', (e) => {
   const mode = e.target.dataset.select;
   if (!mode) return;
-  if (mode === 'all') state.stickers.forEach((s) => state.selected.add(s.id));
+  if (mode === 'all') gridFilter().forEach((s) => state.selected.add(s.id));
   else if (mode === 'none') state.selected.clear();
   else if (mode === 'missing') {
     state.selected.clear();
-    state.stickers.filter((s) => !s.has_raw).forEach((s) => state.selected.add(s.id));
+    gridFilter().filter((s) => !s.has_raw).forEach((s) => state.selected.add(s.id));
   } else if (mode === 'invert') {
     const next = new Set();
-    state.stickers.forEach((s) => { if (!state.selected.has(s.id)) next.add(s.id); });
+    gridFilter().forEach((s) => { if (!state.selected.has(s.id)) next.add(s.id); });
     state.selected = next;
   }
   renderGrid();
@@ -700,7 +1068,17 @@ async function costFor(count) {
 
 async function updateSelectionUi() {
   const n = state.selected.size;
-  $('#selection-count').textContent = `${n}枚選択中`;
+  const valid = (state.info && state.info.line_spec.valid_set_sizes) || [8, 16, 24, 32, 40];
+  const countEl = $('#selection-count');
+  countEl.innerHTML = n && valid.includes(n)
+    ? `<b>${n}</b>枚選択中（このまま1セットにできます）`
+    : `<b>${n}</b>枚選択中`;
+  countEl.classList.toggle('has', n > 0);
+  const floatEl = $('#selection-float');
+  floatEl.innerHTML = `<b>${n}</b>枚選択中`;
+  floatEl.classList.toggle('has', n > 0);
+  updateSelectionFloat();
+  if (packageMode() === 'selected') updatePlan();
   $('#btn-generate').disabled = n === 0;
   $('#btn-render').disabled = n === 0;
 
@@ -718,12 +1096,17 @@ $('#btn-generate').addEventListener('click', async () => {
   const ids = [...state.selected].sort();
   const dry = $('#opt-dryrun').checked;
   const force = $('#opt-force').checked;
+  const unsaved = promptUnsaved();
   if (!dry) {
     const willCall = force ? ids.length : ids.filter((id) => !state.stickers.find((s) => s.id === id).has_raw).length;
     const cost = await costFor(willCall);
     if (!confirm(
       `${ids.length}枚を処理します。\nうちAPI呼び出し: ${willCall}枚\n概算コスト: ${cost}\n\n` +
+      (unsaved ? '※ キャラクターの説明に保存していない変更があります。いまの説明を保存してから作ります。\n\n' : '') +
       `※ 既に原画がある分は課金されません（強制再生成を除く）。\n実行しますか？`)) return;
+  }
+  if (unsaved) {
+    try { await savePrompt(); } catch (e) { toast(e.message, true); return; }
   }
   runGenerate(ids, { force, dry_run: dry });
 });
@@ -898,7 +1281,9 @@ async function refreshStickers() {
   const d = await api('/api/stickers');
   state.stickers = d.stickers;
   if (state.info) state.info.stickers = d.stickers;
-  state.validated = false;  // 画像が変わったので検証をやり直す必要があります
+  // 画像が変わっていれば、サーバー側で「検証済み」が自動で外れます
+  if (d.validation && state.info) state.info.validation = d.validation;
+  if (d.packages_status && state.info) state.info.packages_status = d.packages_status;
   renderGrid();
   fillDesignTargets();
   renderGuide();
@@ -911,17 +1296,25 @@ function renderCsvTable() {
   $('#csv-body').innerHTML = state.stickers.map((s) => `
     <tr data-id="${s.id}">
       <td><input data-f="id" value="${escapeHtml(s.id)}"></td>
-      <td><input data-f="text" value="${escapeHtml(s.text)}"></td>
+      <td><textarea data-f="text" rows="1">${escapeHtml(s.text)}</textarea></td>
       <td><input data-f="action" value="${escapeHtml(s.action)}"></td>
       <td><input data-f="expression" value="${escapeHtml(s.expression)}"></td>
       <td><input data-f="category" value="${escapeHtml(s.category)}"></td>
       <td><button class="btn small" data-act="del">削除</button></td>
     </tr>`).join('');
   $('#csv-count').textContent = `${state.stickers.length}件`;
+  $$('#csv-body textarea').forEach(autoGrow);
+}
+
+/** 改行したセリフの行数に合わせて入力欄の高さを変えます。 */
+function autoGrow(el) {
+  el.style.height = 'auto';
+  el.style.height = `${el.scrollHeight}px`;
 }
 
 $('#csv-body').addEventListener('input', (e) => {
-  if (e.target.tagName !== 'INPUT') return;
+  if (e.target.tagName === 'TEXTAREA') autoGrow(e.target);
+  if (e.target.tagName !== 'INPUT' && e.target.tagName !== 'TEXTAREA') return;
   e.target.closest('tr').classList.add('dirty');
   state.csvDirty = true;
 });
@@ -955,7 +1348,7 @@ $('#btn-row-add').addEventListener('click', () => {
 $('#btn-csv-save').addEventListener('click', async () => {
   const rows = $$('#csv-body tr').map((tr) => {
     const o = {};
-    tr.querySelectorAll('input').forEach((i) => { o[i.dataset.f] = i.value; });
+    tr.querySelectorAll('input, textarea').forEach((i) => { o[i.dataset.f] = i.value; });
     return o;
   });
   try {
@@ -992,7 +1385,91 @@ function fillDesignControls(font) {
   $('#f-fill').value = font.fill || '#FFFFFF';
   $('#f-stroke_fill').value = font.stroke_fill || '#000000';
   $('#f-position').value = font.position || 'bottom';
+  if (font.font_id) state.fontId = font.font_id;
+  loadFonts();
 }
+
+/** 選べるフォントの一覧を読み込みます。 */
+async function loadFonts(selectId) {
+  let d;
+  try { d = await api('/api/fonts'); } catch (e) { return; }
+  state.fonts = d.fonts;
+  state.freeFonts = d.free_fonts || [];
+  state.freeCategories = d.free_categories || [];
+  const current = selectId || $('#f-font').value || state.fontId || d.current;
+  $('#f-font').innerHTML = d.fonts
+    .map((f) => `<option value="${escapeHtml(f.id)}">${escapeHtml(f.label)}</option>`).join('');
+  if (current && d.fonts.some((f) => f.id === current)) $('#f-font').value = current;
+  showFontNote();
+  renderFontStore();
+}
+
+function showFontNote() {
+  const f = (state.fonts || []).find((x) => x.id === $('#f-font').value);
+  $('#font-note').textContent = f ? f.note : '';
+  checkFontGlyphs();
+}
+
+/** 選んだフォントに、セリフで使っている文字がそろっているかを調べて知らせます。 */
+let glyphTimer = null;
+function checkFontGlyphs() {
+  clearTimeout(glyphTimer);
+  glyphTimer = setTimeout(async () => {
+    const box = $('#font-missing');
+    const id = $('#f-font').value;
+    if (!id) { box.hidden = true; return; }
+    let d;
+    try { d = await api(`/api/fonts/check?font_id=${encodeURIComponent(id)}`); } catch (e) { box.hidden = true; return; }
+    if (!d.missing.length) { box.hidden = true; return; }
+    const chars = d.missing.slice(0, 12).map((c) => `「${escapeHtml(c)}」`).join('')
+      + (d.missing.length > 12 ? ` ほか${d.missing.length - 12}文字` : '');
+    const ids = d.affected_ids.length > 8
+      ? `${d.affected_ids.slice(0, 8).join(', ')} ほか${d.affected_ids.length - 8}件`
+      : d.affected_ids.join(', ');
+    box.innerHTML = `このフォントには ${chars} がありません。`
+      + `<b>${d.affected_ids.length}件</b>のスタンプで、その文字が「□」になります（${escapeHtml(ids)}）。`
+      + '別のフォントを選ぶか、セリフを変えてください。';
+    box.hidden = false;
+  }, 150);
+}
+
+$('#f-font').addEventListener('change', () => { showFontNote(); schedulePreview(); });
+
+/* ---------- フォントを増やす（無料フォントの追加） ---------- */
+function renderFontStore() {
+  const cats = state.freeCategories || [];
+  $('#font-store-list').innerHTML = cats.map((cat) => {
+    const items = (state.freeFonts || []).filter((f) => f.category === cat);
+    if (!items.length) return '';
+    return `<div class="fs-cat">${escapeHtml(cat)}</div>` + items.map((f) => `
+      <div class="fs-item">
+        <span class="fs-name">${escapeHtml(f.label)} <span class="hint">${f.size_mb}MB</span></span>
+        <span class="fs-note">${escapeHtml(f.note)}</span>
+        ${f.installed
+          ? '<span class="fs-done">追加済み</span>'
+          : `<button type="button" class="btn small" data-install="${escapeHtml(f.id)}">追加</button>`}
+      </div>`).join('');
+  }).join('');
+}
+
+$('#btn-font-store').addEventListener('click', () => {
+  $('#font-store').hidden = !$('#font-store').hidden;
+});
+
+$('#font-store-list').addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-install]');
+  if (!btn) return;
+  const id = btn.dataset.install;
+  const info = (state.freeFonts || []).find((f) => f.id === id);
+  withBusy(btn, 'ダウンロード中…', async () => {
+    try {
+      await api('/api/fonts/install', { method: 'POST', body: { id } });
+      await loadFonts(id);   // 追加したフォントをそのまま選んでプレビューします
+      schedulePreview();
+      toast(`「${info ? info.label : id}」を追加しました。プレビューで確認して、気に入ったら「この設定を保存」を押してください`);
+    } catch (err) { toast(err.message, true); }
+  });
+});
 
 function fillDesignTargets() {
   // 生成済みを先頭に並べますが、未生成もマスター画像で代用してプレビューできます。
@@ -1003,6 +1480,8 @@ function fillDesignTargets() {
     .map((s) => `<option value="${s.id}">${s.id} ${escapeHtml(s.text)}${s.has_raw ? '' : '（未生成）'}</option>`)
     .join('');
   if (keep && state.stickers.some((s) => s.id === keep)) $('#design-target').value = keep;
+  // 書きかけのセリフ（未保存）があるときは上書きしません。
+  if ($('#btn-text-save').disabled) syncDesignText();
 }
 
 function currentStyleOverrides() {
@@ -1015,6 +1494,7 @@ function currentStyleOverrides() {
   o.fill = $('#f-fill').value;
   o.stroke_fill = $('#f-stroke_fill').value;
   o.position = $('#f-position').value;
+  if ($('#f-font').value) o.font_id = $('#f-font').value;
   return o;
 }
 
@@ -1031,7 +1511,7 @@ function schedulePreview() {
 async function refreshPreview() {
   const id = $('#design-target').value;
   if (!id) return;
-  const body = { id, style: currentStyleOverrides(), text: $('#design-text').value.trim() };
+  const body = { id, style: currentStyleOverrides(), text: $('#design-text').value.replace(/^\s+|\s+$/g, '') };
   try {
     const res = await fetch('/api/preview-text', {
       method: 'POST',
@@ -1064,6 +1544,70 @@ async function refreshPreview() {
   .forEach((sel) => $(sel).addEventListener('input', schedulePreview));
 FONT_FIELDS.forEach((k) => $(`#f-${k}`).addEventListener('input', schedulePreview));
 
+/* セリフを直接書き換える（改行も保存） */
+function syncDesignText() {
+  const s = state.stickers.find((x) => x.id === $('#design-target').value);
+  $('#design-text').value = s ? s.text : '';
+  $('#design-text').dataset.original = s ? s.text : '';
+  $('#btn-text-save').disabled = true;
+  $('#text-save-note').textContent = '';
+}
+$('#design-target').addEventListener('change', syncDesignText);
+$('#design-text').addEventListener('input', () => {
+  const changed = $('#design-text').value.trim() !== ($('#design-text').dataset.original || '').trim();
+  $('#btn-text-save').disabled = !changed || !$('#design-text').value.trim();
+  $('#text-save-note').textContent = changed ? '保存するまで、スタンプには反映されません' : '';
+});
+$('#btn-text-save').addEventListener('click', async () => {
+  const id = $('#design-target').value;
+  try {
+    const d = await api(`/api/stickers/${encodeURIComponent(id)}`, {
+      method: 'PATCH', body: { text: $('#design-text').value },
+    });
+    const i = state.stickers.findIndex((x) => x.id === id);
+    if (i >= 0) state.stickers[i] = d.sticker;
+    if (state.info) state.info.stickers = state.stickers;
+    renderCsvTable();
+    renderGrid();
+    syncDesignText();
+    toast(`${id} のセリフを保存しました。スタンプに反映するには「保存して全部に再適用」または「文字のみ」を押してください`);
+  } catch (e) { toast(e.message, true); }
+});
+
+/* おまかせ提案: キャラの色と雰囲気から文字スタイルの候補を出す */
+$('#btn-suggest').addEventListener('click', () => withBusy($('#btn-suggest'), '読み取り中…', async () => {
+  let d;
+  try { d = await api('/api/design/suggest'); } catch (e) { toast(e.message, true); return; }
+  state.suggestions = d.suggestions;
+  $('#suggest-list').innerHTML = d.suggestions.map((sg, i) => `
+    <button type="button" class="sg" data-i="${i}" data-tip="${escapeHtml(sg.reason)}">
+      <span class="sg-sample" style="color:${sg.fill};
+        text-shadow:${[...Array(8)].map((_, k) => {
+          const a = (Math.PI * 2 * k) / 8;
+          return `${(Math.cos(a) * 2).toFixed(1)}px ${(Math.sin(a) * 2).toFixed(1)}px 0 ${sg.stroke_fill}`;
+        }).join(',')}">あア</span>
+      <span><span class="sg-name">${escapeHtml(sg.name)}</span><br>
+        <span class="sg-font">${escapeHtml(sg.font_label)}・縁取り${sg.stroke_width}px</span></span>
+    </button>`).join('');
+  toast(`${d.source || 'キャラクター'} の色から${d.suggestions.length}通り提案しました。押すとプレビューに反映されます`);
+}));
+
+$('#suggest-list').addEventListener('click', (e) => {
+  const b = e.target.closest('.sg');
+  if (!b) return;
+  const sg = state.suggestions[Number(b.dataset.i)];
+  $$('#suggest-list .sg').forEach((x) => x.classList.toggle('on', x === b));
+  $('#f-fill').value = sg.fill.toLowerCase();
+  $('#f-stroke_fill').value = sg.stroke_fill.toLowerCase();
+  $('#f-stroke_width').value = sg.stroke_width;
+  if (sg.font_id && [...$('#f-font').options].some((o) => o.value === sg.font_id)) {
+    $('#f-font').value = sg.font_id;
+    showFontNote();
+  }
+  schedulePreview();
+  toast('プレビューに反映しました。気に入ったら「この設定を保存」を押してください');
+});
+
 $('#btn-swap-colors').addEventListener('click', () => {
   const a = $('#f-fill').value;
   $('#f-fill').value = $('#f-stroke_fill').value;
@@ -1093,9 +1637,9 @@ $('#btn-design-apply').addEventListener('click', async () => {
 /* ------------------------------------------------------------------ */
 /* 検証・出力                                                          */
 /* ------------------------------------------------------------------ */
-$('#btn-validate').addEventListener('click', async () => {
+$('#btn-validate').addEventListener('click', () => withBusy($('#btn-validate'), '検証中…', async () => {
   const box = $('#validate-result');
-  box.textContent = '検証中…';
+  box.innerHTML = '<div class="line working">全スタンプを検証しています。数秒かかります…</div>';
   try {
     const d = await api('/api/validate', { method: 'POST' });
     if (!d.checked) { box.innerHTML = '<div class="line">完成画像がまだありません。</div>'; return; }
@@ -1107,24 +1651,29 @@ $('#btn-validate').addEventListener('click', async () => {
     d.items.forEach((it) => it.issues.forEach((i) =>
       lines.push(`<div class="line ${i.severity}">[${i.severity}] ${escapeHtml(it.file)}: ${escapeHtml(i.message)}</div>`)));
     box.innerHTML = lines.join('');
-    state.validated = d.checked > 0 && d.errors === 0;
+    if (d.validation) state.info.validation = d.validation;
     renderGuide();
-  } catch (e) { box.innerHTML = `<div class="line ERROR">${escapeHtml(e.message)}</div>`; }
-});
+    toast(d.errors ? `検証しました: エラー ${d.errors}件` : `${d.checked}件を検証しました。エラーはありません`, d.errors > 0);
+  } catch (e) {
+    box.innerHTML = `<div class="line ERROR">${escapeHtml(e.message)}</div>`;
+    toast(e.message, true);
+  }
+  box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}));
 
-$('#btn-package').addEventListener('click', async () => {
+$('#btn-package').addEventListener('click', () => withBusy($('#btn-package'), '作成中…', async () => {
   const box = $('#package-result');
-  box.textContent = '作成中…';
+  box.innerHTML = '<div class="line working">main画像・tab画像・ZIPを作っています。100枚分で10秒ほどかかります…</div>';
   try {
-    const d = await api('/api/package', { method: 'POST' });
+    const d = await api('/api/package', { method: 'POST', body: packageOptions() });
     const lines = [
       `<div class="line">main: ${d.main.size_kb}KB ${d.main.ok ? '<span class="good">OK</span>' : '<span class="ERROR">NG</span>'}` +
       ` / tab: ${d.tab.size_kb}KB ${d.tab.ok ? '<span class="good">OK</span>' : '<span class="ERROR">NG</span>'}</div>`,
     ];
     d.packages.forEach((p) => {
       if (p.downloadable) {
-        lines.push(`<div class="line"><a href="/api/download/${encodeURIComponent(p.name)}" download>${escapeHtml(p.name)}</a>` +
-                   ` — ${p.count}枚 / ${p.size_mb}MB</div>`);
+        lines.push(`<div class="line dl"><a class="btn small primary" href="/api/download/${encodeURIComponent(p.name)}" download>ダウンロード</a>` +
+                   ` ${escapeHtml(p.name)} — ${p.count}枚 / ${p.size_mb}MB</div>`);
       }
       p.warnings.forEach((w) => lines.push(`<div class="line WARNING">${escapeHtml(w)}</div>`));
     });
@@ -1133,11 +1682,98 @@ $('#btn-package').addEventListener('click', async () => {
       state.info.has_main = true;
       state.info.has_tab = true;
       state.info.packages = d.packages.filter((p) => p.downloadable).map((p) => p.name);
+      if (d.packages_status) state.info.packages_status = d.packages_status;
       renderGuide();
     }
     loadAssets();
-  } catch (e) { box.innerHTML = `<div class="line ERROR">${escapeHtml(e.message)}</div>`; }
+    updatePlan();
+    const zips = d.packages.filter((p) => p.downloadable).length;
+    toast(zips ? `ZIPを${zips}個作りました。「ダウンロード」から保存できます` : 'ZIPを作れませんでした。下の警告を確認してください', !zips);
+  } catch (e) {
+    box.innerHTML = `<div class="line ERROR">${escapeHtml(e.message)}</div>`;
+    toast(e.message, true);
+  }
+  box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}));
+
+/* ---------- セットの作り方（何枚ずつZIPにするか） ---------- */
+function packageMode() {
+  const el = document.querySelector('input[name="setmode"]:checked');
+  return el ? el.value : 'auto';
+}
+
+/** サーバーに渡す「セットの作り方」。 */
+function packageOptions() {
+  if (packageMode() === 'selected') return { ids: [...state.selected].sort() };
+  const size = $('#set-size').value;
+  return { set_size: size ? Number(size) : null };
+}
+
+function rangeText(set) {
+  return set.first === set.last ? set.first : `${set.first}〜${set.last}`;
+}
+
+let planTimer = null;
+function updatePlan() {
+  clearTimeout(planTimer);
+  planTimer = setTimeout(async () => {
+    $('#setsize-row').classList.toggle('off', packageMode() !== 'auto');
+    const box = $('#package-plan');
+    let d;
+    try {
+      d = await api('/api/package/plan', { method: 'POST', body: packageOptions() });
+    } catch (e) { box.textContent = e.message; box.classList.add('bad'); return; }
+    state.lastPlan = d;
+    fillListingTargets();
+
+    const lines = [];
+    if (d.sets.length) {
+      // 例: 40枚×2セット＋16枚×1セット
+      const counts = {};
+      d.sets.forEach((s) => { counts[s.count] = (counts[s.count] || 0) + 1; });
+      const summary = Object.keys(counts).map(Number).sort((a, b) => b - a)
+        .map((c) => `${c}枚×${counts[c]}セット`).join('＋');
+      lines.push(`<b>${summary}</b> のZIPを作ります（合計${d.total}枚）`);
+      lines.push(`<small>${d.sets.map(rangeText).join(' ／ ')}</small>`);
+    }
+    if (d.error) lines.push(escapeHtml(d.error));
+    if (d.leftover.length && !d.error) {
+      const ids = d.leftover.length > 8
+        ? `${d.leftover.slice(0, 8).join(', ')} ほか${d.leftover.length - 8}枚`
+        : d.leftover.join(', ');
+      lines.push(`残りの<b>${d.leftover.length}枚</b>はどのセットにも入りません<small>（${escapeHtml(ids)}）</small>`);
+    }
+    if (d.missing.length && packageMode() === 'auto') {
+      lines.push(`<small>まだ完成画像が無い${d.missing.length}枚は含みません</small>`);
+    }
+    box.innerHTML = lines.map((l) => `<div>${l}</div>`).join('');
+    box.classList.toggle('bad', !!d.error || !d.sets.length);
+    $('#btn-package').disabled = !!d.error || !d.sets.length;
+  }, 120);
+}
+
+document.querySelectorAll('input[name="setmode"]').forEach((r) => r.addEventListener('change', () => {
+  writeLS('package.mode', packageMode());
+  updatePlan();
+}));
+$('#set-size').addEventListener('change', () => {
+  writeLS('package.size', $('#set-size').value);
+  updatePlan();
 });
+$('#btn-go-select').addEventListener('click', () => {
+  document.querySelector('input[name="setmode"][value="selected"]').checked = true;
+  writeLS('package.mode', 'selected');
+  switchTab('grid');
+  toast('ZIPに入れたいスタンプにチェックを付けてから、「検証・出力」タブに戻ってください');
+});
+// 前回選んだ作り方を復元
+(function restorePackageChoice() {
+  const mode = readLS('package.mode', 'auto');
+  const radio = document.querySelector(`input[name="setmode"][value="${mode}"]`);
+  if (radio) radio.checked = true;
+  const size = readLS('package.size', '');
+  if ([...$('#set-size').options].some((o) => o.value === size)) $('#set-size').value = size;
+})();
 
 /** main/tab はまだ作っていないことが多いので、404を壊れた画像として見せません。 */
 function loadAssets() {
@@ -1153,12 +1789,16 @@ function loadAssets() {
   });
 }
 
-$('#btn-gallery').addEventListener('click', async () => {
+$('#btn-gallery').addEventListener('click', () => withBusy($('#btn-gallery'), '生成中…', async () => {
   try {
     const d = await api('/api/gallery', { method: 'POST' });
     $('#gallery-result').innerHTML = `<div class="line good">生成しました</div><div class="line">${escapeHtml(d.path)}</div>`;
-  } catch (e) { $('#gallery-result').innerHTML = `<div class="line ERROR">${escapeHtml(e.message)}</div>`; }
-});
+    toast('gallery.html を生成しました');
+  } catch (e) {
+    $('#gallery-result').innerHTML = `<div class="line ERROR">${escapeHtml(e.message)}</div>`;
+    toast(e.message, true);
+  }
+}));
 
 $('#btn-log').addEventListener('click', async () => {
   const d = await api('/api/log');
@@ -1168,3 +1808,151 @@ $('#btn-log').addEventListener('click', async () => {
 
 /* ------------------------------------------------------------------ */
 loadState().catch((e) => toast(e.message, true));
+
+document.querySelectorAll('[data-submit-link]').forEach((a) => {
+  a.addEventListener('click', () => markSubmitOpened());
+});
+
+/* ------------------------------------------------------------------ */
+/* 申請用のタイトル・説明文                                             */
+/* ------------------------------------------------------------------ */
+const LISTING_KEYS = ['creator', 'copyright', 'title_en', 'desc_en', 'title_ja', 'desc_ja'];
+let listingLimits = {};
+let listingCandidates = [];
+let listingCheckTimer = null;
+
+/** LINE の数え方（全角は2文字）。サーバー側（listing.display_width）と同じ考え方です。 */
+function lineWidth(text) {
+  let n = 0;
+  for (const ch of text) {
+    const c = ch.codePointAt(0);
+    // 半角（ASCII・ラテン文字・半角カナ）は1、それ以外は2
+    n += (c <= 0xff || (c >= 0xff61 && c <= 0xff9f)) ? 1 : 2;
+  }
+  return n;
+}
+
+function listingValues() {
+  const out = {};
+  LISTING_KEYS.forEach((k) => { out[k] = $(`#lst-${k}`).value; });
+  return out;
+}
+
+function showListingIssues(issues) {
+  LISTING_KEYS.forEach((k) => {
+    const el = $(`#lst-${k}`);
+    const w = lineWidth(el.value);
+    const limit = listingLimits[k] || 0;
+    const count = $(`[data-count="${k}"]`);
+    count.textContent = `${w} / ${limit}`;
+    count.classList.toggle('over', w > limit);
+    const list = (issues && issues[k]) || [];
+    const box = $(`[data-issues="${k}"]`);
+    box.textContent = list.join(' ／ ');
+    box.hidden = !list.length;
+    el.classList.toggle('bad', list.length > 0 && !(list.length === 1 && list[0] === '必須の項目です' && !el.value));
+  });
+}
+
+async function loadListing() {
+  try {
+    const d = await api('/api/listing');
+    listingLimits = d.limits;
+    LISTING_KEYS.forEach((k) => { $(`#lst-${k}`).value = d.listing[k] || ''; });
+    showListingIssues(d.issues);
+    fillListingTargets();
+  } catch (e) { /* 古いサーバーのときは上部バナーで案内されます */ }
+}
+
+function fillListingTargets() {
+  const sel = $('#lst-target');
+  const prev = sel.value;
+  const opts = ['<option value="">すべてのセリフ</option>'];
+  if (state.selected.size) opts.push(`<option value="selected">スタンプ一覧で選んだ${state.selected.size}枚</option>`);
+  (state.lastPlan ? state.lastPlan.sets : []).forEach((st, i) => {
+    opts.push(`<option value="set:${st.first}:${st.last}">セット${i + 1}（${st.first}〜${st.last}・${st.count}枚）</option>`);
+  });
+  sel.innerHTML = opts.join('');
+  if ([...sel.options].some((o) => o.value === prev)) sel.value = prev;
+}
+
+function listingTargetIds() {
+  const v = $('#lst-target').value;
+  if (v === 'selected') return [...state.selected].sort();
+  if (v.startsWith('set:')) {
+    const [, first, last] = v.split(':');
+    return state.stickers.map((s) => s.id).filter((id) => id >= first && id <= last);
+  }
+  return [];
+}
+
+/** セット2以降を選んだときはタイトルに番号を付けます（同じタイトルのスタンプが並ばないように）。 */
+function listingVolume() {
+  const sel = $('#lst-target');
+  const v = sel.value;
+  if (!v.startsWith('set:')) return 1;
+  const sets = [...sel.options].filter((o) => o.value.startsWith('set:'));
+  return sets.length > 1 ? sets.findIndex((o) => o.value === v) + 1 : 1;
+}
+
+function applyCandidate(i) {
+  const c = listingCandidates[i];
+  if (!c) return;
+  ['title_en', 'desc_en', 'title_ja', 'desc_ja'].forEach((k) => { $(`#lst-${k}`).value = c[k]; });
+  if (!$('#lst-copyright').value && c.copyright) $('#lst-copyright').value = c.copyright;
+  document.querySelectorAll('#lst-candidates .opt').forEach((b, j) => b.classList.toggle('on', j === i));
+  checkListingSoon(0);
+}
+
+$('#btn-listing-suggest').addEventListener('click', (e) => withBusy(e.currentTarget, '作成中…', async () => {
+  try {
+    const d = await api('/api/listing/suggest', {
+      method: 'POST', body: { ids: listingTargetIds(), creator: $('#lst-creator').value, volume: listingVolume() },
+    });
+    listingCandidates = d.candidates;
+    $('#lst-candidates').innerHTML = d.candidates.map((c, i) =>
+      `<button type="button" class="opt" data-cand="${i}">案${i + 1}：${escapeHtml(c.title_ja || c.title_en)}</button>`).join('');
+    $('#lst-candidates-row').hidden = !d.candidates.length;
+    $('#lst-profile-hint').hidden = d.has_profile;
+    applyCandidate(0);
+    toast(`${d.count}件のセリフから案を${d.candidates.length}つ作りました。気に入らなければ書き換えてください`);
+  } catch (err) { toast(err.message, true); }
+}));
+
+$('#lst-candidates').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-cand]');
+  if (b) applyCandidate(Number(b.dataset.cand));
+});
+
+function checkListingSoon(delay = 300) {
+  clearTimeout(listingCheckTimer);
+  showListingIssues(null);
+  listingCheckTimer = setTimeout(async () => {
+    try {
+      const d = await api('/api/listing/check', { method: 'POST', body: { listing: listingValues() } });
+      showListingIssues(d.issues);
+    } catch (err) { /* 入力中なので黙って次を待ちます */ }
+  }, delay);
+}
+LISTING_KEYS.forEach((k) => $(`#lst-${k}`).addEventListener('input', () => checkListingSoon()));
+
+$('#btn-listing-save').addEventListener('click', (e) => withBusy(e.currentTarget, '保存中…', async () => {
+  try {
+    const d = await api('/api/listing', { method: 'PUT', body: { listing: listingValues() } });
+    showListingIssues(d.issues);
+    const bad = Object.values(d.issues).filter((l) => l.length).length;
+    toast(bad ? `保存しました（直したほうがよい項目が${bad}つあります）` : '保存しました。LINE Creators Market にコピーして使えます', !!bad);
+  } catch (err) { toast(err.message, true); }
+}));
+
+$('#listing-form').addEventListener('click', async (e) => {
+  const b = e.target.closest('[data-copy]');
+  if (!b) return;
+  const text = $(`#lst-${b.dataset.copy}`).value;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (err) {
+    const el = $(`#lst-${b.dataset.copy}`); el.select(); document.execCommand('copy');
+  }
+  toast('コピーしました');
+});
