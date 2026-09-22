@@ -699,7 +699,9 @@ def create_app(config=None) -> Flask:
             info = fontlib.find_font(current_config(), str(body["font_id"]))
             if info is None:
                 return jsonify({"error": f"フォントが見つかりません: {body['font_id']}"}), 400
-            updates.update({"font.path": info.path, "font.index": info.index,
+            # プロジェクト内のフォントは相対パスで保存します（フォルダを移動しても動くように）
+            updates.update({"font.path": fontlib.portable_path(current_config(), info.path),
+                            "font.index": info.index,
                             "font.variation": info.variation})
         for key, caster in allowed.items():
             if key in body and body[key] is not None:

@@ -241,3 +241,22 @@ def test_pick_font_skips_font_missing_sticker_chars(font_path):
     no_jp = FontInfo("a", "A", str(arial), 0, "", ("gentle",), "")
     jp = FontInfo("b", "B", font_path, 0, "", ("gentle",), "")
     assert ss._pick_font([no_jp, jp], "gentle", ["了解！"]).id == "b"
+
+
+# --- プロジェクトのフォルダを移動しても動く ---------------------------------
+def test_portable_path_is_relative_inside_project(tmp_config):
+    inside = tmp_config.root / "fonts" / "A.ttf"
+    assert fontlib.portable_path(tmp_config, str(inside)) == "fonts/A.ttf"
+    outside = r"C:\Windows\Fonts\meiryo.ttc"
+    assert fontlib.portable_path(tmp_config, outside) == outside
+
+
+def test_old_absolute_font_path_falls_back_to_fonts_folder(tmp_config, font_path):
+    import shutil
+
+    from src.text_renderer import resolve_font_path
+
+    (tmp_config.root / "fonts").mkdir(exist_ok=True)
+    shutil.copy(font_path, tmp_config.root / "fonts" / "Moved.ttf")
+    tmp_config.raw["font"]["path"] = r"D:\old-place\project\fonts\Moved.ttf"
+    assert resolve_font_path(tmp_config) == tmp_config.root / "fonts" / "Moved.ttf"

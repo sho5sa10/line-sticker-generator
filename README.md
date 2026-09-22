@@ -182,6 +182,11 @@ id,text,action,expression,category
 
 コマンドを覚えなくても、ブラウザ上ですべての操作ができます。
 
+**Windows では、プロジェクトのフォルダにある `start_gui.bat` をダブルクリックするだけで起動します。**
+初回は `.venv` の作成と必要なパッケージのインストールも自動で行います。
+
+コマンドで起動する場合:
+
 ```bash
 python -m src.main gui
 ```
