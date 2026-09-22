@@ -546,11 +546,13 @@ async function loadMaster() {
     $('#master-meta').textContent = m.error || m.path;
   }
 
+  state.savedPrompt = m.prompt_ja || '';
   if (!state.promptDirty && $('#master-prompt') !== document.activeElement) {
     $('#master-prompt').value = m.prompt_ja;
     await loadProfile();
   }
   renderPromptInfo(m);
+  updatePromptUnsaved();
 
   // 履歴
   const field = $('#master-history-field');
@@ -603,9 +605,12 @@ $('#btn-master-upload').addEventListener('click', async () => {
 
 $('#btn-master-generate').addEventListener('click', async () => {
   const cost = await costFor(1);
+  const unsaved = promptUnsaved();
   if (!confirm(`AIにキャラクターマスター画像を1枚作らせます。\n概算コスト: ${cost}\n\n`
+    + (unsaved ? '※ キャラクターの説明に保存していない変更があります。いまの説明を保存してから作ります。\n\n' : '')
     + 'いまの画像は履歴として残るので、気に入らなければ戻せます。\n実行しますか？')) return;
   try {
+    if (unsaved) await savePrompt();
     resetJobUi('キャラクターマスター画像を作成しています');
     await api('/api/master/generate', { method: 'POST', body: {} });
     startPolling();
@@ -700,6 +705,7 @@ async function composeFromProfile() {
   try {
     const d = await api('/api/master/compose', { method: 'POST', body: { profile: state.profile } });
     $('#master-prompt').value = d.text;
+    updatePromptUnsaved();
   } catch (e) { toast(e.message, true); }
 }
 
@@ -741,7 +747,30 @@ $('#profile-extra').addEventListener('input', (e) => {
 $('#master-prompt').addEventListener('input', () => {
   state.promptDirty = true;
   setManualEdit(true);
+  updatePromptUnsaved();
 });
+
+/** 説明文の欄が、保存済みの内容と違うか（＝画像づくりにまだ使われていないか）。 */
+function promptUnsaved() {
+  return state.savedPrompt !== undefined
+    && $('#master-prompt').value.trim() !== state.savedPrompt.trim();
+}
+
+function updatePromptUnsaved() {
+  $('#prompt-unsaved').hidden = !promptUnsaved();
+}
+
+/** 説明文を保存します。AIで画像を作る前にも呼ばれます。 */
+async function savePrompt() {
+  const d = await api('/api/master/prompt', {
+    method: 'POST', body: { prompt_ja: $('#master-prompt').value, profile: state.profile },
+  });
+  state.promptDirty = false;
+  state.savedPrompt = $('#master-prompt').value;
+  renderPromptInfo(d);
+  updatePromptUnsaved();
+  return d;
+}
 
 $('#btn-recompose').addEventListener('click', () => {
   if (!confirm('手で書き換えた説明文を捨てて、選択内容から作り直します。よろしいですか？')) return;
@@ -759,11 +788,7 @@ function renderPromptInfo(m) {
 
 $('#btn-prompt-save').addEventListener('click', async () => {
   try {
-    const d = await api('/api/master/prompt', {
-      method: 'POST', body: { prompt_ja: $('#master-prompt').value, profile: state.profile },
-    });
-    state.promptDirty = false;
-    renderPromptInfo(d);
+    await savePrompt();
     toast('キャラクターの説明を保存しました。これから作る画像に使われます');
   } catch (e) { toast(e.message, true); }
 });
@@ -1012,12 +1037,17 @@ $('#btn-generate').addEventListener('click', async () => {
   const ids = [...state.selected].sort();
   const dry = $('#opt-dryrun').checked;
   const force = $('#opt-force').checked;
+  const unsaved = promptUnsaved();
   if (!dry) {
     const willCall = force ? ids.length : ids.filter((id) => !state.stickers.find((s) => s.id === id).has_raw).length;
     const cost = await costFor(willCall);
     if (!confirm(
       `${ids.length}枚を処理します。\nうちAPI呼び出し: ${willCall}枚\n概算コスト: ${cost}\n\n` +
+      (unsaved ? '※ キャラクターの説明に保存していない変更があります。いまの説明を保存してから作ります。\n\n' : '') +
       `※ 既に原画がある分は課金されません（強制再生成を除く）。\n実行しますか？`)) return;
+  }
+  if (unsaved) {
+    try { await savePrompt(); } catch (e) { toast(e.message, true); return; }
   }
   runGenerate(ids, { force, dry_run: dry });
 });

@@ -674,3 +674,9 @@ main { padding: 16px; max-width: 1500px; margin: 0 auto; }
 .genre-head h4 { margin: 0; font-size: 15px; }
 .genre-head .gcount { font-size: 12px; color: var(--muted); }
 .genre-head .btn { margin-left: auto; }
+
+/* 説明文が未保存のとき */
+.unsaved {
+  font-size: 12px; font-weight: 700; color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 12%, transparent); padding: 3px 10px; border-radius: 99px;
+}
