@@ -450,6 +450,28 @@ def create_app(config=None) -> Flask:
             "text_matches_profile": bool(profile) and cprof.compose(profile) == text,
         })
 
+    @app.get("/api/master/random")
+    def api_master_random():
+        """おまかせで組み合わせたキャラクターを返します（シャッフル用。保存はしません）。"""
+        import random
+
+        try:
+            n = min(max(int(request.args.get("n", 4)), 1), 12)
+        except ValueError:
+            n = 4
+        rng = random.Random()
+        out, seen = [], set()
+        for _ in range(n * 5):
+            p = cprof.random_profile(rng)
+            name = cprof.profile_name(p)
+            if name in seen or name in cprof.PRESETS:
+                continue
+            seen.add(name)
+            out.append({"name": name, "profile": p, "text": cprof.compose(p)})
+            if len(out) >= n:
+                break
+        return jsonify({"characters": out})
+
     @app.post("/api/master/compose")
     def api_master_compose():
         """選択内容から説明文を組み立てます（保存はしません）。"""

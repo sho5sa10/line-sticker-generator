@@ -680,3 +680,8 @@ main { padding: 16px; max-width: 1500px; margin: 0 auto; }
   font-size: 12px; font-weight: 700; color: var(--warn);
   background: color-mix(in srgb, var(--warn) 12%, transparent); padding: 3px 10px; border-radius: 99px;
 }
+
+/* ひな形のシャッフル */
+.preset-tools { display: flex; gap: 6px; margin-bottom: 6px; }
+.opt.preset.random { border-style: solid; border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); }
+.opt.preset.random::before { content: "おまかせ"; font-size: 10px; font-weight: 700; color: var(--accent); margin-right: 5px; }

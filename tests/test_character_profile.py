@@ -160,3 +160,37 @@ def test_fur_color_only_for_animals_and_creatures():
     assert "三毛もようの体。" in cp.compose({"kind": "動物", "animal": "ねこ", "fur": "三毛"})
     assert "fur" not in cp.normalize({"kind": "人", "fur": "白"})
     assert "fur" not in cp.normalize({"kind": "食べ物", "fur": "白"})
+
+
+# --- おまかせ（シャッフル） ---------------------------------------------------
+def test_random_profiles_are_consistent():
+    import random
+
+    rng = random.Random(0)
+    for _ in range(300):
+        p = cp.random_profile(rng)
+        assert p == cp.normalize(p)          # 選択肢の範囲内・表示条件どおり
+        assert cp.compose(p)                 # 説明文が作れる
+        name = cp.profile_name(p)
+        assert name and len(name) <= 20
+        if p["kind"] in cp.HUMAN_KINDS:
+            if p["job"] == "学生":
+                assert p["age"] == "10代"
+            if p["job"] in ("医師", "看護師"):
+                assert p["outfit"] == "白衣"
+            if p["gender"] == "男性":
+                assert not set(p.get("items", [])) & {"リボン"} and p["outfit"] not in ("セーラー服", "ワンピース")
+        else:
+            assert "gender" not in p
+        if p["kind"] == "食べ物":
+            assert "ふわふわの毛" not in p.get("items", []) and "fur" not in p
+
+
+def test_random_endpoint(tmp_config):
+    from src.webapp import create_app
+
+    c = create_app(tmp_config).test_client()
+    chars = c.get("/api/master/random?n=6").get_json()["characters"]
+    assert 1 <= len(chars) <= 6
+    assert len({x["name"] for x in chars}) == len(chars)
+    assert all(x["text"] and x["profile"]["kind"] for x in chars)

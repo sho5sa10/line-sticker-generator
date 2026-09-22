@@ -649,7 +649,9 @@ async function loadProfile() {
   // 保存された選択内容と説明文が食い違う＝手で書き換えてある
   setManualEdit(!d.text_matches_profile && !!$('#master-prompt').value.trim());
   $('#profile-extra').value = state.profile.extra || '';
+  if (!state.presetMode) state.presetMode = readLS('preset.mode', 'shuffle');
   renderProfile();
+  if (!state.shuffled) shufflePresets({ keepMode: true });
 }
 
 function isGroupVisible(g, profile) {
@@ -672,12 +674,21 @@ function renderProfile() {
   };
   const names = state.presetOrder || Object.keys(state.presets);
   const cats = state.presetCategories.length ? state.presetCategories : [''];
+  $('#btn-preset-all').textContent = state.presetMode === 'all' ? 'シャッフル表示に戻す' : 'すべて表示';
+  if (state.presetMode !== 'all' && state.shuffled) {
+    // シャッフル表示: ひな形の一部 ＋ おまかせで組み合わせたキャラ
+    const randoms = (state.randomChars || []).map((c, i) =>
+      `<button type="button" class="opt preset random" data-random="${i}"
+        data-tip="${escapeHtml(c.text.split('\n').join(' '))}">${escapeHtml(c.name)}</button>`);
+    $('#preset-row').innerHTML = `<div class="chips-row">${[...state.shuffled.map(btn), ...randoms].join('')}</div>`;
+  } else {
   $('#preset-row').innerHTML = cats.map((cat) => {
     const inCat = names.filter((n) => !cat || (state.presetInfo[n] || {}).category === cat);
     if (!inCat.length) return '';
     return `<div class="preset-cat">${cat ? `<span class="preset-cat-name">${escapeHtml(cat)}</span>` : ''}
             <div class="chips-row">${inCat.map(btn).join('')}</div></div>`;
   }).join('');
+  }
 
   $('#profile-groups').innerHTML = state.groups
     .filter((g) => isGroupVisible(g, state.profile))
@@ -718,6 +729,17 @@ async function composeFromProfile() {
 }
 
 $('#preset-row').addEventListener('click', (e) => {
+  const rnd = e.target.closest('[data-random]');
+  if (rnd) {
+    const c = state.randomChars[Number(rnd.dataset.random)];
+    if (state.manualEdit && !confirm(`「${c.name}」の内容で説明文を作り直します。手で書き換えた部分は消えますがよろしいですか？`)) return;
+    state.profile = JSON.parse(JSON.stringify(c.profile));
+    $('#profile-extra').value = '';
+    setManualEdit(false);
+    onProfileChange();
+    toast(`「${c.name}」を読み込みました。気になるところだけ変えてください`);
+    return;
+  }
   const name = e.target.dataset.preset;
   if (!name) return;
   if (state.manualEdit && !confirm(`「${name}」の内容で説明文を作り直します。手で書き換えた部分は消えますがよろしいですか？`)) return;
@@ -779,6 +801,35 @@ async function savePrompt() {
   updatePromptUnsaved();
   return d;
 }
+
+/** ひな形を入れ替えます: 用意したひな形から4つ ＋ おまかせで組み合わせたキャラ4人。 */
+async function shufflePresets({ keepMode = false } = {}) {
+  const names = [...(state.presetOrder || Object.keys(state.presets || {}))];
+  for (let i = names.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [names[i], names[j]] = [names[j], names[i]];
+  }
+  state.shuffled = names.slice(0, 4);
+  try {
+    state.randomChars = (await api('/api/master/random?n=4')).characters;
+  } catch (e) { state.randomChars = []; }
+  if (!keepMode) {
+    state.presetMode = 'shuffle';
+    writeLS('preset.mode', 'shuffle');
+  }
+  renderProfile();
+}
+
+$('#btn-preset-shuffle').addEventListener('click', (e) => withBusy(e.currentTarget, 'シャッフル中…', () => shufflePresets()));
+$('#btn-preset-all').addEventListener('click', () => {
+  if (state.presetMode === 'all' && state.shuffled) {
+    state.presetMode = 'shuffle';
+  } else {
+    state.presetMode = 'all';
+  }
+  writeLS('preset.mode', state.presetMode);
+  renderProfile();
+});
 
 $('#btn-recompose').addEventListener('click', () => {
   if (!confirm('手で書き換えた説明文を捨てて、選択内容から作り直します。よろしいですか？')) return;

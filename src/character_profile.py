@@ -361,3 +361,91 @@ def infer_profile(text: str) -> dict | None:
         if compose(preset) == body:
             return normalize(preset)
     return None
+
+
+# ---------------------------------------------------------------------------
+# おまかせ（ランダム）で作るキャラクター
+# ---------------------------------------------------------------------------
+# 職業に合う服装・年齢・性別（ちぐはぐな組み合わせにならないように）
+_JOB_RULES: dict[str, dict] = {
+    "会社員": {"outfit": ["スーツ", "ワイシャツとネクタイ", "ブラウス", "カーディガン"], "age": DECADES[1:4]},
+    "学生": {"outfit": ["パーカー", "Tシャツ"], "age": ["10代"]},
+    "店員": {"outfit": ["エプロン"], "age": DECADES[:3]},
+    "エンジニア": {"outfit": ["パーカー", "Tシャツ", "カーディガン"], "age": DECADES[1:4]},
+    "先生": {"outfit": ["カーディガン", "スーツ", "ブラウス"], "age": DECADES[1:]},
+    "医師": {"outfit": ["白衣"], "age": DECADES[1:]},
+    "看護師": {"outfit": ["白衣"], "age": DECADES[1:4]},
+    "主婦": {"outfit": ["エプロン", "カーディガン"], "age": DECADES[1:], "gender": "女性"},
+    "主夫": {"outfit": ["エプロン", "カーディガン"], "age": DECADES[1:], "gender": "男性"},
+}
+_MEN_ONLY = {"ワイシャツとネクタイ", "学ラン", "ひげ", "七三分け", "坊主"}
+_WOMEN_ONLY = {"ブラウス", "ワンピース", "セーラー服", "ドレス", "リボン", "ポニーテール", "おだんご"}
+_MOOD_WORD = {"親しみやすい": "親しみやすい", "やさしい": "やさしい", "コミカル": "おちゃめな",
+              "かわいい": "かわいい", "上品": "上品な", "クール": "クールな", "シュール": "シュールな",
+              "ゆるい": "ゆるい", "元気": "元気な", "まじめ": "まじめな"}
+_FUR_WORD = {"白": "白い", "クリーム": "クリーム色の", "茶": "茶色い", "グレー": "グレーの", "黒": "黒い",
+             "三毛": "三毛の", "ピンク": "ピンクの", "黄": "黄色い"}
+
+
+def _options(key: str) -> list[str]:
+    return list(_group(key)["options"])
+
+
+def random_profile(rng) -> dict:
+    """選択肢をランダムに組み合わせてキャラクターを1人作ります（random.Random を渡します）。"""
+    kind = rng.choice(["人（日本人）", "動物", "動物", "ふしぎな生き物", "食べ物"])
+    p: dict = {"kind": kind, "heads": rng.choice(_options("heads"))}
+    if kind in HUMAN_KINDS:
+        job = rng.choice(_options("job"))
+        rule = _JOB_RULES.get(job, {})
+        gender = rule.get("gender") or rng.choice(_options("gender"))
+        banned = _WOMEN_ONLY if gender == "男性" else _MEN_ONLY
+        outfits = [o for o in rule.get("outfit", _options("outfit")) if o not in banned]
+        if job == "学生":
+            outfits.append("学ラン" if gender == "男性" else "セーラー服")
+        p.update({
+            "gender": gender,
+            "age": rng.choice(rule.get("age", DECADES)),
+            "job": job,
+            "hair": rng.choice([h for h in _options("hair") if h not in banned]),
+            "hair_color": rng.choice(["黒", "黒", "茶", "茶", "金"]),
+            "outfit": rng.choice(outfits or _options("outfit")),
+            "outfit_color": rng.choice(_options("outfit_color")),
+            "body": rng.choice(["ふつう", "少し丸い", "細身"]),
+        })
+        extras = [i for i in ["メガネ", "帽子", "ひげ", "そばかす", "赤いほっぺ", "ヘッドホン", "リボン"]
+                  if i not in banned]
+    else:
+        if kind == "動物":
+            p["animal"] = rng.choice(_options("animal"))
+        elif kind == "ふしぎな生き物":
+            p["creature"] = rng.choice(_options("creature"))
+        else:
+            p["food"] = rng.choice(_options("food"))
+        if kind in FUR_KINDS:
+            p["fur"] = rng.choice(_options("fur"))
+        p["body"] = rng.choice(["少し丸い", "まんまる", "ぽっちゃり", "ふつう"])
+        if rng.random() < 0.3:  # 動物などは服なしが多め
+            p["outfit"] = rng.choice(["パーカー", "Tシャツ", "エプロン", "カーディガン"])
+            p["outfit_color"] = rng.choice(_options("outfit_color"))
+        extras = ["赤いほっぺ", "ふくらんだほっぺ", "リボン", "帽子", "もちもち"]
+        if kind in FUR_KINDS:
+            extras.append("ふわふわの毛")
+    items = rng.sample(extras, k=rng.choice([0, 1, 1, 2]))
+    if items:
+        p["items"] = [o for o in _options("items") if o in items]
+    moods = rng.sample(_options("mood"), k=rng.choice([1, 2]))
+    p["mood"] = [o for o in _options("mood") if o in moods]
+    p["palette"] = rng.choice(_options("palette"))
+    return normalize(p)
+
+
+def profile_name(p: dict) -> str:
+    """ボタンに出す短い呼び名（例: 「元気な三毛のねこ」「おちゃめな看護師（女性）」）。"""
+    head = _MOOD_WORD.get((p.get("mood") or [""])[0], "")
+    if p.get("kind") in HUMAN_KINDS:
+        who = f"{p.get('job', 'ひと')}（{p.get('gender', '')}）" if p.get("gender") else p.get("job", "ひと")
+        return f"{head}{who}"
+    thing = p.get("animal") or p.get("creature") or p.get("food") or "キャラ"
+    fur = _FUR_WORD.get(p.get("fur", ""), "") if len(thing) <= 6 else ""
+    return f"{head}{fur}{thing}"
