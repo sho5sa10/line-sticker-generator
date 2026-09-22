@@ -806,3 +806,30 @@ def test_sales_status_roundtrip(client):
     assert client.post("/api/sales", json={"ids": ["001"], "status": ""}).get_json()["sales"] == {"003": "selling"}
     assert client.post("/api/sales", json={"ids": [], "status": "selling"}).status_code == 400
     assert client.post("/api/sales", json={"ids": ["001"], "status": "bogus"}).status_code == 400
+
+
+# --- 検証結果は再起動しても残る ---------------------------------------------
+def test_validation_result_survives_restart(app, tmp_config):
+    import os
+
+    from src.webapp import create_app
+
+    client = app.test_client()
+    assert client.get("/api/state").get_json()["validation"]["passed"] is False
+
+    ip.save_png(make_character((370, 320)), tmp_config.dir_final / "001.png")
+    d = client.post("/api/validate").get_json()
+    v = d["validation"]
+    assert v["checked"] == 1 and v["at"]
+    assert v["passed"] is (d["errors"] == 0)
+
+    # サーバーを作り直しても（=GUIの再起動）結果が残る
+    again = create_app(tmp_config).test_client().get("/api/state").get_json()["validation"]
+    assert again["at"] == v["at"] and again["passed"] == v["passed"] and not again["stale"]
+
+    # 検証後に画像が変わったら「検証済み」は外れる
+    final = tmp_config.dir_final / "001.png"
+    st = final.stat()
+    os.utime(final, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
+    after = client.get("/api/stickers").get_json()["validation"]
+    assert after["stale"] is True and after["passed"] is False

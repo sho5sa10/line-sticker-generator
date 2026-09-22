@@ -273,6 +273,7 @@ def create_app(config=None) -> Flask:
                 "has_main": (cfg_.dir_main / "main.png").exists(),
                 "has_tab": (cfg_.dir_tab / "tab.png").exists(),
                 "packages": packages,
+                "validation": vd.load_result(cfg_),
                 "line_spec": {
                     "sticker": list(cfg_.sticker_size),
                     "main": list(cfg_.main_size),
@@ -760,7 +761,7 @@ def create_app(config=None) -> Flask:
         except CsvLoadError as exc:
             return jsonify({"error": str(exc)}), 400
         cfg_ = current_config()
-        return jsonify({"stickers": statuses(cfg_, entries)})
+        return jsonify({"stickers": statuses(cfg_, entries), "validation": vd.load_result(cfg_)})
 
     @app.post("/api/stickers")
     def api_stickers_post():
@@ -1033,12 +1034,17 @@ def create_app(config=None) -> Flask:
             }
             for r in reports
         ]
+        errors = sum(len(r.errors) for r in reports)
+        warnings = sum(len(r.warnings) for r in reports)
+        # 再起動しても「検証済み」が分かるように結果を残します（画像が変われば自動で無効）
+        validation = vd.record_result(cfg_, len(reports), errors, warnings)
         return jsonify(
             {
                 "checked": len(reports),
-                "errors": sum(len(r.errors) for r in reports),
-                "warnings": sum(len(r.warnings) for r in reports),
+                "errors": errors,
+                "warnings": warnings,
                 "items": items,
+                "validation": validation,
             }
         )
 

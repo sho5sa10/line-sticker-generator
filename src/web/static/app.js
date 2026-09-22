@@ -12,7 +12,6 @@ const state = {
   eventOffset: 0,
   poller: null,
   csvDirty: false,
-  validated: false,
   steps: [],
   pinnedStep: null,   // ユーザーが明示的に選んだステップ（自動判定より優先）
   master: null,
@@ -249,10 +248,8 @@ function computeSteps(info) {
     },
     {
       n: 6, key: 'validate', title: 'LINE仕様を検証',
-      desc: state.validated
-        ? '検証に通りました'
-        : 'サイズ・透過・容量・余白をまとめてチェックします',
-      done: !!state.validated, blocked: false,
+      desc: validationDesc(info.validation),
+      done: !!(info.validation && info.validation.passed), blocked: false,
       action: { label: '検証する', run: () => { switchTab('output'); $('#btn-validate').click(); } },
     },
     {
@@ -289,6 +286,15 @@ function openLineCreators(url = LINE_CREATORS_URL) {
 function markSubmitOpened() {
   writeLS('submit.opened', '1');
   renderGuide();
+}
+
+/** 前回の検証結果の説明。結果はサーバーに保存されるので、再起動しても残ります。 */
+function validationDesc(v) {
+  if (!v || !v.at) return 'サイズ・透過・容量・余白をまとめてチェックします';
+  const when = v.at.replace('T', ' ').slice(5, 16);  // 例: 09-22 14:05
+  if (v.stale) return `前回（${when}）のあとに画像が変わりました。もう一度検証してください`;
+  if (v.errors) return `前回（${when}）の検証でエラーが${v.errors}件ありました`;
+  return `${when} に${v.checked}件を検証し、エラーなし`;
 }
 
 function renderGuide() {
@@ -1186,7 +1192,8 @@ async function refreshStickers() {
   const d = await api('/api/stickers');
   state.stickers = d.stickers;
   if (state.info) state.info.stickers = d.stickers;
-  state.validated = false;  // 画像が変わったので検証をやり直す必要があります
+  // 画像が変わっていれば、サーバー側で「検証済み」が自動で外れます
+  if (d.validation && state.info) state.info.validation = d.validation;
   renderGrid();
   fillDesignTargets();
   renderGuide();
@@ -1554,7 +1561,7 @@ $('#btn-validate').addEventListener('click', () => withBusy($('#btn-validate'), 
     d.items.forEach((it) => it.issues.forEach((i) =>
       lines.push(`<div class="line ${i.severity}">[${i.severity}] ${escapeHtml(it.file)}: ${escapeHtml(i.message)}</div>`)));
     box.innerHTML = lines.join('');
-    state.validated = d.checked > 0 && d.errors === 0;
+    if (d.validation) state.info.validation = d.validation;
     renderGuide();
     toast(d.errors ? `検証しました: エラー ${d.errors}件` : `${d.checked}件を検証しました。エラーはありません`, d.errors > 0);
   } catch (e) {
