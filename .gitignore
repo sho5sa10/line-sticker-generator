@@ -44,3 +44,6 @@ fonts/*
 !fonts/README.md
 data/listing.json
 data/sales.json
+output/validation.json
+# マスター画像の履歴（差し替え時の自動バックアップ）
+data/character/character_master_*.png
