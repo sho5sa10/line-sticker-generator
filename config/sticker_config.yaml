@@ -120,3 +120,13 @@ output:
   log: "output/generation.log"
   state: "output/state.json"
   gallery: "output/gallery.html"
+
+# --- ローカルLLM（文章づくりの補助。画像は作りません） ---------------
+# OpenAI 互換の API を持つローカルサーバー（ik_llama.cpp / llama.cpp の llama-server、
+# Ollama など）を使います。料金はかかりません。サーバーが止まっていても他の機能は使えます。
+llm:
+  base_url: "http://127.0.0.1:11434/v1"
+  model: "local"             # llama-server は何でも可。Ollama ならモデル名を書く
+  timeout_sec: 600           # CPU だけで動かすと時間がかかるため長め
+  max_tokens: 4096
+  disable_thinking: true     # 「考える時間」を省いて速く答えさせる（対応するモデルのみ）

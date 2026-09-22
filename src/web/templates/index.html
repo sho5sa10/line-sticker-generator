@@ -145,6 +145,9 @@
             <span class="hint">直接書き換えてもかまいません</span>
             <button class="btn small ghost" id="btn-recompose" hidden
                     data-tip="手で書き換えた内容を捨てて、上の選択内容から説明文を作り直します">選択内容で作り直す</button>
+            <button class="btn small" id="btn-llm-polish"
+                    data-tip="ローカルAIが、いまの説明文を絵にしやすい具体的な文章に書き直します（無料・保存はしません）">ローカルAIで整える</button>
+            <span class="llm-status" data-llm-status></span>
           </div>
           <div class="manual-note" id="manual-note" hidden>
             説明文を手で書き換えたので、上の選択を変えても説明文は自動で変わりません。
@@ -260,12 +263,36 @@
         <button class="btn" id="btn-row-add">行を追加</button>
         <span class="count" id="csv-count"></span>
       </div>
+      <div class="group">
+        <button class="btn" id="btn-llm-fill"
+                data-tip="ポーズか表情が空欄の行を、ローカルAIがセリフに合わせて埋めます（無料）。保存するまでCSVは変わりません">ポーズ・表情の空欄をAIで埋める</button>
+      </div>
       <div class="group right">
         <span class="hint">保存すると data/stickers.csv を更新します（上書き前に .bak を作成）</span>
         <button class="btn primary" id="btn-csv-save"
                 data-tip="data/stickers.csv を更新します。画像は作り直されません">CSVを保存</button>
       </div>
     </div>
+    <div class="llm-box" id="llm-phrases-box">
+      <div class="llm-head">
+        <b>ローカルAIでセリフの案を出す</b>
+        <span class="llm-status" data-llm-status></span>
+      </div>
+      <div class="llm-form">
+        <label>テーマ
+          <input type="text" id="llm-theme" maxlength="100" placeholder="例）在宅ワーク、家族との連絡、推し活、ていねいな敬語"></label>
+        <label>件数
+          <select id="llm-count"><option>5</option><option selected>10</option><option>20</option><option>40</option></select></label>
+        <button class="btn primary" id="btn-llm-phrases"
+                data-tip="キャラクターとテーマに合うセリフ・ポーズ・表情・カテゴリを考えます。CPUだけで動かすため、10件で1分ほどかかります">案を出す</button>
+      </div>
+      <div id="llm-phrases-result" hidden>
+        <div class="llm-list" id="llm-phrases-list"></div>
+        <button class="btn" id="btn-llm-phrases-add">チェックした案を表に追加</button>
+        <span class="hint">表に追加しても、「CSVを保存」を押すまでCSVは変わりません。</span>
+      </div>
+    </div>
+
     <div class="tablewrap">
       <table class="sheet">
         <thead>
@@ -470,7 +497,11 @@
         <div class="lst-actions">
           <label>どのセリフから作る？
             <select id="lst-target" data-tip="複数のセットを申請するときは、セットごとに作ってタイトルを変えてください"></select></label>
-          <button type="button" class="btn primary" id="btn-listing-suggest">自動で作る</button>
+          <button type="button" class="btn primary" id="btn-listing-suggest"
+                  data-tip="テンプレートから3つの案を作ります（すぐにできます）">自動で作る</button>
+          <button type="button" class="btn" id="btn-llm-listing"
+                  data-tip="ローカルAIが自然な文章で案を作ります（無料・1分ほどかかります）。文字数やルールは自動でチェックします">ローカルAIで作る</button>
+          <span class="llm-status" data-llm-status></span>
           <button type="button" class="btn" id="btn-listing-save" data-tip="data/listing.json に保存します">保存</button>
         </div>
         <p class="hint" id="lst-profile-hint" hidden>キャラクターの特徴が未入力のため、呼び名が「キャラクター」になっています。
