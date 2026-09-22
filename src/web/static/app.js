@@ -1226,9 +1226,38 @@ function resetJobUi(title) {
   $('#job-fill').style.width = '0%';
   $('#job-api').textContent = '';
   $('#btn-cancel').style.display = '';
+  setJobCompact(false);
   $('#job-bar').classList.add('open');
+  syncJobBarSpace();
 }
-function closeJobBar() { $('#job-bar').classList.remove('open'); }
+function closeJobBar() {
+  $('#job-bar').classList.remove('open');
+  syncJobBarSpace();
+}
+
+/** 進捗バーを1行だけにする（ログは「ログを見る」で開けます）。 */
+function setJobCompact(on) {
+  $('#job-bar').classList.toggle('compact', on);
+  $('#job-bar').classList.remove('log-open');
+  $('#btn-job-log').hidden = !on;
+  $('#btn-job-log').textContent = 'ログを見る';
+  syncJobBarSpace();
+}
+
+/** 画面の下に固定された進捗バーの高さぶん、ページの下に余白を作ります（最後まで下にスクロールできるように）。 */
+function syncJobBarSpace() {
+  const bar = $('#job-bar');
+  const h = bar.classList.contains('open') ? bar.getBoundingClientRect().height : 0;
+  document.body.style.paddingBottom = h ? `${Math.ceil(h) + 8}px` : '';
+}
+new ResizeObserver(syncJobBarSpace).observe($('#job-bar'));
+
+$('#btn-job-log').addEventListener('click', () => {
+  const bar = $('#job-bar');
+  const open = bar.classList.toggle('log-open');
+  $('#btn-job-log').textContent = open ? 'ログを隠す' : 'ログを見る';
+  syncJobBarSpace();
+});
 $('#btn-job-close').addEventListener('click', closeJobBar);
 $('#btn-cancel').addEventListener('click', async () => {
   await api('/api/job/cancel', { method: 'POST' });
@@ -1261,12 +1290,17 @@ async function pollJob() {
     div.textContent = `${ev.time} ${ev.id ? ev.id + ' ' : ''}${ev.message}`;
     log.appendChild(div);
   });
-  if (job.events.length) log.scrollTop = log.scrollHeight;
+  if (job.events.length) {
+    log.scrollTop = log.scrollHeight;
+    syncJobBarSpace();  // ログが増えてバーが高くなった分、下の余白も広げます
+  }
 
   if (job.status !== 'running') {
     clearInterval(state.poller);
     state.poller = null;
     $('#btn-cancel').style.display = 'none';
+    // 終わったら1行に縮めて、下の画面を隠さないようにします（失敗したときはログを出したまま）
+    setJobCompact(job.status !== 'failed');
     $('#job-title').textContent = {
       finished: '完了しました', failed: '失敗しました', cancelled: '中止しました',
     }[job.status] || job.status;
