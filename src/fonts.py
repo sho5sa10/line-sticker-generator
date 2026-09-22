@@ -287,3 +287,15 @@ def current_font_id(config) -> str | None:
         if Path(f.path).resolve() == path and f.index == index and f.variation == variation:
             return f.id
     return None
+
+
+def portable_path(config, path: str) -> str:
+    """プロジェクト内のファイルならプロジェクトからの相対パス（/ 区切り）、それ以外はそのまま。
+
+    設定ファイルに絶対パスを書くと、プロジェクトのフォルダを移動したときに見つからなくなるためです。
+    """
+    p = Path(path)
+    try:
+        return p.resolve().relative_to(Path(config.root).resolve()).as_posix()
+    except ValueError:
+        return str(path)

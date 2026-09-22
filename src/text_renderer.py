@@ -69,6 +69,12 @@ def resolve_font_path(config) -> Path:
         if not p.is_absolute():
             p = config.root / p
         if not p.exists():
+            # プロジェクトのフォルダを移動すると、前の場所の絶対パスが残っていることがあります。
+            # 同じ名前のフォントが fonts/ にあれば、それを使います。
+            moved = config.root / "fonts" / Path(explicit.replace("\\", "/")).name
+            if moved.exists():
+                return moved
+        if not p.exists():
             raise FontNotFoundError(
                 f"設定された日本語フォントが見つかりません: {p}\n"
                 "config/sticker_config.yaml の font.path を修正してください。"
