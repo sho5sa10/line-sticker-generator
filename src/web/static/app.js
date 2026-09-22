@@ -190,6 +190,12 @@ function computeSteps(info) {
   // APIキーは必須ではありません（手持ち画像の取り込みだけでも最後まで進められます）。
   const ready = !info.font_error && !info.csv_error;
   const aiReady = info.api_key_set && info.master_ok;
+  // ZIPは「いまの完成画像から作ったもの」だけを完了とみなします（作り直し後の古いZIPは数えない）
+  const pkg = info.packages_status || { count: info.packages.length, latest: 0, stale: false };
+  const pkgStale = info.packages.length > 0 && pkg.stale;
+  const pkgReady = info.packages.length > 0 && !pkg.stale;
+  // LINEを開いたのが、いまのZIPを作ったあとなら完了
+  const submitted = pkgReady && Number(readLS('submit.opened', '0')) >= pkg.latest && pkg.latest > 0;
 
   return [
     {
@@ -254,20 +260,22 @@ function computeSteps(info) {
     },
     {
       n: 7, key: 'package', title: '提出用ZIPを作る',
-      desc: info.packages.length
-        ? `${info.packages.length}個のZIPができています`
-        : 'main画像・tab画像も一緒に作ります',
-      done: info.packages.length > 0, blocked: false,
+      desc: !info.packages.length
+        ? 'main画像・tab画像も一緒に作ります'
+        : pkgStale
+          ? 'いまあるZIPは前の画像で作ったものです。作り直してください'
+          : `${info.packages.length}個のZIPができています`,
+      done: pkgReady, blocked: false,
       action: { label: 'ZIPを作る', run: () => { switchTab('output'); $('#btn-package').click(); } },
     },
     {
       n: 8, key: 'submit', title: 'LINEに登録・申請',
-      desc: readLS('submit.opened', '0') === '1'
+      desc: submitted
         ? 'LINE Creators Market を開きました。審査に出したら完了です'
-        : info.packages.length
+        : pkgReady
           ? 'LINE Creators Market を開いて、ZIPをアップロードします'
           : 'ZIPができたら、LINE Creators Market で登録・申請します',
-      done: readLS('submit.opened', '0') === '1', blocked: false,
+      done: submitted, blocked: false,
       action: { label: 'LINE Creators Market を開く', run: () => openLineCreators() },
       help: 'LINE Creators Market（公式サイト）を別タブで開きます。'
           + '登録に使うタイトル・説明文は「検証・出力」タブで自動作成できます。'
@@ -284,7 +292,7 @@ function openLineCreators(url = LINE_CREATORS_URL) {
 }
 
 function markSubmitOpened() {
-  writeLS('submit.opened', '1');
+  writeLS('submit.opened', String(Math.floor(Date.now() / 1000)));
   renderGuide();
 }
 
@@ -1224,6 +1232,7 @@ async function refreshStickers() {
   if (state.info) state.info.stickers = d.stickers;
   // 画像が変わっていれば、サーバー側で「検証済み」が自動で外れます
   if (d.validation && state.info) state.info.validation = d.validation;
+  if (d.packages_status && state.info) state.info.packages_status = d.packages_status;
   renderGrid();
   fillDesignTargets();
   renderGuide();
@@ -1622,6 +1631,7 @@ $('#btn-package').addEventListener('click', () => withBusy($('#btn-package'), '�
       state.info.has_main = true;
       state.info.has_tab = true;
       state.info.packages = d.packages.filter((p) => p.downloadable).map((p) => p.name);
+      if (d.packages_status) state.info.packages_status = d.packages_status;
       renderGuide();
     }
     loadAssets();

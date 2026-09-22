@@ -833,3 +833,30 @@ def test_validation_result_survives_restart(app, tmp_config):
     os.utime(final, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
     after = client.get("/api/stickers").get_json()["validation"]
     assert after["stale"] is True and after["passed"] is False
+
+
+# --- 作り直し後の古いZIPは「完了」にしない ---------------------------------
+def test_packages_become_stale_when_images_change(client, tmp_config):
+    import os
+
+    st = lambda: client.get("/api/state").get_json()["packages_status"]  # noqa: E731
+    assert st() == {"count": 0, "latest": 0, "stale": False}
+
+    ip.save_png(make_character((370, 320)), tmp_config.dir_final / "001.png")
+    zp = tmp_config.dir_packages / "line_stickers_001_008.zip"
+    zp.parent.mkdir(parents=True, exist_ok=True)
+    zp.write_bytes(b"PK")
+    final = tmp_config.dir_final / "001.png"
+    t = final.stat().st_mtime
+    os.utime(zp, (t + 10, t + 10))
+    assert st()["stale"] is False and st()["count"] == 1
+
+    # 完成画像がZIPより新しくなった（作り直した）
+    os.utime(final, (t + 20, t + 20))
+    assert st()["stale"] is True
+    assert client.get("/api/stickers").get_json()["packages_status"]["stale"] is True
+
+    # 完成画像を退避して1枚も無い
+    os.utime(final, (t, t))
+    final.unlink()
+    assert st()["stale"] is True

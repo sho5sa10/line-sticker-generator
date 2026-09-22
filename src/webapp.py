@@ -222,6 +222,21 @@ def create_app(config=None) -> Flask:
             "sale": sales.get(entry.id, ""),
         }
 
+    def packages_status(cfg_) -> dict:
+        """ZIPがいまの完成画像から作られたものか。
+
+        ZIPより新しい完成画像がある、または完成画像が1枚も無いときは「古い」とみなします
+        （キャラクターを作り直したあとに、前のキャラのZIPを完了扱いしないため）。
+        """
+        zips = list(cfg_.dir_packages.glob("*.zip"))
+        finals = list(cfg_.dir_final.glob("*.png"))
+        if not zips:
+            return {"count": 0, "latest": 0, "stale": False}
+        latest_zip = max(z.stat().st_mtime for z in zips)
+        latest_final = max((f.stat().st_mtime for f in finals), default=0)
+        stale = not finals or latest_final > latest_zip
+        return {"count": len(zips), "latest": int(latest_zip), "stale": stale}
+
     def statuses(cfg_, entries) -> list[dict]:
         sales = sales_mod.load_sales(cfg_)
         return [sticker_status(cfg_, e, sales) for e in entries]
@@ -273,6 +288,7 @@ def create_app(config=None) -> Flask:
                 "has_main": (cfg_.dir_main / "main.png").exists(),
                 "has_tab": (cfg_.dir_tab / "tab.png").exists(),
                 "packages": packages,
+                "packages_status": packages_status(cfg_),
                 "validation": vd.load_result(cfg_),
                 "line_spec": {
                     "sticker": list(cfg_.sticker_size),
@@ -761,7 +777,8 @@ def create_app(config=None) -> Flask:
         except CsvLoadError as exc:
             return jsonify({"error": str(exc)}), 400
         cfg_ = current_config()
-        return jsonify({"stickers": statuses(cfg_, entries), "validation": vd.load_result(cfg_)})
+        return jsonify({"stickers": statuses(cfg_, entries), "validation": vd.load_result(cfg_),
+                        "packages_status": packages_status(cfg_)})
 
     @app.post("/api/stickers")
     def api_stickers_post():
@@ -1163,6 +1180,7 @@ def create_app(config=None) -> Flask:
                     }
                     for r in results
                 ],
+                "packages_status": packages_status(cfg_),
             }
         )
 
