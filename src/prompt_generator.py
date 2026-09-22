@@ -57,7 +57,10 @@ Draw the character only. Absolutely no text, no letters, no Japanese characters,
 no kanji, no kana, no numbers, no speech balloons, no captions, no logo, no signature.
 Fully transparent background (alpha channel), no background color, no shadow on the ground.
 Single character, centered, full body visible, with generous empty margin on all four sides.
-Do not crop any part of the body."""
+The WHOLE character, from the top of the head (including ears or hair) down to the bottom of the feet,
+must be inside the image. Keep the character at about 70% of the image height,
+with clear empty space above the head and below the feet.
+Do not crop any part of the body, not even the feet."""
 
 # キャラクター固有の特徴（髪型・服装など）はここに書きません。
 # 書くとマスタープロンプトでキャラクターを変えたときに矛盾するためです。

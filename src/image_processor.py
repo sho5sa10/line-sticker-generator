@@ -232,3 +232,31 @@ def save_png(
 
     p.write_bytes(data)
     return p, len(data), warnings
+
+
+def cropped_sides(img: Image.Image, *, band: int = 2, min_ratio: float = 0.02) -> list[str]:
+    """キャラクターが画像の端で切れていそうな辺（"top" / "bottom" / "left" / "right"）。
+
+    透過画像で、端から band ピクセル以内に不透明な画素が、その辺の長さの min_ratio 以上
+    並んでいれば「はみ出している（切れている）」とみなします。
+    背景が透明でない画像は判定できないので空を返します。
+    """
+    rgba = img.convert("RGBA")
+    alpha = rgba.getchannel("A")
+    if alpha.getextrema()[0] > ALPHA_THRESHOLD:  # 透明な部分が無い＝判定できない
+        return []
+    w, h = rgba.size
+    boxes = {
+        "top": (0, 0, w, band),
+        "bottom": (0, h - band, w, h),
+        "left": (0, 0, band, h),
+        "right": (w - band, 0, w, h),
+    }
+    sides = []
+    for side, box in boxes.items():
+        strip = alpha.crop(box)
+        opaque = sum(1 for a in strip.getdata() if a > 128)
+        length = w if side in ("top", "bottom") else h
+        if opaque / band >= length * min_ratio:
+            sides.append(side)
+    return sides

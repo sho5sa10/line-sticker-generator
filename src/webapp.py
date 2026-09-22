@@ -381,6 +381,8 @@ def create_app(config=None) -> Flask:
             try:
                 with Image.open(p) as im:
                     info.update(width=im.width, height=im.height, mode=im.mode)
+                    # 体が画像の端で切れていないか（全身が入っていないとスタンプの絵も切れます）
+                    info["cropped_sides"] = ip.cropped_sides(im)
                 info["mtime"] = int(p.stat().st_mtime)
                 info["size_kb"] = round(p.stat().st_size / 1024, 1)
             except Exception as exc:  # noqa: BLE001
@@ -578,6 +580,10 @@ def create_app(config=None) -> Flask:
         job.api_calls += 1
         job.done = 1
         job.log("ok", "マスター画像を作成しました")
+        with Image.open(target) as im:
+            sides = ip.cropped_sides(im)
+        if sides:
+            job.log("warn", "キャラクターが画像の端で切れているようです。全身が入るよう、作り直すか履歴から戻してください")
 
     @app.post("/api/master/generate")
     def api_master_generate():

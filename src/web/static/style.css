@@ -714,3 +714,11 @@ main { padding: 16px; max-width: 1500px; margin: 0 auto; }
 .jobbar.compact:not(.log-open) .bar,
 .jobbar.compact:not(.log-open) .joblog { display: none; }
 .jobbar.compact:not(.log-open) { padding-top: 8px; padding-bottom: 8px; }
+
+/* マスター画像の体が切れているときの警告 */
+.crop-warn {
+  margin-top: 8px; padding: 8px 10px; border-radius: 8px; font-size: 12px; line-height: 1.6;
+  color: var(--fg); background: color-mix(in srgb, var(--warn) 14%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--line));
+}
+.crop-warn b { color: var(--warn); }

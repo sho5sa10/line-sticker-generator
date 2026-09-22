@@ -569,6 +569,16 @@ async function loadMaster() {
     .slice().reverse()
     .map((b) => `<option value="${escapeHtml(b)}">${escapeHtml(b)}</option>`).join('');
 
+  // 体が画像の端で切れていないか
+  const sides = m.cropped_sides || [];
+  const sideJa = { top: '上', bottom: '下', left: '左', right: '右' };
+  $('#master-crop-warn').hidden = !sides.length;
+  $('#master-crop-warn').innerHTML = sides.length
+    ? `<b>キャラクターが画像の${sides.map((s) => sideJa[s]).join('・')}の端で切れています。</b><br>
+       このままだと、スタンプの絵も切れてしまいます。「AIでマスター画像を作る」で作り直すか、
+       全身が入っている画像を履歴から戻してください。`
+    : '';
+
   // 既存画像との食い違い警告
   const warn = $('#master-warn');
   if (m.raw_count > 0) {
@@ -1299,8 +1309,8 @@ async function pollJob() {
     clearInterval(state.poller);
     state.poller = null;
     $('#btn-cancel').style.display = 'none';
-    // 終わったら1行に縮めて、下の画面を隠さないようにします（失敗したときはログを出したまま）
-    setJobCompact(job.status !== 'failed');
+    // 終わったら1行に縮めて、下の画面を隠さないようにします（失敗・警告があるときはログを出したまま）
+    setJobCompact(job.status !== 'failed' && !$('#job-log .warn, #job-log .error'));
     $('#job-title').textContent = {
       finished: '完了しました', failed: '失敗しました', cancelled: '中止しました',
     }[job.status] || job.status;
