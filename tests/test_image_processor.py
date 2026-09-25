@@ -112,3 +112,21 @@ def test_save_png_reduces_when_over_limit(tmp_path):
 def test_load_rgba_missing_file(tmp_path):
     with pytest.raises(ip.ImageProcessingError):
         ip.load_rgba(tmp_path / "nope.png")
+
+
+# --- 体が画像の端で切れていないか ---------------------------------------------
+def test_cropped_sides_detects_body_cut_off_at_bottom():
+    from PIL import Image, ImageDraw
+
+    from src.image_processor import cropped_sides
+
+    ok = Image.new("RGBA", (200, 200), (0, 0, 0, 0))
+    ImageDraw.Draw(ok).ellipse((40, 30, 160, 170), fill=(255, 200, 0, 255))
+    assert cropped_sides(ok) == []
+
+    cut = Image.new("RGBA", (200, 200), (0, 0, 0, 0))
+    ImageDraw.Draw(cut).rectangle((50, 20, 150, 199), fill=(255, 200, 0, 255))  # 下の端まで体がある
+    assert cropped_sides(cut) == ["bottom"]
+
+    opaque = Image.new("RGBA", (200, 200), (255, 255, 255, 255))  # 透過なし＝判定しない
+    assert cropped_sides(opaque) == []

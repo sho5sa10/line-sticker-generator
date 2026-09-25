@@ -29,6 +29,7 @@ from . import image_processor as ip
 from . import importer
 from . import sales as sales_mod
 from . import listing as listing_mod
+from . import llm as llm_mod
 from . import package_builder as pkg
 from . import pipeline
 from . import validator as vd
@@ -380,6 +381,8 @@ def create_app(config=None) -> Flask:
             try:
                 with Image.open(p) as im:
                     info.update(width=im.width, height=im.height, mode=im.mode)
+                    # 体が画像の端で切れていないか（全身が入っていないとスタンプの絵も切れます）
+                    info["cropped_sides"] = ip.cropped_sides(im)
                 info["mtime"] = int(p.stat().st_mtime)
                 info["size_kb"] = round(p.stat().st_size / 1024, 1)
             except Exception as exc:  # noqa: BLE001
@@ -577,6 +580,10 @@ def create_app(config=None) -> Flask:
         job.api_calls += 1
         job.done = 1
         job.log("ok", "マスター画像を作成しました")
+        with Image.open(target) as im:
+            sides = ip.cropped_sides(im)
+        if sides:
+            job.log("warn", "キャラクターが画像の端で切れているようです。全身が入るよう、作り直すか履歴から戻してください")
 
     @app.post("/api/master/generate")
     def api_master_generate():
@@ -1112,6 +1119,88 @@ def create_app(config=None) -> Flask:
         except sales_mod.SalesError as exc:
             return jsonify({"error": str(exc)}), 400
         return jsonify({"sales": sales, "labels": sales_mod.STATUS_LABELS})
+
+    # ---------- ローカルLLM（文章づくりの補助。料金なし） ----------
+    def _character_text(cfg_, body: dict) -> str:
+        """画面の説明文（未保存でも）を優先し、無ければ保存済みの説明文を使います。"""
+        text = str(body.get("character") or "").strip()
+        if not text and cfg_.master_prompt_ja_path.exists():
+            text = cfg_.master_prompt_ja_path.read_text(encoding="utf-8").strip()
+        return text[:1000]
+
+    def _llm_call(fn):
+        try:
+            return fn()
+        except llm_mod.LLMError as exc:
+            return jsonify({"error": str(exc)}), 502
+
+    @app.get("/api/llm/status")
+    def api_llm_status():
+        return jsonify(llm_mod.LocalLLM(current_config()).status())
+
+    @app.post("/api/llm/phrases")
+    def api_llm_phrases():
+        """テーマに合うセリフの案を作ります（CSVには保存しません）。"""
+        cfg_ = current_config()
+        body = request.get_json(silent=True) or {}
+        try:
+            entries = entries_or_error()
+        except CsvLoadError:
+            entries = []
+        examples = [{"text": e.text, "action": e.action, "expression": e.expression,
+                     "category": e.category} for e in entries[:4]]
+
+        def run():
+            rows = llm_mod.suggest_phrases(
+                llm_mod.LocalLLM(cfg_), theme=str(body.get("theme", "")).strip()[:100],
+                count=int(body.get("count", 10) or 10), character=_character_text(cfg_, body),
+                existing=[e.text for e in entries], examples=examples)
+            return jsonify({"rows": rows})
+        return _llm_call(run)
+
+    @app.post("/api/llm/fill")
+    def api_llm_fill():
+        """セリフに合うポーズ・表情を作ります（CSVには保存しません）。"""
+        cfg_ = current_config()
+        body = request.get_json(silent=True) or {}
+        texts = [str(t)[:40] for t in (body.get("texts") or []) if str(t).strip()][:100]
+        if not texts:
+            return jsonify({"error": "セリフがありません"}), 400
+        return _llm_call(lambda: jsonify({"results": llm_mod.fill_pose(
+            llm_mod.LocalLLM(cfg_), texts, character=_character_text(cfg_, body))}))
+
+    @app.post("/api/llm/listing")
+    def api_llm_listing():
+        """申請用のタイトル・説明文を作ります（保存はしません）。"""
+        cfg_ = current_config()
+        body = request.get_json(silent=True) or {}
+        try:
+            entries = entries_or_error()
+        except CsvLoadError as exc:
+            return jsonify({"error": str(exc)}), 400
+        ids = {str(i) for i in body.get("ids") or []}
+        if ids:
+            entries = [e for e in entries if e.id in ids] or entries
+        try:
+            volume = max(1, int(body.get("volume") or 1))
+        except (TypeError, ValueError):
+            volume = 1
+
+        def run():
+            result = llm_mod.write_listing(llm_mod.LocalLLM(cfg_), character=_character_text(cfg_, body),
+                                           texts=[e.text for e in entries], volume=volume)
+            return jsonify({"listing": result, "issues": listing_mod.check_listing(result)})
+        return _llm_call(run)
+
+    @app.post("/api/llm/polish")
+    def api_llm_polish():
+        """キャラクターの説明文を、絵にしやすい文章に整えます（保存はしません）。"""
+        cfg_ = current_config()
+        body = request.get_json(silent=True) or {}
+        text = _character_text(cfg_, body)
+        if not text:
+            return jsonify({"error": "キャラクターの説明文がありません"}), 400
+        return _llm_call(lambda: jsonify({"text": llm_mod.polish_character(llm_mod.LocalLLM(cfg_), text)}))
 
     # ---------- 申請用のタイトル・説明文 ----------
     def _listing_payload(data: dict) -> dict:

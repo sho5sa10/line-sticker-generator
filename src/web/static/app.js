@@ -569,6 +569,16 @@ async function loadMaster() {
     .slice().reverse()
     .map((b) => `<option value="${escapeHtml(b)}">${escapeHtml(b)}</option>`).join('');
 
+  // 体が画像の端で切れていないか
+  const sides = m.cropped_sides || [];
+  const sideJa = { top: '上', bottom: '下', left: '左', right: '右' };
+  $('#master-crop-warn').hidden = !sides.length;
+  $('#master-crop-warn').innerHTML = sides.length
+    ? `<b>キャラクターが画像の${sides.map((s) => sideJa[s]).join('・')}の端で切れています。</b><br>
+       このままだと、スタンプの絵も切れてしまいます。「AIでマスター画像を作る」で作り直すか、
+       全身が入っている画像を履歴から戻してください。`
+    : '';
+
   // 既存画像との食い違い警告
   const warn = $('#master-warn');
   if (m.raw_count > 0) {
@@ -1226,9 +1236,38 @@ function resetJobUi(title) {
   $('#job-fill').style.width = '0%';
   $('#job-api').textContent = '';
   $('#btn-cancel').style.display = '';
+  setJobCompact(false);
   $('#job-bar').classList.add('open');
+  syncJobBarSpace();
 }
-function closeJobBar() { $('#job-bar').classList.remove('open'); }
+function closeJobBar() {
+  $('#job-bar').classList.remove('open');
+  syncJobBarSpace();
+}
+
+/** 進捗バーを1行だけにする（ログは「ログを見る」で開けます）。 */
+function setJobCompact(on) {
+  $('#job-bar').classList.toggle('compact', on);
+  $('#job-bar').classList.remove('log-open');
+  $('#btn-job-log').hidden = !on;
+  $('#btn-job-log').textContent = 'ログを見る';
+  syncJobBarSpace();
+}
+
+/** 画面の下に固定された進捗バーの高さぶん、ページの下に余白を作ります（最後まで下にスクロールできるように）。 */
+function syncJobBarSpace() {
+  const bar = $('#job-bar');
+  const h = bar.classList.contains('open') ? bar.getBoundingClientRect().height : 0;
+  document.body.style.paddingBottom = h ? `${Math.ceil(h) + 8}px` : '';
+}
+new ResizeObserver(syncJobBarSpace).observe($('#job-bar'));
+
+$('#btn-job-log').addEventListener('click', () => {
+  const bar = $('#job-bar');
+  const open = bar.classList.toggle('log-open');
+  $('#btn-job-log').textContent = open ? 'ログを隠す' : 'ログを見る';
+  syncJobBarSpace();
+});
 $('#btn-job-close').addEventListener('click', closeJobBar);
 $('#btn-cancel').addEventListener('click', async () => {
   await api('/api/job/cancel', { method: 'POST' });
@@ -1261,12 +1300,17 @@ async function pollJob() {
     div.textContent = `${ev.time} ${ev.id ? ev.id + ' ' : ''}${ev.message}`;
     log.appendChild(div);
   });
-  if (job.events.length) log.scrollTop = log.scrollHeight;
+  if (job.events.length) {
+    log.scrollTop = log.scrollHeight;
+    syncJobBarSpace();  // ログが増えてバーが高くなった分、下の余白も広げます
+  }
 
   if (job.status !== 'running') {
     clearInterval(state.poller);
     state.poller = null;
     $('#btn-cancel').style.display = 'none';
+    // 終わったら1行に縮めて、下の画面を隠さないようにします（失敗・警告があるときはログを出したまま）
+    setJobCompact(job.status !== 'failed' && !$('#job-log .warn, #job-log .error'));
     $('#job-title').textContent = {
       finished: '完了しました', failed: '失敗しました', cancelled: '中止しました',
     }[job.status] || job.status;
@@ -1327,7 +1371,8 @@ $('#csv-body').addEventListener('click', (e) => {
   $('#csv-count').textContent = `${$$('#csv-body tr').length}件`;
 });
 
-$('#btn-row-add').addEventListener('click', () => {
+/** 表の最後に1行足します（保存するまでCSVは変わりません）。 */
+function appendCsvRow(row = {}) {
   const rows = $$('#csv-body tr');
   const maxId = rows.reduce((m, r) => Math.max(m, parseInt(r.querySelector('[data-f=id]').value, 10) || 0), 0);
   const nextId = String(maxId + 1).padStart(3, '0');
@@ -1335,14 +1380,19 @@ $('#btn-row-add').addEventListener('click', () => {
   tr.className = 'dirty';
   tr.innerHTML = `
     <td><input data-f="id" value="${nextId}"></td>
-    <td><input data-f="text" value=""></td>
-    <td><input data-f="action" value=""></td>
-    <td><input data-f="expression" value=""></td>
-    <td><input data-f="category" value="basic"></td>
+    <td><input data-f="text" value="${escapeHtml(row.text || '')}"></td>
+    <td><input data-f="action" value="${escapeHtml(row.action || '')}"></td>
+    <td><input data-f="expression" value="${escapeHtml(row.expression || '')}"></td>
+    <td><input data-f="category" value="${escapeHtml(row.category || 'basic')}"></td>
     <td><button class="btn small" data-act="del">削除</button></td>`;
   $('#csv-body').appendChild(tr);
-  tr.querySelector('[data-f=text]').focus();
   state.csvDirty = true;
+  $('#csv-count').textContent = `${$$('#csv-body tr').length}件`;
+  return tr;
+}
+
+$('#btn-row-add').addEventListener('click', () => {
+  appendCsvRow().querySelector('[data-f=text]').focus();
 });
 
 $('#btn-csv-save').addEventListener('click', async () => {
@@ -1956,3 +2006,118 @@ $('#listing-form').addEventListener('click', async (e) => {
   }
   toast('コピーしました');
 });
+
+/* ------------------------------------------------------------------ */
+/* ローカルLLM（文章づくりの補助。料金なし）                            */
+/* ------------------------------------------------------------------ */
+/** いまの説明文（未保存でも画面の内容を使います）。 */
+function currentCharacterText() {
+  const box = $('#master-prompt');
+  return box ? box.value : '';
+}
+
+async function refreshLlmStatus() {
+  let d;
+  try { d = await api('/api/llm/status'); } catch (e) { d = { ok: false }; }
+  state.llmOk = !!d.ok;
+  $$('[data-llm-status]').forEach((el) => {
+    el.textContent = d.ok ? 'ローカルAI: 接続OK' : 'ローカルAI: 未起動';
+    el.classList.toggle('ok', !!d.ok);
+    el.dataset.tip = d.ok
+      ? `${d.base_url} につながっています（料金はかかりません）`
+      : 'ローカルAIのサーバーが動いていません。C:\\llm\\start_llm.bat をダブルクリックして起動してください';
+  });
+  return d.ok;
+}
+
+/** ローカルAIを呼ぶボタンの共通処理（未起動なら先に知らせます）。 */
+async function withLlm(btn, busyLabel, fn) {
+  if (!state.llmOk && !(await refreshLlmStatus())) {
+    toast('ローカルAIのサーバーが動いていません。C:\\llm\\start_llm.bat で起動してください', true);
+    return;
+  }
+  await withBusy(btn, busyLabel, async () => {
+    try { await fn(); } catch (err) { toast(err.message, true); refreshLlmStatus(); }
+  });
+}
+
+// キャラクターの説明文を整える
+$('#btn-llm-polish').addEventListener('click', (e) => withLlm(e.currentTarget, '整えています…', async () => {
+  const text = currentCharacterText().trim();
+  if (!text) { toast('先に説明文を作ってください', true); return; }
+  const d = await api('/api/llm/polish', { method: 'POST', body: { character: text } });
+  $('#master-prompt').value = d.text;
+  state.promptDirty = true;
+  setManualEdit(true);
+  updatePromptUnsaved();
+  toast('説明文を整えました。よければ「この内容で保存」を押してください（元に戻すなら「選択内容で作り直す」）');
+}));
+
+// セリフの案
+$('#btn-llm-phrases').addEventListener('click', (e) => withLlm(e.currentTarget, '考えています…', async () => {
+  const d = await api('/api/llm/phrases', {
+    method: 'POST',
+    body: { theme: $('#llm-theme').value, count: Number($('#llm-count').value), character: currentCharacterText() },
+  });
+  state.llmRows = d.rows;
+  $('#llm-phrases-list').innerHTML = d.rows.map((r, i) => `
+    <label class="llm-row">
+      <input type="checkbox" data-llm-row="${i}" checked>
+      <b>${escapeHtml(r.text)}</b>
+      <span>${escapeHtml(r.action)}</span>
+      <span>${escapeHtml(r.expression)}</span>
+      <small>${escapeHtml(genreLabel(r.category))}</small>
+    </label>`).join('') || '<p class="hint">案が出ませんでした。テーマを変えてもう一度試してください。</p>';
+  $('#llm-phrases-result').hidden = false;
+  toast(`${d.rows.length}件の案を出しました。使うものにチェックして表に追加してください`);
+}));
+
+$('#btn-llm-phrases-add').addEventListener('click', () => {
+  const picked = $$('#llm-phrases-list [data-llm-row]:checked').map((c) => state.llmRows[Number(c.dataset.llmRow)]);
+  if (!picked.length) { toast('追加する案にチェックを入れてください', true); return; }
+  picked.forEach((r) => appendCsvRow(r));
+  $('#llm-phrases-result').hidden = true;
+  toast(`${picked.length}件を表の最後に追加しました。「CSVを保存」で確定します`);
+});
+
+// ポーズ・表情の空欄を埋める
+$('#btn-llm-fill').addEventListener('click', (e) => {
+  const rows = $$('#csv-body tr').filter((tr) => {
+    const v = (f) => tr.querySelector(`[data-f=${f}]`).value.trim();
+    return v('text') && (!v('action') || !v('expression'));
+  });
+  if (!rows.length) { toast('ポーズか表情が空欄の行はありません'); return; }
+  withLlm(e.currentTarget, `${rows.length}件を考えています…`, async () => {
+    const texts = rows.map((tr) => tr.querySelector('[data-f=text]').value.trim());
+    const d = await api('/api/llm/fill', { method: 'POST', body: { texts, character: currentCharacterText() } });
+    let filled = 0;
+    rows.forEach((tr, i) => {
+      const r = d.results[i] || {};
+      ['action', 'expression'].forEach((f) => {
+        const input = tr.querySelector(`[data-f=${f}]`);
+        if (!input.value.trim() && r[f]) { input.value = r[f]; filled += 1; }
+      });
+      tr.classList.add('dirty');
+    });
+    state.csvDirty = true;
+    toast(`${filled}か所を埋めました。確認して「CSVを保存」を押してください`);
+  });
+});
+
+// 申請用のタイトル・説明文
+$('#btn-llm-listing').addEventListener('click', (e) => withLlm(e.currentTarget, '作成中…', async () => {
+  const d = await api('/api/llm/listing', {
+    method: 'POST',
+    body: { ids: listingTargetIds(), volume: listingVolume(), character: currentCharacterText() },
+  });
+  const c = { ...d.listing, creator: $('#lst-creator').value, copyright: $('#lst-copyright').value, ai: true };
+  listingCandidates = [c, ...listingCandidates.filter((x) => !x.ai)];
+  $('#lst-candidates').innerHTML = listingCandidates.map((x, i) =>
+    `<button type="button" class="opt${x.ai ? ' ai' : ''}" data-cand="${i}">${x.ai ? 'AI案' : `案${i}`}：${escapeHtml(x.title_ja || x.title_en)}</button>`).join('');
+  $('#lst-candidates-row').hidden = false;
+  applyCandidate(0);
+  const bad = Object.values(d.issues).filter((l) => l.length).length;
+  toast(bad ? `AIの案を入れました。直したほうがよい項目が${bad}つあります` : 'AIの案を入れました。ルールのチェックも通っています', !!bad);
+}));
+
+refreshLlmStatus();
