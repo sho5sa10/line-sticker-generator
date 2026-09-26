@@ -415,6 +415,72 @@ def _generate_variants(config, args, entries) -> int:
     return EXIT_OK
 
 
+def cmd_variants_list(config, args) -> int:
+    """候補の一覧を表示します（ファイルは作りません）。"""
+    try:
+        entries = load_stickers(config.csv_path)
+    except CsvLoadError as exc:
+        print(f"ERROR:\n  {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    if getattr(args, "id", None):
+        entries = [e for e in entries if e.id == args.id]
+        if not entries:
+            print(f"ERROR:\n  CSVにIDがありません: {args.id}", file=sys.stderr)
+            return EXIT_ERROR
+
+    data = vr.load(config)
+    found = vr.list_all(config, [e.id for e in entries], data)
+    if not found:
+        print("候補はまだありません。")
+        return EXIT_OK
+
+    for entry in entries:
+        sticker = found.get(entry.id)
+        if sticker is None:
+            continue
+        print(f"\n{entry.id}「{entry.text}」")
+        # いま採用中かどうかは sticker.adopted が正（verdict は人の判断の履歴）
+        print(f"\nCURRENT: {sticker.adopted or '-'}")
+        print("\nVARIANTS")
+        print("─" * 56)
+        for v in sticker.variants:
+            rating = v.human_rating if v.human_rating is not None else "-"
+            flags = ",".join(v.flags) if v.flags else "-"
+            verdict = "REGEN" if v.verdict == vr.VERDICT_REGEN else v.verdict
+            missing = "" if v.exists(config) else "  (画像なし)"
+            print(f"{v.variant_id:<6}{v.source:<8}{verdict:<9}rating:{rating:<4}"
+                  f"flags:{flags}{missing}")
+        print("─" * 56)
+    return EXIT_OK
+
+
+def cmd_variants_verdict(config, args) -> int:
+    """候補に人の判断（pending / rejected / regen）を付けます。"""
+    try:
+        item = vr.set_verdict(config, args.id, args.variant, args.set)
+    except vr.VariantError as exc:
+        print(f"ERROR:\n  {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    adopted = vr.get_sticker(config, args.id).adopted
+    print(f"{args.id}/{args.variant} の判断を {item['verdict']} にしました")
+    print(f"CURRENT（採用中）: {adopted or '-'}（変更していません）")
+    return EXIT_OK
+
+
+def cmd_variants_rate(config, args) -> int:
+    """候補に5段階の評価を付けます（--clear で消します）。"""
+    rating = None if args.clear else args.rating
+    try:
+        item = vr.set_rating(config, args.id, args.variant, rating)
+    except vr.VariantError as exc:
+        print(f"ERROR:\n  {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    value = item["human_rating"] if item["human_rating"] is not None else "なし"
+    print(f"{args.id}/{args.variant} の評価を {value} にしました")
+    return EXIT_OK
+
+
 def cmd_variants_adopt(config, args) -> int:
     """候補を採用します（APIは呼びません）。
 
@@ -670,10 +736,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("variants", help="候補の操作（APIを呼びません）")
     vsub = p.add_subparsers(dest="variants_command", required=True)
+    vp = vsub.add_parser("list", help="候補の一覧を表示する")
+    vp.add_argument("--id", help="1件だけ表示するときのID (例: 001)")
+    vp.set_defaults(func=cmd_variants_list)
+
     vp = vsub.add_parser("adopt", help="候補を採用して、原画・完成画像を作り直す")
     vp.add_argument("--id", required=True, help="スタンプのID (例: 001)")
     vp.add_argument("--variant", required=True, help="採用する候補のID (例: v002)")
     vp.set_defaults(func=cmd_variants_adopt)
+
+    vp = vsub.add_parser("verdict", help="候補に人の判断を付ける（採用は adopt を使います）")
+    vp.add_argument("--id", required=True, help="スタンプのID (例: 001)")
+    vp.add_argument("--variant", required=True, help="候補のID (例: v003)")
+    vp.add_argument("--set", required=True, choices=list(vr.SETTABLE_VERDICTS),
+                    help="pending（未評価）/ rejected（不採用）/ regen（作り直したい）")
+    vp.set_defaults(func=cmd_variants_verdict)
+
+    vp = vsub.add_parser("rate", help="候補に5段階の評価を付ける（将来の重み決め用に残すだけ）")
+    vp.add_argument("--id", required=True, help="スタンプのID (例: 001)")
+    vp.add_argument("--variant", required=True, help="候補のID (例: v003)")
+    g = vp.add_mutually_exclusive_group(required=True)
+    g.add_argument("--rating", type=int, choices=[1, 2, 3, 4, 5], help="1（ダメ）〜5（非常に良い）")
+    g.add_argument("--clear", action="store_true", help="評価を消す")
+    vp.set_defaults(func=cmd_variants_rate)
 
     p = sub.add_parser("render", help="既存の原画からセリフ合成のみ再実行（APIを呼びません）")
     _add_selection_args(p)

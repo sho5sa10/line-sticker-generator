@@ -36,6 +36,12 @@ VERDICT_ADOPTED = "adopted"
 VERDICT_REJECTED = "rejected"
 VERDICT_REGEN = "regen"
 VERDICTS = (VERDICT_PENDING, VERDICT_ADOPTED, VERDICT_REJECTED, VERDICT_REGEN)
+# 人が手で設定できる値。adopted は「採用」操作の結果としてのみ付きます
+# （いま採用中かどうかは sticker.adopted が正のため）。
+SETTABLE_VERDICTS = (VERDICT_PENDING, VERDICT_REJECTED, VERDICT_REGEN)
+
+RATING_MIN = 1
+RATING_MAX = 5
 
 
 # ---------------------------------------------------------------------------
@@ -429,8 +435,63 @@ def _generate_for_entry(config, state: dict, entry, count: int, generator,
 # ---------------------------------------------------------------------------
 # 採用（Phase 1c）
 # ---------------------------------------------------------------------------
-class AdoptError(Exception):
+class VariantError(Exception):
+    """候補の操作ができない場合に送出されます（状態ファイルは更新されません）。"""
+
+
+class AdoptError(VariantError):
     """候補を採用できない場合に送出されます（状態ファイルは更新されません）。"""
+
+
+def _find_item(config, data: dict, sticker_id: str, variant_id: str) -> tuple[dict, dict]:
+    """(記録, 候補) を返します。見つからなければ保存せずに例外にします。"""
+    sticker = get_sticker(config, sticker_id, data)
+    if sticker is None or sticker.find(variant_id) is None:
+        have = ", ".join(v.variant_id for v in sticker.variants) if sticker else "なし"
+        raise VariantError(f"候補が見つかりません: {sticker_id}/{variant_id}（ある候補: {have}）")
+    record = ensure_record(config, data, sticker_id)
+    item = next((v for v in record.get("variants", [])
+                 if isinstance(v, dict) and v.get("variant_id") == variant_id), None)
+    if item is None:  # pragma: no cover - get_sticker と ensure_record は同じ元を見ています
+        raise VariantError(f"候補が見つかりません: {sticker_id}/{variant_id}")
+    return record, item
+
+
+def set_verdict(config, sticker_id: str, variant_id: str, verdict: str,
+                *, data: dict | None = None) -> dict:
+    """人の判断（pending / rejected / regen）を記録します。
+
+    いま採用中かどうか（sticker.adopted）は変更しません。採用の切り替えは adopt() です。
+    """
+    if verdict not in SETTABLE_VERDICTS:
+        raise VariantError(
+            f"指定できない判断です: {verdict}"
+            f"（指定できるのは {', '.join(SETTABLE_VERDICTS)}。"
+            "採用は variants adopt を使ってください）"
+        )
+    state = load(config) if data is None else data
+    _record, item = _find_item(config, state, sticker_id, variant_id)
+    item["verdict"] = verdict
+    save(config, state)
+    return item
+
+
+def set_rating(config, sticker_id: str, variant_id: str, rating: int | None,
+               *, data: dict | None = None) -> dict:
+    """人の5段階評価を記録します（None で消します）。
+
+    スコアリングには使いません。将来の重み決めのために残すだけです。
+    """
+    if rating is not None:
+        if not isinstance(rating, int) or isinstance(rating, bool):
+            raise VariantError(f"評価は整数で指定してください: {rating}")
+        if not RATING_MIN <= rating <= RATING_MAX:
+            raise VariantError(f"評価は{RATING_MIN}〜{RATING_MAX}で指定してください: {rating}")
+    state = load(config) if data is None else data
+    _record, item = _find_item(config, state, sticker_id, variant_id)
+    item["human_rating"] = rating
+    save(config, state)
+    return item
 
 
 def adopt(config, entry, variant_id: str, *, style=None, data: dict | None = None) -> dict:
