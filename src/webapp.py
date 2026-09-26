@@ -28,6 +28,7 @@ from . import gallery as gallery_mod
 from . import image_processor as ip
 from . import importer
 from . import sales as sales_mod
+from . import variants as variants_mod
 from . import listing as listing_mod
 from . import llm as llm_mod
 from . import package_builder as pkg
@@ -810,6 +811,38 @@ def create_app(config=None) -> Flask:
         cfg_ = current_config()
         return jsonify({"stickers": statuses(cfg_, entries), "validation": vd.load_result(cfg_),
                         "packages_status": packages_status(cfg_)})
+
+    # ---------- 候補（variant）の読み取り ----------
+    @app.get("/api/variants")
+    def api_variants_get():
+        """CSVにある全スタンプの候補状況を返します（読み取りのみ）。"""
+        try:
+            entries = entries_or_error()
+        except CsvLoadError as exc:
+            return jsonify({"error": str(exc)}), 400
+        cfg_ = current_config()
+        state = variants_mod.load(cfg_)
+        found = variants_mod.list_all(cfg_, [e.id for e in entries], state)
+        return jsonify({
+            "schema": state.get("schema", variants_mod.SCHEMA),
+            "state_exists": cfg_.variants_path.exists(),
+            "stickers": {sid: sv.to_dict() for sid, sv in found.items()},
+        })
+
+    @app.get("/api/variants/<sticker_id>")
+    def api_variants_one(sticker_id: str):
+        cfg_ = current_config()
+        try:
+            known = {e.id for e in entries_or_error()}
+        except CsvLoadError as exc:
+            return jsonify({"error": str(exc)}), 400
+        if sticker_id not in known:
+            return jsonify({"error": f"IDが見つかりません: {sticker_id}"}), 404
+        sticker = variants_mod.get_sticker(cfg_, sticker_id)
+        if sticker is None:
+            return jsonify({"sticker_id": sticker_id, "adopted": None, "legacy": False,
+                            "variant_count": 0, "variants": []})
+        return jsonify(sticker.to_dict())
 
     @app.post("/api/stickers")
     def api_stickers_post():

@@ -26,6 +26,8 @@ output/main/*
 output/tab/*
 output/packages/*
 output/archive/
+output/variants/
+output/variants.json
 output/*.log
 output/state.json
 output/gallery.html

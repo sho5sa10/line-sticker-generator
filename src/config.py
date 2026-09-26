@@ -136,6 +136,19 @@ class Config:
         return self.resolve("output.packages", "output/packages")
 
     @property
+    def dir_variants(self) -> Path:
+        """候補画像の置き場。generated/ の外に置きます。
+
+        main/tab画像の自動選択 (package_builder.pick_source_image) が
+        generated/*.png を走査するため、候補が混ざらないようにするためです。
+        """
+        return self.resolve("output.variants", "output/variants")
+
+    @property
+    def variants_path(self) -> Path:
+        return self.resolve("output.variants_state", "output/variants.json")
+
+    @property
     def log_path(self) -> Path:
         return self.resolve("output.log", "output/generation.log")
 

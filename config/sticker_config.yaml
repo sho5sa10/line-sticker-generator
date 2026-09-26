@@ -120,6 +120,10 @@ output:
   log: "output/generation.log"
   state: "output/state.json"
   gallery: "output/gallery.html"
+  # 1つのセリフに対する候補画像。generated/ の外に置きます
+  # （main/tab画像の自動選択が generated/*.png を走査するため）
+  variants: "output/variants"
+  variants_state: "output/variants.json"
 
 # --- ローカルLLM（文章づくりの補助。画像は作りません） ---------------
 # OpenAI 互換の API を持つローカルサーバー（ik_llama.cpp / llama.cpp の llama-server、

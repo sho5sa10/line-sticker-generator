@@ -1,0 +1,276 @@
+"""1つのセリフに対する候補画像（variant）の管理。
+
+Phase 1a では **読み取りだけ** を担当します。候補の生成・採用・再生成は行いません。
+
+責務の分け方:
+  output/variants/<id>/vNNN.png  候補の履歴（消さない）
+  output/generated/<id>.png      いま採用している原画（既存のまま）
+  output/final/<id>.png          いま採用している完成画像（既存のまま）
+  output/variants.json           候補のメタデータ
+
+既存環境には variants.json がありません。その場合は generated/<id>.png を
+「legacy の v001（採用中）」として *読み取り時だけ* 仮想的に扱います。
+ファイルのコピーや移動は一切行いません。
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+
+SCHEMA = 1
+
+# 候補の出どころ
+SOURCE_API = "api"          # 画像生成APIで作った
+SOURCE_IMPORT = "import"    # 手持ち画像を取り込んだ
+SOURCE_LEGACY = "legacy"    # variants.json 導入前からある generated/<id>.png
+
+# 人間の判断。Phase 1a では読み取るだけで、変更するAPIは作りません。
+VERDICT_PENDING = "pending"
+VERDICT_ADOPTED = "adopted"
+VERDICT_REJECTED = "rejected"
+VERDICT_REGEN = "regen"
+VERDICTS = (VERDICT_PENDING, VERDICT_ADOPTED, VERDICT_REJECTED, VERDICT_REGEN)
+
+
+# ---------------------------------------------------------------------------
+# データ構造
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class Variant:
+    """候補1件。file はプロジェクトからの相対パス（フォルダを移動しても動くように）。"""
+
+    variant_id: str
+    file: str
+    source: str = SOURCE_API
+    verdict: str = VERDICT_PENDING
+    created_at: str | None = None
+    human_rating: int | None = None
+    note: str = ""
+    flags: list[str] = field(default_factory=list)
+    extra: dict = field(default_factory=dict)
+
+    def path(self, config) -> Path:
+        p = Path(self.file)
+        return p if p.is_absolute() else (Path(config.root) / p)
+
+    def exists(self, config) -> bool:
+        return self.path(config).exists()
+
+    def to_dict(self) -> dict:
+        data = {
+            "variant_id": self.variant_id,
+            "file": self.file,
+            "created_at": self.created_at,
+            "source": self.source,
+            "verdict": self.verdict,
+            "human_rating": self.human_rating,
+            "note": self.note,
+            "flags": list(self.flags),
+        }
+        data.update(self.extra)
+        return data
+
+
+@dataclass
+class StickerVariants:
+    """1スタンプ分の候補一覧。"""
+
+    sticker_id: str
+    adopted: str | None = None          # いま採用している候補ID（これが正）
+    adopted_at: str | None = None
+    next_seq: int = 1
+    variants: list[Variant] = field(default_factory=list)
+    legacy: bool = False                # variants.json に記録が無く、仮想的に作った
+
+    @property
+    def variant_count(self) -> int:
+        return len(self.variants)
+
+    def find(self, variant_id: str) -> Variant | None:
+        return next((v for v in self.variants if v.variant_id == variant_id), None)
+
+    def adopted_variant(self) -> Variant | None:
+        return self.find(self.adopted) if self.adopted else None
+
+    def to_dict(self) -> dict:
+        return {
+            "sticker_id": self.sticker_id,
+            "adopted": self.adopted,
+            "adopted_at": self.adopted_at,
+            "next_seq": self.next_seq,
+            "legacy": self.legacy,
+            "variant_count": self.variant_count,
+            "variants": [v.to_dict() for v in self.variants],
+        }
+
+
+# ---------------------------------------------------------------------------
+# パス
+# ---------------------------------------------------------------------------
+def variant_dir(config, sticker_id: str) -> Path:
+    """候補の置き場 output/variants/<id>/。Phase 1a では作成しません。"""
+    return config.dir_variants / sticker_id
+
+
+def relative_file(config, path: str | Path) -> str:
+    """プロジェクト内なら相対パス（/ 区切り）にします。外ならそのまま。"""
+    p = Path(path)
+    try:
+        return p.resolve().relative_to(Path(config.root).resolve()).as_posix()
+    except (ValueError, OSError):
+        return str(path)
+
+
+# ---------------------------------------------------------------------------
+# 読み書き
+# ---------------------------------------------------------------------------
+def load(config) -> dict:
+    """variants.json を読みます。
+
+    無い場合・壊れている場合は空の状態を返します（例外は投げません）。
+    壊れている場合だけ、既存の StateStore と同じ方式で警告を出します。
+    """
+    path = config.variants_path
+    if not path.exists():
+        return _empty_state()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        print(f"WARNING: 候補の記録を読めないため、generated/ の画像だけを使います: {path}",
+              file=sys.stderr)
+        return _empty_state()
+    if not isinstance(data, dict) or not isinstance(data.get("stickers"), dict):
+        print(f"WARNING: 候補の記録の形式が不正です。generated/ の画像だけを使います: {path}",
+              file=sys.stderr)
+        return _empty_state()
+    data.setdefault("schema", SCHEMA)
+    data.setdefault("defaults", {})
+    return data
+
+
+def save(config, data: dict) -> Path:
+    """variants.json を原子的に書き換えます（.tmp に書いてから置換）。
+
+    Phase 1a では呼び出し箇所はありません（採用・生成は未実装）。
+    """
+    path = config.variants_path
+    out = dict(data)
+    out["schema"] = SCHEMA
+    out["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    out.setdefault("defaults", {})
+    out.setdefault("stickers", {})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+    return path
+
+
+def _empty_state() -> dict:
+    return {"schema": SCHEMA, "defaults": {}, "stickers": {}}
+
+
+# ---------------------------------------------------------------------------
+# 取得
+# ---------------------------------------------------------------------------
+def ensure_legacy_variant(config, sticker_id: str) -> StickerVariants | None:
+    """記録が無いスタンプを、generated/<id>.png を指す仮想の v001 として扱います。
+
+    **ファイルのコピー・移動はしません。variants.json も作りません。**
+    generated/<id>.png が無ければ None を返します。
+    """
+    src = config.dir_generated / f"{sticker_id}.png"
+    if not src.exists():
+        return None
+    v = Variant(
+        variant_id="v001",
+        file=relative_file(config, src),
+        source=SOURCE_LEGACY,
+        verdict=VERDICT_ADOPTED,
+        created_at=None,
+    )
+    return StickerVariants(sticker_id=sticker_id, adopted="v001", next_seq=2,
+                           variants=[v], legacy=True)
+
+
+def get_sticker(config, sticker_id: str, data: dict | None = None) -> StickerVariants | None:
+    """1スタンプ分の候補。記録があればそれを優先し、無ければ legacy として返します。"""
+    state = load(config) if data is None else data
+    record = (state.get("stickers") or {}).get(sticker_id)
+    if not isinstance(record, dict):
+        return ensure_legacy_variant(config, sticker_id)
+
+    variants: list[Variant] = []
+    for item in record.get("variants") or []:
+        v = _variant_from_dict(item)
+        if v is not None:
+            variants.append(v)
+    if not variants:
+        # 記録はあるが候補が1件も読めない場合も、既存画像で動けるようにします。
+        return ensure_legacy_variant(config, sticker_id)
+
+    adopted = record.get("adopted")
+    if adopted is not None and not any(v.variant_id == adopted for v in variants):
+        adopted = None      # 実在しない候補を指していたら「未採用」として扱います
+    next_seq = record.get("next_seq")
+    if not isinstance(next_seq, int) or next_seq < len(variants) + 1:
+        next_seq = len(variants) + 1
+    return StickerVariants(
+        sticker_id=sticker_id,
+        adopted=adopted,
+        adopted_at=record.get("adopted_at"),
+        next_seq=next_seq,
+        variants=variants,
+        legacy=False,
+    )
+
+
+def _variant_from_dict(item) -> Variant | None:
+    if not isinstance(item, dict):
+        return None
+    vid = str(item.get("variant_id") or "").strip()
+    file = str(item.get("file") or "").strip()
+    if not vid or not file:
+        return None
+    verdict = str(item.get("verdict") or VERDICT_PENDING)
+    rating = item.get("human_rating")
+    known = {"variant_id", "file", "created_at", "source", "verdict", "human_rating",
+             "note", "flags"}
+    return Variant(
+        variant_id=vid,
+        file=file,
+        source=str(item.get("source") or SOURCE_API),
+        verdict=verdict if verdict in VERDICTS else VERDICT_PENDING,
+        created_at=item.get("created_at"),
+        human_rating=rating if isinstance(rating, int) else None,
+        note=str(item.get("note") or ""),
+        flags=[str(f) for f in (item.get("flags") or [])],
+        extra={k: v for k, v in item.items() if k not in known},
+    )
+
+
+def list_variants(config, sticker_id: str, data: dict | None = None) -> list[Variant]:
+    """1スタンプの候補一覧（記録が無ければ legacy の1件）。"""
+    sticker = get_sticker(config, sticker_id, data)
+    return list(sticker.variants) if sticker else []
+
+
+def get_adopted(config, sticker_id: str, data: dict | None = None) -> Variant | None:
+    """いま採用している候補。未採用・画像なしなら None。"""
+    sticker = get_sticker(config, sticker_id, data)
+    return sticker.adopted_variant() if sticker else None
+
+
+def list_all(config, sticker_ids, data: dict | None = None) -> dict[str, StickerVariants]:
+    """複数スタンプ分をまとめて取得します（variants.json の読み込みは1回だけ）。"""
+    state = load(config) if data is None else data
+    out: dict[str, StickerVariants] = {}
+    for sid in sticker_ids:
+        sticker = get_sticker(config, sid, state)
+        if sticker is not None:
+            out[sid] = sticker
+    return out
