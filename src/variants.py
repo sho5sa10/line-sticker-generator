@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -423,6 +424,86 @@ def _generate_for_entry(config, state: dict, entry, count: int, generator,
                             "path": None, "detail": result.detail or "生成に失敗しました"})
         if on_event:
             on_event(entry.id, variant_id, results[-1]["status"], results[-1]["detail"])
+
+
+# ---------------------------------------------------------------------------
+# 採用（Phase 1c）
+# ---------------------------------------------------------------------------
+class AdoptError(Exception):
+    """候補を採用できない場合に送出されます（状態ファイルは更新されません）。"""
+
+
+def adopt(config, entry, variant_id: str, *, style=None, data: dict | None = None) -> dict:
+    """候補を「採用中の原画」にして、既存の合成・検証をそのまま通します。
+
+    順序:
+      記録を読む → 候補とPNGを確認 → 既存原画を退避（既存の archive_existing）
+      → 候補を generated/<id>.png にコピー → 既存の pipeline.render_final
+      → 既存の validator → 最後に variants.json を更新（原子的に保存）
+
+    途中で失敗した場合、variants.json は更新しません（adopted は前のまま）。
+    候補ファイル（variants/ 側）は移動も削除もしません。
+    """
+    from . import image_processor as ip
+    from . import pipeline
+    from . import validator as vd
+    from .importer import archive_existing
+    from .text_renderer import TextStyle
+
+    state = load(config) if data is None else data
+    sticker = get_sticker(config, entry.id, state)
+    if sticker is None:
+        raise AdoptError(f"候補がありません: {entry.id}")
+    variant = sticker.find(variant_id)
+    if variant is None:
+        have = ", ".join(v.variant_id for v in sticker.variants) or "なし"
+        raise AdoptError(f"候補が見つかりません: {entry.id}/{variant_id}（ある候補: {have}）")
+
+    src = variant.path(config)
+    if not src.exists():
+        raise AdoptError(f"候補の画像がありません: {src}")
+    try:
+        ip.load_rgba(src)          # 既存の読み込み処理で、壊れたPNGをここで弾きます
+    except Exception as exc:       # noqa: BLE001 - 破損画像の例外は多岐にわたる
+        raise AdoptError(f"候補の画像を読めません: {src} ({type(exc).__name__}: {exc})") from exc
+
+    dest = config.dir_generated / f"{entry.id}.png"
+    archived = None
+    # legacy の候補（generated/<id>.png 自身）を採用する場合は、退避もコピーも不要です。
+    if src.resolve() != dest.resolve():
+        archived = archive_existing(config, entry.id)      # 既存の退避処理を再利用
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dest)
+
+    # ここから先は既存の正式な経路をそのまま使います（final を直接コピーしない）
+    style = style or TextStyle.from_config(config)
+    final_path, size_bytes, warnings = pipeline.render_final(config, entry, style)
+    report = vd.validate_sticker(final_path, config)
+    if not report.ok:
+        raise AdoptError(
+            "採用した画像がLINE仕様を満たしませんでした（採用状態は変更していません）:\n  "
+            + "\n  ".join(i.message for i in report.errors)
+        )
+
+    # すべて成功してから記録を更新します
+    record = ensure_record(config, state, entry.id)
+    for item in record.get("variants", []):
+        if isinstance(item, dict) and item.get("variant_id") == variant_id:
+            item["verdict"] = VERDICT_ADOPTED       # 採用した候補だけ変えます
+    record["adopted"] = variant_id                  # ほかの候補の verdict は触りません
+    record["adopted_at"] = datetime.now().isoformat(timespec="seconds")
+    save(config, state)
+
+    return {
+        "sticker_id": entry.id,
+        "variant_id": variant_id,
+        "generated": dest,
+        "final": final_path,
+        "size_bytes": size_bytes,
+        "archived": archived,
+        "warnings": list(warnings) + [i.message for i in report.warnings],
+        "validation_ok": report.ok,
+    }
 
 
 def list_all(config, sticker_ids, data: dict | None = None) -> dict[str, StickerVariants]:

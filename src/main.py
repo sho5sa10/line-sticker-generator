@@ -415,6 +415,57 @@ def _generate_variants(config, args, entries) -> int:
     return EXIT_OK
 
 
+def cmd_variants_adopt(config, args) -> int:
+    """候補を採用します（APIは呼びません）。
+
+    候補 → generated/<id>.png → 既存のセリフ合成 → 既存の検証 の順に通します。
+    候補ファイルは履歴として残り、前の原画は既存の仕組みで退避されます。
+    """
+    try:
+        entries = {e.id: e for e in load_stickers(config.csv_path)}
+    except CsvLoadError as exc:
+        print(f"ERROR:\n  {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    entry = entries.get(args.id)
+    if entry is None:
+        print(f"ERROR:\n  CSVにIDがありません: {args.id}", file=sys.stderr)
+        return EXIT_ERROR
+
+    config.ensure_output_dirs()
+    try:
+        style = TextStyle.from_config(config)
+    except FontNotFoundError as exc:
+        print(f"ERROR:\n  {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    try:
+        result = vr.adopt(config, entry, args.variant, style=style)
+    except vr.AdoptError as exc:
+        print(f"ERROR:\n  {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    except Exception as exc:  # noqa: BLE001 - 原因を必ず画面に出す
+        print(f"ERROR:\n  {type(exc).__name__}: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    print("Adopted:")
+    print(f"  sticker: {result['sticker_id']}")
+    print(f"  variant: {result['variant_id']}")
+    print()
+    print("generated:")
+    print(f"  {result['generated']}")
+    print("final:")
+    print(f"  {result['final']} ({result['size_bytes'] / 1024:.0f}KB)")
+    print("validation:")
+    print("  PASS")
+    if result["archived"]:
+        print("archived:")
+        print(f"  {result['archived']}")
+    for w in result["warnings"]:
+        print(f"WARNING: {w}")
+    return EXIT_OK
+
+
 def cmd_render(config, args) -> int:
     """APIを呼ばず、既存の原画からセリフ合成のみやり直します。"""
     entries = _select_entries(config, args)
@@ -616,6 +667,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("path", help="画像ファイル、または画像を入れたフォルダ（ファイル名の数字=ID）")
     p.add_argument("--id", help="1ファイルだけ取り込むときに、IDを明示する (例: 001)")
     p.set_defaults(func=cmd_import)
+
+    p = sub.add_parser("variants", help="候補の操作（APIを呼びません）")
+    vsub = p.add_subparsers(dest="variants_command", required=True)
+    vp = vsub.add_parser("adopt", help="候補を採用して、原画・完成画像を作り直す")
+    vp.add_argument("--id", required=True, help="スタンプのID (例: 001)")
+    vp.add_argument("--variant", required=True, help="採用する候補のID (例: v002)")
+    vp.set_defaults(func=cmd_variants_adopt)
 
     p = sub.add_parser("render", help="既存の原画からセリフ合成のみ再実行（APIを呼びません）")
     _add_selection_args(p)
