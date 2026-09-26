@@ -906,6 +906,19 @@ def create_app(config=None) -> Flask:
             return jsonify({"error": str(exc)}), 400
         return jsonify({"sticker": variants_mod.get_sticker(cfg_, sticker_id).to_dict()})
 
+    @app.post("/api/variants/<sticker_id>/<variant_id>/score")
+    def api_variants_score(sticker_id: str, variant_id: str):
+        """候補1件を再評価します（計算は scoring.py のみ。人の判断は変えません）。"""
+        from . import scoring
+
+        cfg_ = current_config()
+        try:
+            scoring.score_variant(cfg_, sticker_id, variant_id)
+        except scoring.ScoringError as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"sticker": variants_mod.get_sticker(cfg_, sticker_id).to_dict(),
+                        "formula": scoring.SCORING_FORMULA})
+
     @app.post("/api/variants/<sticker_id>/<variant_id>/rating")
     def api_variants_rating(sticker_id: str, variant_id: str):
         """候補に5段階の評価を付けます（null で消します）。"""

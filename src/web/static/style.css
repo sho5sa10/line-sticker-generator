@@ -802,3 +802,15 @@ main { padding: 16px; max-width: 1500px; margin: 0 auto; }
 .vmsg.ok { color: var(--ok); }
 .vmsg.bad { color: var(--danger); }
 .vmsg.busy { color: var(--muted); }
+
+/* 候補カードの機械評価（Gate / Warn） */
+.vscore { font-size: 12px; margin: 4px 0 2px; }
+.vscore-row { display: flex; align-items: center; gap: 10px; }
+.vscore-row b { font-size: 14px; }
+.vscore-row .btn { margin-left: auto; }
+.vscore-na { color: var(--muted); font-size: 11px; margin: 2px 0 4px; }
+.vgate { color: var(--danger); font-weight: 700; line-height: 1.5; }
+.vwarn { color: var(--warn); line-height: 1.5; }
+.vok { color: var(--ok); }
+.vnone { display: flex; align-items: center; gap: 8px; color: var(--muted); }
+.vcard.has-gate { border-color: color-mix(in srgb, var(--danger) 55%, var(--line)); }

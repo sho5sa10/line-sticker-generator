@@ -233,6 +233,35 @@ def score_sticker(config, sticker_id: str, data: dict, *, force: bool = False) -
     return results
 
 
+def score_variant(config, sticker_id: str, variant_id: str, *, force: bool = True,
+                  data: dict | None = None) -> dict:
+    """候補1件だけを評価して保存します（GUIの「再評価」用）。
+
+    画像・採用状態・人の判断（verdict / human_rating）は変更しません。
+    """
+    state = vr.load(config) if data is None else data
+    sticker = vr.get_sticker(config, sticker_id, state)
+    if sticker is None or sticker.find(variant_id) is None:
+        raise ScoringError(f"候補が見つかりません: {sticker_id}/{variant_id}")
+    record = vr.ensure_record(config, state, sticker_id)
+    item = next((v for v in record.get("variants", [])
+                 if isinstance(v, dict) and v.get("variant_id") == variant_id), None)
+    if item is None:  # pragma: no cover - get_sticker と同じ元を見ています
+        raise ScoringError(f"候補が見つかりません: {sticker_id}/{variant_id}")
+    if not needs_scoring(item, force=force):
+        return {"id": sticker_id, "variant_id": variant_id, "status": "skipped",
+                "scores": item.get("derived_scores"), "flags": item.get("flags") or []}
+
+    metrics = measure(sticker.find(variant_id).path(config))     # 失敗時は ScoringError
+    scores, flags = evaluate(metrics)
+    item["raw_metrics"] = metrics
+    item["derived_scores"] = scores
+    item["flags"] = flags
+    vr.save(config, state)
+    return {"id": sticker_id, "variant_id": variant_id, "status": "scored",
+            "scores": scores, "flags": flags}
+
+
 def score_all(config, sticker_ids, *, force: bool = False, data: dict | None = None) -> list[dict]:
     """複数スタンプを評価し、variants.json を既存の保存方式で更新します。"""
     state = vr.load(config) if data is None else data

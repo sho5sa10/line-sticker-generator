@@ -2196,6 +2196,49 @@ async function loadVariantSticker() {
   renderVariantStats();
 }
 
+/** 機械評価の説明（画面に出す短い日本語）。scoring.py の flags と1対1で対応します。 */
+const FLAG_LABEL = {
+  'gate:empty': '画像が空',
+  'gate:too_small': '描画が極端に小さい',
+  'gate:cropped': '体が画像の端で切れている',
+  'gate:low_contrast': '小さくすると見分けにくい',
+  'warn:low_coverage': '描画が小さめ',
+  'warn:fringe': '半透明のふちが多い',
+  'warn:many_colors': '色数が多い（グラデ/ノイズ）',
+  'warn:thin': '細い線が多く、小さいと潰れやすい',
+  'warn:small_margin': '余白が少なめ',
+};
+
+function flagText(flag) {
+  return `${FLAG_LABEL[flag] || flag}（${flag}）`;
+}
+
+/** 候補カードに出す機械評価。スコアから採用の可否を自動判断はしません。 */
+function variantScoreHtml(v) {
+  const s = v.derived_scores;
+  if (!s) {
+    return '<div class="vscore"><span class="vnone">機械評価: 未評価'
+      + '<button type="button" class="btn small ghost" data-vact="score">評価する</button></span></div>';
+  }
+  const gate = (v.flags || []).filter((f) => f.startsWith('gate:'));
+  const warn = (v.flags || []).filter((f) => f.startsWith('warn:'));
+  const num = (x) => (typeof x === 'number' ? x : '—');
+  return `
+    <div class="vscore">
+      <div class="vscore-row">
+        <span>品質 <b>${num(s.quality)}</b></span>
+        <span>視認性 <b>${num(s.visibility)}</b></span>
+        <button type="button" class="btn small ghost" data-vact="score"
+                title="この候補だけ再評価します（画像や採用状態は変わりません）">再評価</button>
+      </div>
+      <div class="vscore-na">一貫性 ${num(s.consistency)} ・ 重複 ${num(s.duplication)}
+        ・ セリフ適合 ${num(s.semantic)}（未評価）</div>
+      ${gate.map((f) => `<div class="vgate">⛔ 要確認: ${escapeHtml(flagText(f))}</div>`).join('')}
+      ${warn.map((f) => `<div class="vwarn">⚠ 注意: ${escapeHtml(flagText(f))}</div>`).join('')}
+      ${!gate.length && !warn.length ? '<div class="vok">✓ 機械チェックで問題なし</div>' : ''}
+    </div>`;
+}
+
 function renderVariantCards() {
   const id = vstate.sticker.sticker_id;
   const adopted = vstate.sticker.adopted;
@@ -2205,13 +2248,10 @@ function renderVariantCards() {
     const stars = [1, 2, 3, 4, 5].map((n) =>
       `<button type="button" data-rate="${n}" class="${(v.human_rating || 0) >= n ? 'on' : ''}"
          title="評価 ${n}（Shift+${n}）">★</button>`).join('');
-    const scores = v.derived_scores
-      ? Object.entries(v.derived_scores)
-        .filter(([k, x]) => typeof x === 'number' && k !== 'formula')
-        .map(([k, x]) => `${k} ${x}`).join(' / ')
-      : '';
+    const scoreBlock = variantScoreHtml(v);
     return `
-      <div class="vcard ${i === vstate.picked ? 'picked' : ''} ${isCurrent ? 'current' : ''}"
+      <div class="vcard ${i === vstate.picked ? 'picked' : ''} ${isCurrent ? 'current' : ''}
+           ${(v.flags || []).some((f) => f.startsWith('gate:')) ? 'has-gate' : ''}"
            data-idx="${i}">
         <div class="vcard-head">
           <span class="vkey">${i + 1}</span>
@@ -2230,7 +2270,7 @@ function renderVariantCards() {
           <span class="vverdict ${v.verdict}">${VERDICT_LABEL[v.verdict] || v.verdict}</span>
           <span class="vstars">${stars}</span>
         </div>
-        <div class="vflags">${escapeHtml(v.flags && v.flags.length ? v.flags.join(' / ') : scores)}</div>
+        ${scoreBlock}
         <div class="vbtns">
           <button class="btn primary" data-vact="adopt" ${isCurrent ? 'disabled' : ''}>
             ${isCurrent ? '採用済' : '採用'}</button>
@@ -2302,6 +2342,21 @@ async function adoptCurrent({ advance = false } = {}) {
   }
 }
 
+/** 候補1件の再評価。計算はサーバー側の scoring.py だけが行います。 */
+async function rescoreCurrent() {
+  const v = currentVariant();
+  if (!v) return;
+  vmsg(`${v.variant_id} を評価中…`, 'busy');
+  try {
+    const d = await api(`/api/variants/${vstate.sticker.sticker_id}/${v.variant_id}/score`,
+                        { method: 'POST', body: {} });
+    vstate.sticker = d.sticker;
+    vstate.all[d.sticker.sticker_id] = d.sticker;
+    renderVariantCards();
+    vmsg(`${v.variant_id} を評価しました（式 ${d.formula}）`, 'ok');
+  } catch (e) { vmsg(`✕ ${e.message}`, 'bad'); }
+}
+
 async function setVerdict(verdict) {
   const v = currentVariant();
   if (!v) return;
@@ -2352,6 +2407,7 @@ $('#v-cards').addEventListener('click', (e) => {
   }
   const act = e.target.dataset.vact;
   if (act === 'adopt') adoptCurrent();
+  else if (act === 'score') rescoreCurrent();
   else if (act) setVerdict(act);
 });
 
