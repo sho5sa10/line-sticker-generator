@@ -920,10 +920,17 @@ function cellHtml(s) {
     tag = '<span class="tag raw">原画のみ</span>';
   }
   const sale = s.sale ? `<span class="sale-badge ${s.sale}">${SALE_LABELS[s.sale]}</span>` : '';
+  // 候補が2件以上あるときだけ小さなバッジを出します（候補が無いセルは今までどおりの見た目）
+  const variants = (s.variant_count || 0) >= 2
+    ? `<span class="tag variants" data-variants="${s.id}" title="候補を見比べる">${s.variant_count}案</span>`
+    : '';
+  // flags は保存済みの値があるときだけ表示します（ここでは計算しません）
+  const vflag = (s.flags || []).length
+    ? `<span class="tag vflag" title="${escapeHtml(s.flags.join(' / '))}">⚠</span>` : '';
   return `
     <div class="cell ${sel ? 'selected' : ''} ${s.sale ? `sale-${s.sale}` : ''}" data-id="${s.id}">
       <input class="pick" type="checkbox" ${sel ? 'checked' : ''} aria-label="選択">
-      ${sale}${tag}
+      ${sale}${variants}${vflag}${tag}
       <div class="thumb" data-zoom="${s.id}">${thumb}</div>
       <div class="cid">${s.id}${s.size_kb ? ` · ${s.size_kb}KB` : ''}</div>
       <div class="ctext">${escapeHtml(s.text)}</div>
@@ -1012,6 +1019,12 @@ $('#grid').addEventListener('click', async (e) => {
     if (e.target.checked) state.selected.add(id); else state.selected.delete(id);
     cell.classList.toggle('selected', e.target.checked);
     updateSelectionUi();
+    return;
+  }
+  // 候補バッジ、または候補が2件以上あるスタンプの画像 → 候補の比較画面
+  if (e.target.closest('[data-variants]')
+      || (e.target.closest('[data-zoom]') && (sticker.variant_count || 0) >= 2)) {
+    openVariantModal(id);
     return;
   }
   const zoom = e.target.closest('[data-zoom]');
@@ -2121,3 +2134,240 @@ $('#btn-llm-listing').addEventListener('click', (e) => withLlm(e.currentTarget, 
 }));
 
 refreshLlmStatus();
+
+/* ------------------------------------------------------------------ */
+/* 候補の比較・採用（Phase 2）                                          */
+/* ------------------------------------------------------------------ */
+/** いま比較している状態。スコアの計算はここでは一切しません。 */
+const vstate = { ids: [], index: 0, sticker: null, picked: 0, open: false, all: {} };
+
+const VERDICT_LABEL = { pending: '未評価', adopted: '採用中', rejected: '除外', regen: '再生成したい' };
+
+function variantImageUrl(v, sticker_id) {
+  // legacy の候補は generated/ を指しています（コピーしていないため）
+  return v.source === 'legacy'
+    ? `/img/generated/${sticker_id}.png?t=${Date.now()}`
+    : `/img/variants/${sticker_id}/${v.variant_id}.png`;
+}
+
+function vmsg(text, kind = '') {
+  const el = $('#v-msg');
+  el.textContent = text;
+  el.className = `vmsg ${kind}`;
+}
+
+/** 候補が2件以上あるスタンプだけを対象にします（1件のものは従来どおり拡大表示）。 */
+async function openVariantModal(stickerId) {
+  vstate.ids = gridFilter().filter((s) => (s.variant_count || 0) >= 1).map((s) => s.id);
+  vstate.index = Math.max(vstate.ids.indexOf(stickerId), 0);
+  vstate.open = true;
+  $('#variant-modal').hidden = false;
+  try {
+    // 選抜状況の集計用。一覧画面の表示では呼ばないので、既存画面は遅くなりません。
+    vstate.all = (await api('/api/variants')).stickers || {};
+  } catch (e) { vstate.all = {}; }
+  await loadVariantSticker();
+}
+
+function closeVariantModal() {
+  vstate.open = false;
+  $('#variant-modal').hidden = true;
+  vmsg('');
+}
+
+async function loadVariantSticker() {
+  const id = vstate.ids[vstate.index];
+  const sticker = state.stickers.find((s) => s.id === id);
+  $('#v-title').textContent = `${id}「${sticker ? sticker.text : ''}」`;
+  $('#v-position').textContent = `[${vstate.index + 1} / ${vstate.ids.length}]`;
+  $('#v-cards').innerHTML = '<p class="hint">読み込み中…</p>';
+  try {
+    vstate.sticker = await api(`/api/variants/${id}`);
+    vstate.all[id] = vstate.sticker;
+  } catch (e) {
+    $('#v-cards').innerHTML = `<p class="hint">${escapeHtml(e.message)}</p>`;
+    return;
+  }
+  // 現在の採用は必ず sticker.adopted を使います（verdict では判定しません）
+  const adopted = vstate.sticker.adopted;
+  const pickedIdx = vstate.sticker.variants.findIndex((v) => v.variant_id === adopted);
+  vstate.picked = pickedIdx >= 0 ? pickedIdx : 0;
+  renderVariantCards();
+  renderVariantStats();
+}
+
+function renderVariantCards() {
+  const id = vstate.sticker.sticker_id;
+  const adopted = vstate.sticker.adopted;
+  $('#v-cards').innerHTML = vstate.sticker.variants.map((v, i) => {
+    const isCurrent = v.variant_id === adopted;
+    const url = variantImageUrl(v, id);
+    const stars = [1, 2, 3, 4, 5].map((n) =>
+      `<button type="button" data-rate="${n}" class="${(v.human_rating || 0) >= n ? 'on' : ''}"
+         title="評価 ${n}（Shift+${n}）">★</button>`).join('');
+    const scores = v.derived_scores
+      ? Object.entries(v.derived_scores)
+        .filter(([k, x]) => typeof x === 'number' && k !== 'formula')
+        .map(([k, x]) => `${k} ${x}`).join(' / ')
+      : '';
+    return `
+      <div class="vcard ${i === vstate.picked ? 'picked' : ''} ${isCurrent ? 'current' : ''}"
+           data-idx="${i}">
+        <div class="vcard-head">
+          <span class="vkey">${i + 1}</span>
+          <span>${escapeHtml(v.variant_id)}</span>
+          <small>${escapeHtml(v.source)}</small>
+          ${isCurrent ? '<span class="vcurrent">★ CURRENT</span>' : ''}
+        </div>
+        <div class="vpreview">
+          <img class="big" src="${url}" alt="${escapeHtml(v.variant_id)}">
+          <div class="vsmall">
+            <figure><img src="${url}" width="96" alt=""><figcaption>96px</figcaption></figure>
+            <figure><img src="${url}" width="74" alt=""><figcaption>74px</figcaption></figure>
+          </div>
+        </div>
+        <div class="vmeta">
+          <span class="vverdict ${v.verdict}">${VERDICT_LABEL[v.verdict] || v.verdict}</span>
+          <span class="vstars">${stars}</span>
+        </div>
+        <div class="vflags">${escapeHtml(v.flags && v.flags.length ? v.flags.join(' / ') : scores)}</div>
+        <div class="vbtns">
+          <button class="btn primary" data-vact="adopt" ${isCurrent ? 'disabled' : ''}>
+            ${isCurrent ? '採用済' : '採用'}</button>
+          <button class="btn" data-vact="rejected">除外</button>
+          <button class="btn" data-vact="regen">再生成</button>
+          <button class="btn ghost" data-vact="pending">保留</button>
+        </div>
+      </div>`;
+  }).join('') || '<p class="hint">候補がありません。</p>';
+}
+
+function renderVariantStats() {
+  // 「採用済み」は sticker.adopted があるかどうかで数えます（verdict=adopted の数ではありません）
+  const rows = vstate.ids.map((id) => vstate.all[id]).filter(Boolean);
+  const adopted = rows.filter((s) => s.adopted).length;
+  const regen = rows.filter((s) => (s.variants || []).some((v) => v.verdict === 'regen')).length;
+  $('#v-stats').innerHTML =
+    `採用済み <b>${adopted}</b> / ${vstate.ids.length}　`
+    + `未採用 <b>${vstate.ids.length - adopted}</b>　再生成 <b>${regen}</b>`;
+}
+
+function pickVariant(i) {
+  if (!vstate.sticker || i < 0 || i >= vstate.sticker.variants.length) return;
+  vstate.picked = i;
+  renderVariantCards();
+}
+
+function currentVariant() {
+  return vstate.sticker && vstate.sticker.variants[vstate.picked];
+}
+
+async function moveSticker(step) {
+  const next = vstate.index + step;
+  if (next < 0 || next >= vstate.ids.length) return;
+  vstate.index = next;
+  vmsg('');
+  await loadVariantSticker();
+}
+
+/** 採用（generated→final→検証は既存の variants.adopt に任せます）。 */
+async function adoptCurrent({ advance = false } = {}) {
+  const v = currentVariant();
+  if (!v) return false;
+  const id = vstate.sticker.sticker_id;
+  if (vstate.sticker.adopted === v.variant_id) {
+    vmsg(`${v.variant_id} はすでに採用中です`);
+    if (advance) await moveSticker(1);
+    return true;
+  }
+  vmsg(`${v.variant_id} を採用処理中…`, 'busy');
+  $$('#v-cards [data-vact]').forEach((b) => { b.disabled = true; });
+  try {
+    const d = await api(`/api/variants/${id}/${v.variant_id}/adopt`, { method: 'POST', body: {} });
+    vstate.sticker = d.sticker;
+    vstate.all[id] = d.sticker;
+    const row = state.stickers.find((s) => s.id === id);
+    if (row) { row.adopted = d.sticker.adopted; row.has_final = true; row.final_mtime = Date.now() / 1000; }
+    if (state.info) { state.info.validation = d.validation; state.info.packages_status = d.packages_status; }
+    renderVariantCards();
+    renderVariantStats();
+    vmsg(`✓ ${v.variant_id} を採用しました`, 'ok');
+    d.warnings.forEach((w) => toast(w, true));
+    if (advance) await moveSticker(1);
+    return true;
+  } catch (e) {
+    vmsg(`✕ 採用に失敗しました：${e.message}`, 'bad');
+    renderVariantCards();          // 一覧は壊さず、そのまま比較を続けられます
+    return false;
+  }
+}
+
+async function setVerdict(verdict) {
+  const v = currentVariant();
+  if (!v) return;
+  try {
+    const d = await api(`/api/variants/${vstate.sticker.sticker_id}/${v.variant_id}/verdict`,
+                        { method: 'POST', body: { verdict } });
+    vstate.sticker = d.sticker;
+    vstate.all[d.sticker.sticker_id] = d.sticker;
+    renderVariantCards();
+    renderVariantStats();
+    vmsg(`${v.variant_id} を「${VERDICT_LABEL[verdict]}」にしました`, 'ok');
+  } catch (e) { vmsg(`✕ ${e.message}`, 'bad'); }
+}
+
+async function setRating(rating) {
+  const v = currentVariant();
+  if (!v) return;
+  try {
+    const d = await api(`/api/variants/${vstate.sticker.sticker_id}/${v.variant_id}/rating`,
+                        { method: 'POST', body: { rating } });
+    vstate.sticker = d.sticker;
+    vstate.all[d.sticker.sticker_id] = d.sticker;
+    renderVariantCards();
+    vmsg(`${v.variant_id} の評価を ${rating === null ? 'なし' : rating} にしました`, 'ok');
+  } catch (e) { vmsg(`✕ ${e.message}`, 'bad'); }
+}
+
+/* --- 操作 --- */
+$('#v-close').addEventListener('click', closeVariantModal);
+$('#v-prev').addEventListener('click', () => moveSticker(-1));
+$('#v-next').addEventListener('click', () => moveSticker(1));
+$('#variant-modal').addEventListener('click', (e) => {
+  if (e.target.id === 'variant-modal') closeVariantModal();
+});
+
+$('#v-cards').addEventListener('click', (e) => {
+  const card = e.target.closest('.vcard');
+  if (!card) return;
+  const idx = Number(card.dataset.idx);
+  if (idx !== vstate.picked) pickVariant(idx);
+
+  const star = e.target.closest('[data-rate]');
+  if (star) {
+    const n = Number(star.dataset.rate);
+    const cur = currentVariant();
+    setRating(cur && cur.human_rating === n ? null : n);   // 同じ星をもう一度押すと消す
+    return;
+  }
+  const act = e.target.dataset.vact;
+  if (act === 'adopt') adoptCurrent();
+  else if (act) setVerdict(act);
+});
+
+document.addEventListener('keydown', (e) => {
+  if (!vstate.open) return;
+  const el = e.target;
+  if (el instanceof Element && el.matches('input, textarea, select')) return;
+  const key = e.key;
+  if (key === 'Escape') { closeVariantModal(); return; }
+  if (key === 'ArrowLeft') { e.preventDefault(); moveSticker(-1); return; }
+  if (key === 'ArrowRight') { e.preventDefault(); moveSticker(1); return; }
+  if (key === 'Enter') { e.preventDefault(); adoptCurrent({ advance: true }); return; }
+  if (key === 'x' || key === 'X') { setVerdict('rejected'); return; }
+  if (key === 'r' || key === 'R') { setVerdict('regen'); return; }
+  // Shift+1〜5 は評価、1〜9 は候補の選択（衝突しないように分けています）
+  if (e.shiftKey && '!"#$%'.includes(key)) { setRating('!"#$%'.indexOf(key) + 1); return; }
+  if (e.shiftKey && /^[1-5]$/.test(key)) { setRating(Number(key)); return; }
+  if (!e.shiftKey && /^[1-9]$/.test(key)) { pickVariant(Number(key) - 1); }
+});

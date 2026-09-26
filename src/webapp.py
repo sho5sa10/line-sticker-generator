@@ -241,7 +241,19 @@ def create_app(config=None) -> Flask:
 
     def statuses(cfg_, entries) -> list[dict]:
         sales = sales_mod.load_sales(cfg_)
-        return [sticker_status(cfg_, e, sales) for e in entries]
+        # 候補の件数だけ一覧に載せます（variants.json の読み込みは1リクエストに1回）
+        vstate = variants_mod.load(cfg_)
+        found = variants_mod.list_all(cfg_, [e.id for e in entries], vstate)
+        out = []
+        for e in entries:
+            row = sticker_status(cfg_, e, sales)
+            sv = found.get(e.id)
+            row["variant_count"] = sv.variant_count if sv else 0
+            row["adopted"] = sv.adopted if sv else None
+            # flags は保存済みの値だけを見ます（ここでは計算しません）
+            row["flags"] = sorted({f for v in (sv.variants if sv else []) for f in v.flags})
+            out.append(row)
+        return out
 
     # ------------------------------------------------------------------
     # 画面
@@ -358,6 +370,11 @@ def create_app(config=None) -> Flask:
     @app.get("/img/tab.png")
     def img_tab():
         return _serve(current_config().dir_tab, "tab.png")
+
+    @app.get("/img/variants/<sticker_id>/<variant_id>.png")
+    def img_variant(sticker_id: str, variant_id: str):
+        cfg_ = current_config()
+        return _serve(variants_mod.variant_dir(cfg_, sticker_id), f"{variant_id}.png")
 
     @app.get("/img/master.png")
     def img_master():
@@ -843,6 +860,68 @@ def create_app(config=None) -> Flask:
             return jsonify({"sticker_id": sticker_id, "adopted": None, "legacy": False,
                             "variant_count": 0, "variants": []})
         return jsonify(sticker.to_dict())
+
+    def _variant_entry(sticker_id: str):
+        """CSVの行を取り出します。無ければ (None, エラーレスポンス)。"""
+        try:
+            entry = next((e for e in entries_or_error() if e.id == sticker_id), None)
+        except CsvLoadError as exc:
+            return None, (jsonify({"error": str(exc)}), 400)
+        if entry is None:
+            return None, (jsonify({"error": f"IDが見つかりません: {sticker_id}"}), 404)
+        return entry, None
+
+    @app.post("/api/variants/<sticker_id>/<variant_id>/adopt")
+    def api_variants_adopt(sticker_id: str, variant_id: str):
+        """候補を採用します（退避・合成・検証は既存の variants.adopt に任せます）。"""
+        cfg_ = current_config()
+        entry, err = _variant_entry(sticker_id)
+        if err:
+            return err
+        try:
+            style = style_or_error()
+        except FontNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 400
+        try:
+            result = variants_mod.adopt(cfg_, entry, variant_id, style=style)
+        except variants_mod.AdoptError as exc:
+            return jsonify({"error": str(exc)}), 400
+        sticker = variants_mod.get_sticker(cfg_, sticker_id)
+        return jsonify({
+            "sticker": sticker.to_dict() if sticker else None,
+            "final_size_kb": round(result["size_bytes"] / 1024, 1),
+            "warnings": result["warnings"],
+            "validation": vd.load_result(cfg_),
+            "packages_status": packages_status(cfg_),
+        })
+
+    @app.post("/api/variants/<sticker_id>/<variant_id>/verdict")
+    def api_variants_verdict(sticker_id: str, variant_id: str):
+        """候補に人の判断（pending / rejected / regen）を付けます。"""
+        cfg_ = current_config()
+        body = request.get_json(silent=True) or {}
+        try:
+            variants_mod.set_verdict(cfg_, sticker_id, variant_id, str(body.get("verdict", "")))
+        except variants_mod.VariantError as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"sticker": variants_mod.get_sticker(cfg_, sticker_id).to_dict()})
+
+    @app.post("/api/variants/<sticker_id>/<variant_id>/rating")
+    def api_variants_rating(sticker_id: str, variant_id: str):
+        """候補に5段階の評価を付けます（null で消します）。"""
+        cfg_ = current_config()
+        body = request.get_json(silent=True) or {}
+        rating = body.get("rating")
+        if rating is not None:
+            try:
+                rating = int(rating)
+            except (TypeError, ValueError):
+                return jsonify({"error": f"評価は数字で指定してください: {rating}"}), 400
+        try:
+            variants_mod.set_rating(cfg_, sticker_id, variant_id, rating)
+        except variants_mod.VariantError as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"sticker": variants_mod.get_sticker(cfg_, sticker_id).to_dict()})
 
     @app.post("/api/stickers")
     def api_stickers_post():

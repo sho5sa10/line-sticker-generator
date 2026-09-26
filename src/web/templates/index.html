@@ -623,6 +623,29 @@
 <!-- 拡大表示 -->
 <div id="lightbox"><img id="lb-img" alt=""><div id="lb-cap"></div></div>
 
+<!-- 候補の比較・採用 -->
+<div id="variant-modal" class="vmodal" hidden>
+  <div class="vbox" role="dialog" aria-label="候補の比較">
+    <div class="vhead">
+      <strong id="v-title"></strong>
+      <span class="vcount" id="v-position"></span>
+      <span class="vstats" id="v-stats"></span>
+      <button class="btn small ghost" id="v-prev" data-tip="前のスタンプ（←）">← 前</button>
+      <button class="btn small ghost" id="v-next" data-tip="次のスタンプ（→）">次 →</button>
+      <button class="btn small ghost" id="v-close" data-tip="閉じる（Esc）">閉じる</button>
+    </div>
+    <div class="vcards" id="v-cards"></div>
+    <div class="vfoot">
+      <span class="hint">
+        キー操作: <kbd>1</kbd>〜<kbd>9</kbd> 候補を選ぶ / <kbd>Enter</kbd> 採用して次へ /
+        <kbd>X</kbd> 除外 / <kbd>R</kbd> 再生成 / <kbd>Shift</kbd>+<kbd>1</kbd>〜<kbd>5</kbd> 評価 /
+        <kbd>←</kbd><kbd>→</kbd> 前後 / <kbd>Esc</kbd> 閉じる
+      </span>
+      <span class="vmsg" id="v-msg"></span>
+    </div>
+  </div>
+</div>
+
 <div id="toast" class="toast"></div>
 <div id="tip" class="tip"></div>
 
