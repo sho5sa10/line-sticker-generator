@@ -455,6 +455,50 @@ def cmd_variants_list(config, args) -> int:
     return EXIT_OK
 
 
+def cmd_variants_score(config, args) -> int:
+    """候補を機械評価します（APIは呼びません。人の判断は変えません）。"""
+    from . import scoring
+
+    try:
+        entries = load_stickers(config.csv_path)
+    except CsvLoadError as exc:
+        print(f"ERROR:\n  {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    if getattr(args, "id", None):
+        entries = [e for e in entries if e.id == args.id]
+        if not entries:
+            print(f"ERROR:\n  CSVにIDがありません: {args.id}", file=sys.stderr)
+            return EXIT_ERROR
+
+    results = scoring.score_all(config, [e.id for e in entries], force=args.force)
+    if not results:
+        print("評価する候補がありません。")
+        return EXIT_OK
+
+    shown = ""
+    errors = 0
+    for r in results:
+        if r["id"] != shown:
+            shown = r["id"]
+            print(f"\n{shown}")
+        if r["status"] == "error":
+            errors += 1
+            print(f"  {r['variant_id']}  ERROR {r['detail']}")
+            continue
+        s = r["scores"] or {}
+        flags = ",".join(r["flags"]) if r["flags"] else "-"
+        mark = "" if r["status"] == "scored" else "（計算済み）"
+        print(f"  {r['variant_id']}  quality={s.get('quality')} "
+              f"visibility={s.get('visibility')} flags={flags} {mark}".rstrip())
+    scored = sum(1 for r in results if r["status"] == "scored")
+    print("-" * 56)
+    print(f"評価: {scored}件 / 変更なし {len(results) - scored - errors}件 / 失敗 {errors}件"
+          f"（式 {scoring.SCORING_FORMULA}）")
+    print("※ Gate が付いても候補は削除されず、採用状態や人の判断も変わりません。")
+    return EXIT_ERROR if errors else EXIT_OK
+
+
 def cmd_variants_verdict(config, args) -> int:
     """候補に人の判断（pending / rejected / regen）を付けます。"""
     try:
@@ -744,6 +788,11 @@ def build_parser() -> argparse.ArgumentParser:
     vp.add_argument("--id", required=True, help="スタンプのID (例: 001)")
     vp.add_argument("--variant", required=True, help="採用する候補のID (例: v002)")
     vp.set_defaults(func=cmd_variants_adopt)
+
+    vp = vsub.add_parser("score", help="候補を機械評価する（APIを呼びません）")
+    vp.add_argument("--id", help="1件だけ評価するときのID (例: 001)")
+    vp.add_argument("--force", action="store_true", help="計算済みでも評価をやり直す")
+    vp.set_defaults(func=cmd_variants_score)
 
     vp = vsub.add_parser("verdict", help="候補に人の判断を付ける（採用は adopt を使います）")
     vp.add_argument("--id", required=True, help="スタンプのID (例: 001)")
