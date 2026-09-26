@@ -15,6 +15,7 @@ Phase 1a では **読み取りだけ** を担当します。候補の生成・�
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from dataclasses import dataclass, field
@@ -263,6 +264,165 @@ def get_adopted(config, sticker_id: str, data: dict | None = None) -> Variant | 
     """いま採用している候補。未採用・画像なしなら None。"""
     sticker = get_sticker(config, sticker_id, data)
     return sticker.adopted_variant() if sticker else None
+
+
+def sha1_text(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+
+def sha1_file(path: str | Path) -> str | None:
+    """ファイルのSHA1。読めない場合は None。"""
+    p = Path(path)
+    try:
+        h = hashlib.sha1()
+        with p.open("rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# 候補の追加（Phase 1b: 生成のみ。採用は行いません）
+# ---------------------------------------------------------------------------
+def ensure_record(config, data: dict, sticker_id: str) -> dict:
+    """variants.json 内の1スタンプ分の記録を用意します（無ければ作る）。
+
+    記録が無く generated/<id>.png がある環境では、その画像を v001(legacy・採用中)
+    として記録に残します。**ファイルはコピーせず、generated/ のパスを指したままです。**
+    """
+    stickers = data.setdefault("stickers", {})
+    record = stickers.get(sticker_id)
+    if isinstance(record, dict) and record.get("variants"):
+        record.setdefault("next_seq", len(record["variants"]) + 1)
+        return record
+
+    legacy = ensure_legacy_variant(config, sticker_id)
+    if legacy is not None:
+        record = {
+            "adopted": legacy.adopted,
+            "adopted_at": None,
+            "next_seq": legacy.next_seq,
+            "variants": [v.to_dict() for v in legacy.variants],
+        }
+    else:
+        record = {"adopted": None, "adopted_at": None, "next_seq": 1, "variants": []}
+    stickers[sticker_id] = record
+    return record
+
+
+def allocate_variant(config, record: dict, sticker_id: str) -> tuple[str, Path]:
+    """次の候補ID とファイルパスを確保します（next_seq を1つ進めます）。
+
+    欠番は再利用しません。生成に失敗しても番号は消費したままにします
+    （APIが課金されている可能性があるため、同じ番号を使い回さないほうが安全です）。
+    """
+    seq = int(record.get("next_seq", len(record.get("variants", [])) + 1))
+    used = {str(v.get("variant_id")) for v in record.get("variants", []) if isinstance(v, dict)}
+    folder = variant_dir(config, sticker_id)
+    # 記録に無くてもファイルがあれば飛ばします（中断後の再実行で上書きしないため）
+    while f"v{seq:03d}" in used or (folder / f"v{seq:03d}.png").exists():
+        seq += 1
+    variant_id = f"v{seq:03d}"
+    record["next_seq"] = seq + 1
+    return variant_id, folder / f"{variant_id}.png"
+
+
+def register_variant(config, record: dict, variant_id: str, path: Path, *, meta: dict) -> dict:
+    """生成できた候補をメタデータ付きで記録します（PNGが実在する前提で呼びます）。"""
+    item = {
+        "variant_id": variant_id,
+        "file": relative_file(config, path),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "source": SOURCE_API,
+        "verdict": VERDICT_PENDING,     # 生成しただけでは採用も不採用もしません
+        "human_rating": None,
+        "note": "",
+    }
+    item.update(meta)
+    record.setdefault("variants", []).append(item)
+    return item
+
+
+def generation_meta(config, generator, prompt: str, sticker_id: str) -> dict:
+    """候補の生成条件。既存の設定・プロバイダから取れる値だけを入れます。"""
+    reference = generator.reference_image()
+    return {
+        "provider": config.provider_name,
+        "model": config.model,
+        "model_params": {
+            "size": str(config.get("generation.size", "1024x1024")),
+            "quality": config.quality,
+            "background": str(config.get("generation.background", "transparent")),
+        },
+        "prompt_sha1": sha1_text(prompt),
+        "prompt_file": _prompt_file(config, sticker_id),
+        # 既存コードにプロンプトの版という概念が無いため null。追跡は prompt_sha1 で行います。
+        "prompt_version": None,
+        "master_hash": sha1_file(reference) if reference else None,
+        "cost_usd": generator.estimate_cost_usd(1),
+    }
+
+
+def _prompt_file(config, sticker_id: str) -> str | None:
+    """既存の保存機構（prompts/generated/<id>.txt）が使われていればそのパス。"""
+    if not bool(config.get("generation.save_prompt", True)):
+        return None
+    path = config.dir_generated_prompts / f"{sticker_id}.txt"
+    return relative_file(config, path) if path.exists() else None
+
+
+def generate_variants(config, entries, count: int, generator, *, data: dict | None = None,
+                      on_event=None) -> list[dict]:
+    """各スタンプについて count 枚の候補を生成します（generated/ には触れません）。
+
+    Args:
+        generator: ImageGenerator。呼び出し側が dry_run などを設定して渡します。
+        on_event: (sticker_id, variant_id, status, detail) を受け取る関数（進捗表示用）。
+
+    Returns:
+        1件ごとの結果 [{"id","variant_id","status","path","detail"}]。
+        status は generated | dry-run | error。
+    """
+    state = load(config) if data is None else data
+    results: list[dict] = []
+    for entry in entries:
+        try:
+            _generate_for_entry(config, state, entry, count, generator, results, on_event)
+        finally:
+            # 途中で例外が出ても、そこまでの記録（と消費した番号）は残します
+            if not getattr(generator, "dry_run", False):
+                save(config, state)
+    return results
+
+
+def _generate_for_entry(config, state: dict, entry, count: int, generator,
+                        results: list[dict], on_event) -> None:
+    record = ensure_record(config, state, entry.id)
+    prompt = generator.prompt_for(entry)
+    for _ in range(max(int(count), 1)):
+        if getattr(generator, "dry_run", False):
+            results.append({"id": entry.id, "variant_id": None, "status": "dry-run",
+                            "path": None, "detail": ""})
+            if on_event:
+                on_event(entry.id, None, "dry-run", "")
+            continue
+
+        variant_id, path = allocate_variant(config, record, entry.id)
+        result = generator.generate_one(entry, output_path=path)
+        if result.status == "generated" and path.exists():
+            # PNG が出来てから記録します（記録だけ残る状態を作らない）
+            register_variant(config, record, variant_id, path,
+                             meta=generation_meta(config, generator, prompt, entry.id))
+            results.append({"id": entry.id, "variant_id": variant_id, "status": "generated",
+                            "path": path, "detail": ""})
+        else:
+            # 失敗しても番号は戻しません（課金済みの可能性があるため）
+            results.append({"id": entry.id, "variant_id": variant_id, "status": "error",
+                            "path": None, "detail": result.detail or "生成に失敗しました"})
+        if on_event:
+            on_event(entry.id, variant_id, results[-1]["status"], results[-1]["detail"])
 
 
 def list_all(config, sticker_ids, data: dict | None = None) -> dict[str, StickerVariants]:

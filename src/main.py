@@ -23,6 +23,7 @@ from . import gallery as gallery_mod
 from . import package_builder as pkg
 from . import pipeline
 from . import validator as vd
+from . import variants as vr
 from .config import ConfigError, load_config
 from .csv_loader import CsvLoadError, StickerEntry, filter_entries, load_stickers
 from .image_generator import ImageGenerator, MasterImageMissingError, check_master_image
@@ -265,6 +266,11 @@ def cmd_generate(config, args) -> int:
         print("対象のスタンプがありません。")
         return EXIT_ERROR
 
+    # --variants を付けたときだけ、候補生成という別の処理に分岐します。
+    # 付けない場合は、以下の従来どおりの処理をそのまま通ります。
+    if getattr(args, "variants", None):
+        return _generate_variants(config, args, entries)
+
     config.ensure_output_dirs()
     logger = RunLogger(config.log_path)
     state = StateStore(config.state_path)
@@ -349,6 +355,62 @@ def cmd_generate(config, args) -> int:
         print(f"失敗したID: {', '.join(uniq)}")
         print(f"再実行例  : python -m src.main generate --id {uniq[0]} --force")
         print(f"ログ      : {config.log_path}")
+        return EXIT_ERROR
+    return EXIT_OK
+
+
+def _generate_variants(config, args, entries) -> int:
+    """1セリフにつき複数の候補を output/variants/<id>/ に作ります。
+
+    採用中の原画 output/generated/<id>.png と完成画像 output/final/<id>.png には
+    一切触れません。採用は別コマンド（未実装）で行います。
+    """
+    count = int(args.variants)
+    if count < 1:
+        print("--variants は1以上を指定してください。", file=sys.stderr)
+        return EXIT_ERROR
+
+    config.ensure_output_dirs()
+    logger = RunLogger(config.log_path)
+    state = StateStore(config.state_path)
+    generator = ImageGenerator(config, logger, state, dry_run=args.dry_run)
+    total = len(entries) * count
+
+    if args.dry_run:
+        print(f"[DRY-RUN] APIは呼び出しません。{len(entries)}件 × {count}案 = {total}枚の予定")
+        for entry in entries:
+            print("=" * 72)
+            print(f"{entry.id} {entry.text} / {entry.action} / {entry.expression}")
+            print(generator.prompt_for(entry))
+        print("=" * 72)
+        _print_cost(generator, total)
+        return EXIT_OK
+
+    try:
+        check_master_image(config)
+    except MasterImageMissingError as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_ERROR
+
+    print(f"候補を作ります: {len(entries)}件 × {count}案 = API呼び出し {total}件")
+    print("（採用中の原画・完成画像は変更しません）")
+    _print_cost(generator, total)
+    if not args.yes and not _confirm("候補の生成を開始しますか？"):
+        print("中止しました。")
+        return EXIT_OK
+
+    def show(sticker_id, variant_id, status, detail):
+        mark = {"generated": "OK", "error": "NG"}.get(status, status)
+        print(f"  {sticker_id} {variant_id or '-'} {mark} {detail}".rstrip())
+
+    results = vr.generate_variants(config, entries, count, generator, on_event=show)
+    ok = sum(1 for r in results if r["status"] == "generated")
+    ng = [r for r in results if r["status"] == "error"]
+    print("-" * 72)
+    print(f"完了: 成功 {ok} / 失敗 {len(ng)}（保存先: {config.dir_variants}）")
+    if ng:
+        print("失敗した候補:", ", ".join(f"{r['id']}/{r['variant_id']}" for r in ng))
+        print(f"ログ: {config.log_path}")
         return EXIT_ERROR
     return EXIT_OK
 
@@ -543,6 +605,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true", help="既存画像があっても再生成する")
     p.add_argument("--yes", "-y", action="store_true", help="コスト確認をスキップする")
     p.add_argument("--no-render", action="store_true", help="原画生成のみでセリフ合成しない")
+    p.add_argument(
+        "--variants", type=int, metavar="N",
+        help="1セリフにつきN案を output/variants/<id>/ に作ります"
+             "（採用中の原画・完成画像は変更しません）",
+    )
     p.set_defaults(func=cmd_generate)
 
     p = sub.add_parser("import", help="手持ちの画像を原画として取り込む（APIを呼びません）")

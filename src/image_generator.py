@@ -93,16 +93,26 @@ class ImageGenerator:
         return build_prompt(entry, self.master_prompt)
 
     # ------------------------------------------------------------------
-    def generate_one(self, entry: StickerEntry, *, force: bool = False) -> GenerationResult:
-        """1件生成します。既存画像があればスキップします。"""
-        out = self.output_path(entry)
+    def generate_one(self, entry: StickerEntry, *, force: bool = False,
+                     output_path: Path | None = None) -> GenerationResult:
+        """1件生成します。既存画像があればスキップします。
+
+        Args:
+            output_path: 書き出し先を変えたいときに指定します（候補画像の生成用）。
+                省略時は従来どおり output/generated/<id>.png に書き、
+                既存画像の退避・スキップ判定・state.json の更新も従来どおり行います。
+                指定した場合は「採用中の原画」ではないので、
+                generated/ には一切触れず、state.json も更新しません。
+        """
+        variant_mode = output_path is not None
+        out = Path(output_path) if variant_mode else self.output_path(entry)
         prompt = self.prompt_for(entry)
 
         if bool(self.config.get("generation.save_prompt", True)):
             save_prompt(prompt, self.config.dir_generated_prompts, entry.id)
 
         skip_existing = bool(self.config.get("generation.skip_existing", True))
-        if out.exists() and skip_existing and not force:
+        if out.exists() and skip_existing and not force and not variant_mode:
             self.logger.event(entry.id, "SKIP", "already exists")
             return GenerationResult(entry.id, "skipped", out, prompt)
 
@@ -120,19 +130,22 @@ class ImageGenerator:
             try:
                 self.logger.event(entry.id, "API REQUEST", f"attempt {attempt}/{retries}")
                 # 一時ファイルに書いてから移動し、中断時に壊れたPNGを残さないようにします。
+                out.parent.mkdir(parents=True, exist_ok=True)
                 tmp = out.with_suffix(".png.part")
                 self.provider.generate(
                     prompt=prompt,
                     reference_image=reference,
                     output_path=str(tmp),
                 )
-                # 強制再生成でも前の画像（手持ちの取り込み画像を含む）は消さずに退避します。
-                archived = archive_existing(self.config, entry.id)
-                if archived:
-                    self.logger.event(entry.id, "ARCHIVED", archived.name)
+                if not variant_mode:
+                    # 強制再生成でも前の画像（手持ちの取り込み画像を含む）は消さずに退避します。
+                    archived = archive_existing(self.config, entry.id)
+                    if archived:
+                        self.logger.event(entry.id, "ARCHIVED", archived.name)
                 tmp.replace(out)
                 self.logger.event(entry.id, "IMAGE GENERATED", str(out.name))
-                self.state.set(entry.id, "generated")
+                if not variant_mode:
+                    self.state.set(entry.id, "generated")
                 return GenerationResult(entry.id, "generated", out, prompt)
 
             except RetryableProviderError as exc:
@@ -148,7 +161,8 @@ class ImageGenerator:
                 break
 
         self.logger.error(entry.id, last_error or "unknown error")
-        self.state.set(entry.id, "error", last_error)
+        if not variant_mode:
+            self.state.set(entry.id, "error", last_error)
         return GenerationResult(entry.id, "error", None, prompt, last_error)
 
     # ------------------------------------------------------------------
