@@ -102,6 +102,13 @@ class Job:
         }
 
 
+class JobBusyError(RuntimeError):
+    """ほかのジョブが実行中のため、新しいジョブを始められない（この競合だけを表します）。
+
+    RuntimeError のサブクラスなので、既存の except RuntimeError でも捕まえられます。
+    """
+
+
 class JobManager:
     """実行中ジョブを1件に制限し、進捗とキャンセルを管理します。"""
 
@@ -129,7 +136,7 @@ class JobManager:
     def start(self, kind: str, total: int, target, *args) -> Job:
         with self._lock:
             if self.is_running():
-                raise RuntimeError("すでに処理が実行中です。完了を待つか中止してください。")
+                raise JobBusyError("すでに処理が実行中です。完了を待つか中止してください。")
             self._cancel.clear()
             job = Job(id=datetime.now().strftime("%Y%m%d%H%M%S%f"), kind=kind, total=total)
             self._job = job
@@ -693,7 +700,10 @@ def create_app(config=None) -> Flask:
             return jsonify({"error": "OPENAI_API_KEY が未設定です。.env に記入してください。"}), 400
         if jobs.is_running():
             return jsonify({"error": "すでに処理が実行中です"}), 409
-        job = jobs.start("master", 1, _run_master)
+        try:
+            job = jobs.start("master", 1, _run_master)
+        except JobBusyError as exc:     # 入口の確認とほぼ同時に、別のジョブが始まった
+            return jsonify({"error": str(exc)}), 409
         return jsonify(job.to_dict())
 
     @app.post("/api/generated/archive")
@@ -1281,7 +1291,10 @@ def create_app(config=None) -> Flask:
             except FontNotFoundError as exc:
                 return jsonify({"error": str(exc)}), 400
 
-        job = jobs.start("generate", len(ids), _run_generate, ids, force, dry_run)
+        try:
+            job = jobs.start("generate", len(ids), _run_generate, ids, force, dry_run)
+        except JobBusyError as exc:     # 入口の確認とほぼ同時に、別のジョブが始まった
+            return jsonify({"error": str(exc)}), 409
         return jsonify(job.to_dict())
 
     def _run_render(job: Job, ids: list[str]) -> None:
@@ -1322,7 +1335,10 @@ def create_app(config=None) -> Flask:
                 return jsonify({"error": str(exc)}), 400
         if jobs.is_running():
             return jsonify({"error": "すでに処理が実行中です"}), 409
-        job = jobs.start("render", len(ids), _run_render, ids)
+        try:
+            job = jobs.start("render", len(ids), _run_render, ids)
+        except JobBusyError as exc:     # 入口の確認とほぼ同時に、別のジョブが始まった
+            return jsonify({"error": str(exc)}), 409
         return jsonify(job.to_dict())
 
     # ------------------------------------------------------------------
