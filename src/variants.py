@@ -15,6 +15,7 @@ Phase 1a では **読み取りだけ** を担当します。候補の生成・�
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import hashlib
 import json
@@ -1015,7 +1016,7 @@ def _prompt_file(config, sticker_id: str) -> str | None:
 
 
 def generate_variants(config, entries, count: int, generator, *, on_event=None,
-                      on_registered=None, should_stop=None) -> list[dict]:
+                      on_reserved=None, on_registered=None, should_stop=None) -> list[dict]:
     """各スタンプについて count 枚の候補を生成します（generated/ には触れません）。
 
     Args:
@@ -1029,12 +1030,13 @@ def generate_variants(config, entries, count: int, generator, *, on_event=None,
     results: list[dict] = []
     for entry in entries:
         _generate_for_entry(config, entry, count, generator, results, on_event,
-                            on_registered, should_stop)
+                            on_registered, should_stop, on_reserved)
     return results
 
 
 def _generate_for_entry(config, entry, count: int, generator, results: list[dict],
-                        on_event, on_registered=None, should_stop=None) -> None:
+                        on_event, on_registered=None, should_stop=None,
+                        on_reserved=None) -> None:
     """1スタンプ分。番号の確保と記録は、そのつど最新の状態に対して行います。
 
     生成には時間がかかるため、その間ずっと古い状態を持たないようにしています
@@ -1053,7 +1055,11 @@ def _generate_for_entry(config, entry, count: int, generator, results: list[dict
 
         def reserve(state):     # noqa: B023 - ループごとに即時実行します
             record = ensure_record(config, state, entry.id)
-            return allocate_variant(config, record, entry.id)
+            variant_id, path = allocate_variant(config, record, entry.id)
+            if on_reserved is not None:
+                # 番号の確保と同じ保存で、呼び出し側の記録（再生成の予約など）も更新します
+                on_reserved(state, record, variant_id)
+            return variant_id, path
 
         variant_id, path = update_sticker(config, entry.id, reserve)    # 番号は先に確定・保存
 
@@ -1093,7 +1099,7 @@ def _regen_now() -> str:
     return datetime.now().isoformat(timespec="microseconds")
 
 
-def _regen_requested(record: dict) -> bool:
+def _regen_requested(record: dict, done_at: str | None = None) -> bool:
     """regen の印の中に、まだ生成していない指示があるか。
 
     regen_generated_at は「その時刻までに付いた regen の指示には、候補を作り終えた」ことを表します
@@ -1104,7 +1110,7 @@ def _regen_requested(record: dict) -> bool:
              if isinstance(v, dict) and v.get("verdict") == VERDICT_REGEN]
     if not marks:
         return False
-    done_at = record.get("regen_generated_at")
+    done_at = done_at or record.get("regen_generated_at")
     if not done_at:
         return True
     return any(isinstance(v.get("regen_marked_at"), str) and v["regen_marked_at"] > done_at
@@ -1127,13 +1133,96 @@ def _regen_owner_alive(owner) -> bool:
 
 
 def _regen_pending_run(record: dict) -> dict | None:
-    """途中で止まった（失敗・中止・異常終了した）実行。続きから作ります。"""
+    """途中で止まった（失敗・中止・異常終了した）実行。実行中（持ち主が動いている）なら None。"""
     run = record.get("regen_run")
     if not isinstance(run, dict) or not isinstance(run.get("count"), int):
         return None
     if _regen_owner_alive(run.get("owner")):
         return None
     return run
+
+
+def _regen_resumable(record: dict, run: dict) -> bool:
+    """途中の実行を続けてよいか。その実行が対象にした regen の印が、いまも残っているか。
+
+    実行を始めた時刻（since）以前に付いた印（日時の無い以前の印を含む）が1つでも残っていれば、
+    その実行の続きです。印がすべて外された・付け直された場合は、古い実行の記録（regen_run）だけを
+    根拠に作ることはしません（付け直した新しい印は、新しい実行の対象になります）。
+    """
+    since = run.get("since")
+    for item in record.get("variants") or []:
+        if not isinstance(item, dict) or item.get("verdict") != VERDICT_REGEN:
+            continue
+        marked = item.get("regen_marked_at")
+        if not isinstance(marked, str) or not isinstance(since, str) or marked <= since:
+            return True
+    return False
+
+
+def _regen_recover(config, sticker_id: str, record: dict, run: dict, *, apply: bool) -> int:
+    """前回の実行で予約した番号のうち、画像はできているのに記録されていないものを数える・戻す。
+
+    API が画像を返した直後（記録する前）に落ちた場合の、課金済みの画像です。作り直さずに登録します。
+    ただし、この実行で予約した番号のもので、最後まで読める PNG のものだけです（壊れた・書きかけの
+    ファイルは使いません）。一時ファイル（.png.part）のままなら、正式な名前に置き換えてから登録します。
+    apply=False なら数えるだけで、何も書きません。
+    """
+    done = run.get("done") or []
+    known = {v.get("variant_id") for v in record.get("variants") or [] if isinstance(v, dict)}
+    recovered = 0
+    for variant_id in run.get("reserved") or []:
+        if variant_id in done:
+            continue
+        path = variant_dir(config, sticker_id) / f"{variant_id}.png"
+        part = path.with_suffix(".png.part")
+        source = path if path.exists() else part if part.exists() else None
+        if source is None or not _is_complete_png(source):
+            continue
+        recovered += 1
+        if not apply:
+            continue
+        if source == part:
+            _replace_with_retry(part, path)
+        if variant_id not in known:
+            register_variant(config, record, variant_id, path, meta={"regen_recovered": True})
+        run.setdefault("done", []).append(variant_id)
+    return recovered
+
+
+def _regen_decide(config, sticker_id: str, record: dict, count: int, *, apply: bool) -> dict | None:
+    """1スタンプの再生成を、続きから・新しく・しない、のどれにするかを決めます。
+
+    apply=True なら、決めた結果を record に書きます（記録の鍵の中で呼びます）。
+    apply=False なら何も書きません（dry-run・計画用）。
+
+    Returns:
+        {"busy": True} … 別の処理が実行中
+        {"resume": True, "run": 実行, "remaining": n} … 途中の実行の続き
+        {"new": True, "remaining": count} … 新しい実行
+        None … 作るものは無い
+    """
+    run = record.get("regen_run")
+    if isinstance(run, dict) and _regen_owner_alive(run.get("owner")):
+        return {"busy": True}
+    done_at = record.get("regen_generated_at")
+    pending = _regen_pending_run(record)
+    if pending is not None:
+        work = pending if apply else copy.deepcopy(pending)
+        recovered = _regen_recover(config, sticker_id, record, work, apply=apply)
+        made = len(work.get("done") or []) + (0 if apply else recovered)
+        if made >= work["count"]:
+            # 全部できている（締めの前に止まった）: 作り直さずに完了として締めます
+            done_at = work.get("since") or done_at
+            if apply:
+                record["regen_generated_at"] = done_at
+                record.pop("regen_run", None)
+        elif _regen_resumable(record, work):
+            return {"resume": True, "run": work, "remaining": work["count"] - made}
+        elif apply:
+            record.pop("regen_run", None)       # 印を取り消された古い実行は、続けずに片付けます
+    if _regen_requested(record, done_at):
+        return {"new": True, "remaining": int(count)}
+    return None
 
 
 def regen_plan(config, sticker_ids, count: int) -> dict:
@@ -1150,25 +1239,22 @@ def regen_plan(config, sticker_ids, count: int) -> dict:
         record = stickers.get(sid)
         if not isinstance(record, dict):
             continue
-        run = record.get("regen_run")
-        if isinstance(run, dict) and _regen_owner_alive(run.get("owner")):
-            busy.append(sid)
+        decision = _regen_decide(config, sid, record, count, apply=False)
+        if decision is None:
             continue
-        pending = _regen_pending_run(record)
-        if pending is not None:
-            left = max(pending["count"] - len(pending.get("done") or []), 0)
-            if left:
-                targets.append({"id": sid, "count": left, "resume": True})
-                continue
-        if _regen_requested(record):
-            targets.append({"id": sid, "count": count, "resume": False})
+        if decision.get("busy"):
+            busy.append(sid)
+        elif decision["remaining"] > 0:
+            targets.append({"id": sid, "count": decision["remaining"],
+                            "resume": bool(decision.get("resume"))})
     return {"targets": targets, "total": sum(t["count"] for t in targets), "busy": busy}
 
 
 def begin_regen(config, sticker_id: str, count: int) -> dict | None:
     """1スタンプの再生成を始めます（記録の鍵の中で、対象かどうかを確かめ直してから）。
 
-    途中で止まった実行があればその続き（残りの枚数だけ）、無ければ新しい実行を始めます。
+    途中で止まった実行は、その対象だった regen の印が残っていれば続きから（残りだけ）。
+    前回の記録前に落ちた課金済みの画像は、作り直さずに登録します。
     実行中の目印（owner）を書くので、同じスタンプを2つの処理が同時に生成することはありません。
 
     Returns:
@@ -1178,23 +1264,22 @@ def begin_regen(config, sticker_id: str, count: int) -> dict | None:
         record = (state.get("stickers") or {}).get(sticker_id)
         if not isinstance(record, dict):
             return UNCHANGED
-        run = record.get("regen_run")
-        if isinstance(run, dict) and _regen_owner_alive(run.get("owner")):
-            return UNCHANGED                                   # 別の処理が実行中
-        pending = _regen_pending_run(record)
-        if pending is not None and pending["count"] > len(pending.get("done") or []):
-            run = pending                                      # 続きから（作れた分は作り直さない）
-        elif _regen_requested(record):
-            run = {"since": _regen_now(), "count": int(count), "done": []}
+        before = copy.deepcopy(record)
+        decision = _regen_decide(config, sticker_id, record, count, apply=True)
+        if decision is None or decision.get("busy") or decision["remaining"] <= 0:
+            # 締め・片付け・復元で記録が変わっていれば保存します（作るものは無い）
+            return {"claim": None} if record != before else UNCHANGED
+        if decision.get("resume"):
+            run = decision["run"]
         else:
-            return UNCHANGED
+            run = {"since": _regen_now(), "count": int(count), "done": [], "reserved": []}
         run["owner"] = _regen_owner()
         record["regen_run"] = run
-        return {"token": run["owner"]["token"], "since": run["since"],
-                "remaining": run["count"] - len(run.get("done") or [])}
+        return {"claim": {"token": run["owner"]["token"], "since": run["since"],
+                          "remaining": decision["remaining"]}}
 
     result = update_sticker(config, sticker_id, mutate)
-    return None if result is UNCHANGED else result
+    return None if result is UNCHANGED else result["claim"]
 
 
 def _regen_run_of(state: dict, sticker_id: str, token: str) -> tuple[dict, dict] | tuple[None, None]:
@@ -1204,6 +1289,19 @@ def _regen_run_of(state: dict, sticker_id: str, token: str) -> tuple[dict, dict]
     if not isinstance(owner, dict) or owner.get("token") != token:
         return None, None
     return record, run
+
+
+def regen_reserve_hook(sticker_id: str, token: str):
+    """generate_variants の on_reserved に渡す関数。
+
+    番号を確保するのと同じ保存で「この実行で予約した番号」を記録します。API が画像を返した
+    直後・記録する前に落ちても、次回その番号の画像を見つけて、作り直さずに登録できるように。
+    """
+    def hook(state, record_for_sticker, variant_id):
+        _record, run = _regen_run_of(state, sticker_id, token)
+        if run is not None:
+            run.setdefault("reserved", []).append(variant_id)
+    return hook
 
 
 def regen_register_hook(sticker_id: str, token: str):
@@ -1217,6 +1315,32 @@ def regen_register_hook(sticker_id: str, token: str):
         if run is not None:
             run.setdefault("done", []).append(variant_id)
     return hook
+
+
+def run_regen(config, entry, count: int, generator, *, on_start=None, on_event=None,
+              should_stop=None) -> dict:
+    """1スタンプの再生成を最後まで行います（GUI のジョブが1スタンプずつ呼びます）。
+
+    始める → 候補を作る（番号の予約と登録は、それぞれ記録の鍵の中の1回の保存）→ 締める。
+    API を呼んでいる間は鍵を持ちません。
+
+    Returns:
+        {"claimed": 始めたか, "remaining": 作ろうとした枚数, "complete": 全部作れたか}
+    """
+    claim = begin_regen(config, entry.id, count)
+    if claim is None:
+        return {"claimed": False, "remaining": 0, "complete": False}
+    if on_start:
+        on_start(claim["remaining"])
+    try:
+        generate_variants(
+            config, [entry], claim["remaining"], generator, on_event=on_event,
+            on_reserved=regen_reserve_hook(entry.id, claim["token"]),
+            on_registered=regen_register_hook(entry.id, claim["token"]),
+            should_stop=should_stop)
+    finally:
+        complete = finish_regen(config, entry.id, claim["token"])
+    return {"claimed": True, "remaining": claim["remaining"], "complete": complete}
 
 
 def finish_regen(config, sticker_id: str, token: str) -> bool:

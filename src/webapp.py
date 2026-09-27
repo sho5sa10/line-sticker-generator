@@ -1009,12 +1009,9 @@ def create_app(config=None) -> Flask:
             if entry is None:
                 job.log("error", "CSVに存在しません", sticker_id)
                 continue
-            # 記録の鍵の中で対象かどうかを確かめ直し、実行中の目印を付けてから作ります
-            claim = variants_mod.begin_regen(cfg_, sticker_id, count)
-            if claim is None:
-                job.log("skip", "対象ではなくなったか、別の処理が実行中のため作りませんでした", sticker_id)
-                continue
-            job.log("info", f"候補を {claim['remaining']} 枚作ります", sticker_id)
+
+            def on_start(remaining, sid=sticker_id):
+                job.log("info", f"候補を {remaining} 枚作ります", sid)
 
             def on_event(sid, variant_id, status, detail):
                 job.api_calls += 1
@@ -1024,14 +1021,13 @@ def create_app(config=None) -> Flask:
                 else:
                     job.log("error", f"{variant_id}: {detail}", sid)
 
-            try:
-                variants_mod.generate_variants(
-                    cfg_, [entry], claim["remaining"], generator, on_event=on_event,
-                    on_registered=variants_mod.regen_register_hook(sticker_id, claim["token"]),
-                    should_stop=jobs.cancelled)
-            finally:
-                complete = variants_mod.finish_regen(cfg_, sticker_id, claim["token"])
-            if complete:
+            # 記録の鍵の中で対象かどうかを確かめ直し、実行中の目印を付けてから作ります
+            # （番号の予約・登録・締めは variants.run_regen に任せます）
+            outcome = variants_mod.run_regen(cfg_, entry, count, generator, on_start=on_start,
+                                             on_event=on_event, should_stop=jobs.cancelled)
+            if not outcome["claimed"]:
+                job.log("skip", "対象ではなくなったか、別の処理が実行中のため作りませんでした", sticker_id)
+            elif outcome["complete"]:
                 job.log("ok", "再生成の候補を作り終えました", sticker_id)
             else:
                 job.log("warn", "途中で止まりました（作れた候補は残し、次回は残りだけ作ります）", sticker_id)
