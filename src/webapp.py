@@ -15,6 +15,7 @@ import os
 import threading
 import traceback
 import zipfile
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -703,15 +704,25 @@ def create_app(config=None) -> Flask:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         base = cfg_.root / "output" / "archive" / stamp
         moved = {"generated": 0, "final": 0}
-        for kind, src_dir in (("generated", cfg_.dir_generated), ("final", cfg_.dir_final)):
-            files = sorted(src_dir.glob("*.png"))
-            if not files:
-                continue
-            dest = base / kind
-            dest.mkdir(parents=True, exist_ok=True)
-            for f in files:
-                f.replace(dest / f.name)
-                moved[kind] += 1
+        sources = (("generated", cfg_.dir_generated), ("final", cfg_.dir_final))
+        sticker_ids = sorted({f.stem for _kind, d in sources for f in d.glob("*.png")})
+        try:
+            with ExitStack() as locks:
+                # 採用中のスタンプの画像を動かすと、採用の巻き戻しで元に戻されてしまうため、
+                # 対象スタンプの鍵を ID 順に取ってから動かします（修復と同じ順序）
+                for sticker_id in sticker_ids:
+                    locks.enter_context(variants_mod.adopt_lock(cfg_, sticker_id))
+                for kind, src_dir in sources:
+                    files = sorted(src_dir.glob("*.png"))
+                    if not files:
+                        continue
+                    dest = base / kind
+                    dest.mkdir(parents=True, exist_ok=True)
+                    for f in files:
+                        f.replace(dest / f.name)
+                        moved[kind] += 1
+        except variants_mod.LockBusyError as exc:
+            return jsonify({"error": f"{exc}（まだ何も退避していません）"}), 409
         if not any(moved.values()):
             return jsonify({"error": "退避する画像がありません"}), 400
         return jsonify({"archived_to": str(base), "moved": moved})
@@ -1087,40 +1098,50 @@ def create_app(config=None) -> Flask:
                 job.log("error", "CSVに存在しません", sticker_id)
                 continue
 
-            result = generator.generate_one(entry, force=force)
-            if result.status == "generated":
-                job.api_calls += 1
-                job.log("ok", "画像を生成しました", sticker_id)
-            elif result.status == "skipped":
-                job.log("skip", "既存画像のためスキップ（APIを呼びません）", sticker_id)
-            elif result.status == "dry-run":
-                job.log("info", "DRY-RUN（APIを呼びません）", sticker_id)
-                job.done += 1
-                continue
-            else:
-                job.done += 1
-                job.log("error", result.detail or "生成に失敗しました", sticker_id)
-                continue
-
+            # generated/<id>.png と final/<id>.png を書き換えるので、採用・取り込みと同じ
+            # スタンプの鍵を持って行います（採用の巻き戻しに、生成した画像を消されないため）。
+            # 鍵の順序は「スタンプ → 記録」。ここでは記録（variants.json）の鍵は取りません。
             try:
-                path, size_bytes, warnings = pipeline.render_final(cfg_, entry, style)
-                for w in warnings:
-                    job.log("warn", w, sticker_id)
-                report = vd.validate_sticker(path, cfg_)
-                for issue in report.issues:
-                    job.log("warn" if issue.severity == "WARNING" else "error",
-                            issue.message, sticker_id)
-                if report.ok:
-                    job.log("ok", f"完了 ({size_bytes / 1024:.0f}KB)", sticker_id)
-                    state.set(sticker_id, "complete")
-                else:
-                    state.set(sticker_id, "validation_failed", report.errors[0].message)
-            except Exception as exc:  # noqa: BLE001 - 1件の失敗で全体を止めない
-                job.log("error", f"{type(exc).__name__}: {exc}", sticker_id)
-                state.set(sticker_id, "error", str(exc))
+                with variants_mod.adopt_lock(cfg_, sticker_id):
+                    _generate_one_locked(job, generator, entry, force, cfg_, style, state)
+            except variants_mod.LockBusyError as exc:
+                job.log("error", f"{exc}（このスタンプは生成しませんでした）", sticker_id)
             job.done += 1
 
         job.result["api_calls"] = job.api_calls
+
+    def _generate_one_locked(job: Job, generator, entry, force: bool, cfg_, style, state) -> None:
+        """1スタンプ分の生成・合成・検証。スタンプの鍵を持った状態で呼びます。"""
+        sticker_id = entry.id
+        result = generator.generate_one(entry, force=force)
+        if result.status == "generated":
+            job.api_calls += 1
+            job.log("ok", "画像を生成しました", sticker_id)
+        elif result.status == "skipped":
+            job.log("skip", "既存画像のためスキップ（APIを呼びません）", sticker_id)
+        elif result.status == "dry-run":
+            job.log("info", "DRY-RUN（APIを呼びません）", sticker_id)
+            return
+        else:
+            job.log("error", result.detail or "生成に失敗しました", sticker_id)
+            return
+
+        try:
+            path, size_bytes, warnings = pipeline.render_final(cfg_, entry, style)
+            for w in warnings:
+                job.log("warn", w, sticker_id)
+            report = vd.validate_sticker(path, cfg_)
+            for issue in report.issues:
+                job.log("warn" if issue.severity == "WARNING" else "error",
+                        issue.message, sticker_id)
+            if report.ok:
+                job.log("ok", f"完了 ({size_bytes / 1024:.0f}KB)", sticker_id)
+                state.set(sticker_id, "complete")
+            else:
+                state.set(sticker_id, "validation_failed", report.errors[0].message)
+        except Exception as exc:  # noqa: BLE001 - 1件の失敗で全体を止めない
+            job.log("error", f"{type(exc).__name__}: {exc}", sticker_id)
+            state.set(sticker_id, "error", str(exc))
 
     @app.post("/api/generate")
     def api_generate():
@@ -1162,11 +1183,16 @@ def create_app(config=None) -> Flask:
                 break
             entry = by_id.get(sticker_id)
             job.done += 1
-            if entry is None or not (cfg_.dir_generated / f"{sticker_id}.png").exists():
+            if entry is None:
                 job.log("skip", "原画がないためスキップ", sticker_id)
                 continue
             try:
-                path, size_bytes, warnings = pipeline.render_final(cfg_, entry, style)
+                # final/<id>.png を書き換えるので、採用と同時に走らないようスタンプの鍵を持ちます
+                with variants_mod.adopt_lock(cfg_, sticker_id):
+                    if not (cfg_.dir_generated / f"{sticker_id}.png").exists():
+                        job.log("skip", "原画がないためスキップ", sticker_id)
+                        continue
+                    path, size_bytes, warnings = pipeline.render_final(cfg_, entry, style)
                 for w in warnings:
                     job.log("warn", w, sticker_id)
                 job.log("ok", f"再合成しました ({size_bytes / 1024:.0f}KB)", sticker_id)

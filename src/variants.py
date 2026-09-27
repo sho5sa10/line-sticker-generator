@@ -438,6 +438,9 @@ def file_lock(lock_path: Path, timeout: float = LOCK_TIMEOUT_SEC, *, wait: bool 
     同じスレッドがすでに持っている鍵は、そのまま入れ子で使えます
     （ロックファイルを二重に作ろうとして自分自身を待ち続けないように）。
     wait=False なら待たずに1回だけ試し、取れなければ LockBusyError にします。
+    timeout は「同じプロセスの他のスレッドを待つ時間」と「他のプロセスを待つ時間」の合計です。
+    スレッド間の待ちにも上限を付けるのは、万一鍵の順序が崩れて待ち合っても、GUI が
+    永久に止まらず「使用中」のエラーとして返すためです。
     """
     lock_path = Path(lock_path)
     key = str(lock_path)
@@ -445,13 +448,17 @@ def file_lock(lock_path: Path, timeout: float = LOCK_TIMEOUT_SEC, *, wait: bool 
     if key in held:
         yield
         return
+    deadline = time.monotonic() + timeout
     rlock = _thread_lock(key)
-    if not rlock.acquire(blocking=wait):
-        raise LockBusyError(f"候補の記録が他の処理で使用中です（{lock_path}）。")
+    acquired = rlock.acquire(timeout=max(timeout, 0.0)) if wait else rlock.acquire(blocking=False)
+    if not acquired:
+        raise LockBusyError(
+            f"候補の記録が他の処理で使用中です（{lock_path}）。しばらく待ってからやり直してください。")
     try:
         held.add(key)
         try:
-            with _exclusive_file(lock_path, timeout if wait else 0.0):
+            remaining = max(deadline - time.monotonic(), 0.0) if wait else 0.0
+            with _exclusive_file(lock_path, remaining):
                 yield
         finally:
             held.discard(key)
