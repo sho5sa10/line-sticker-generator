@@ -869,6 +869,10 @@ def ensure_record(config, data: dict, sticker_id: str) -> dict:
 
     記録が無く generated/<id>.png がある環境では、その画像を候補置き場へコピーして
     v001(legacy・採用中) として記録に残し、原画の目印（adopted_file）も付けます。
+
+    記録はあるが候補が0件（variants=[]）の場合は、その記録をそのまま使います。
+    番号の予約（next_seq）・実行中の状態・知らない項目を消さないためです
+    （作り直すと、予約済みの番号を別の処理がもう一度使ってしまいます）。
     """
     stickers = data.setdefault("stickers", {})
     record = stickers.get(sticker_id)
@@ -884,7 +888,7 @@ def ensure_record(config, data: dict, sticker_id: str) -> dict:
         with _sticker_lock_for_copy(config, sticker_id):
             kept, stamp = _materialize_legacy(config, sticker_id, legacy.variants[0])
         seq = int(kept.variant_id[1:])
-        record = {
+        fresh = {
             "adopted": kept.variant_id,
             "adopted_at": None,
             "next_seq": max(legacy.next_seq, seq + 1),
@@ -893,8 +897,22 @@ def ensure_record(config, data: dict, sticker_id: str) -> dict:
             "adopted_file": stamp,
         }
     else:
-        record = {"adopted": None, "adopted_at": None, "next_seq": 1, "variants": []}
-    stickers[sticker_id] = record
+        fresh = {"adopted": None, "adopted_at": None, "next_seq": 1, "variants": []}
+    if not isinstance(record, dict):
+        stickers[sticker_id] = fresh
+        return fresh
+
+    # 候補0件の既存の記録: 候補と採用の項目だけを整え、それ以外はそのまま残します
+    reserved = record.get("next_seq")
+    if legacy is not None:
+        record.update({k: v for k, v in fresh.items() if k != "next_seq"})
+    else:
+        for key, value in fresh.items():
+            record.setdefault(key, value)
+        if not isinstance(record.get("variants"), list):
+            record["variants"] = []
+    valid = isinstance(reserved, int) and not isinstance(reserved, bool) and reserved >= 1
+    record["next_seq"] = max(reserved, fresh["next_seq"]) if valid else fresh["next_seq"]
     return record
 
 
@@ -963,8 +981,10 @@ def allocate_variant(config, record: dict, sticker_id: str) -> tuple[str, Path]:
     seq = int(record.get("next_seq", len(record.get("variants", [])) + 1))
     used = {str(v.get("variant_id")) for v in record.get("variants", []) if isinstance(v, dict)}
     folder = variant_dir(config, sticker_id)
-    # 記録に無くてもファイルがあれば飛ばします（中断後の再実行で上書きしないため）
-    while f"v{seq:03d}" in used or (folder / f"v{seq:03d}.png").exists():
+    # 記録に無くてもファイルがあれば飛ばします（中断後の再実行で上書きしないため）。
+    # 書き込み途中の一時ファイル（.png.part）も同じです（課金済みの画像の可能性があるため）
+    while (f"v{seq:03d}" in used or (folder / f"v{seq:03d}.png").exists()
+           or (folder / f"v{seq:03d}.png.part").exists()):
         seq += 1
     variant_id = f"v{seq:03d}"
     record["next_seq"] = seq + 1
