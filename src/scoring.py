@@ -210,7 +210,7 @@ def _prepare(config, sticker_id: str):
         raise vr.StateCorruptError(vr.corrupt_message(config))
     sticker = vr.get_sticker(config, sticker_id)
     if sticker is not None and sticker.legacy:
-        vr.update(config, lambda state: vr.ensure_record(config, state, sticker_id))
+        vr.update_sticker(config, sticker_id, lambda state: vr.ensure_record(config, state, sticker_id))
         sticker = vr.get_sticker(config, sticker_id)
     return sticker
 

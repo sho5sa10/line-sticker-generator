@@ -328,6 +328,8 @@ def create_app(config=None) -> Flask:
             row["flags"] = sorted({f for v in (sv.variants if sv else []) for f in v.flags})
             # 採用した画像が、採用以外の操作で差し替わっていないか
             row["generated_mismatch"] = bool(sv and sv.generated_mismatch)
+            # 採用に失敗し、元に戻す処理も完了できなかった（画像が採用前と違う可能性）
+            row["rollback_failed"] = bool(sv and sv.rollback_failed)
             out.append(row)
         return out
 

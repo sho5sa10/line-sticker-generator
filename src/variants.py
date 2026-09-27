@@ -25,7 +25,7 @@ import tempfile
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -280,7 +280,8 @@ def _read_state_file(config) -> tuple[str, dict | None]:
     """
     path = config.variants_path
     try:
-        text = _retry_io(lambda: _read_file_bytes(path)).decode("utf-8")
+        # BOM 付き UTF-8（メモ帳などで保存）も正常として読みます。書き込みは BOM なしです
+        text = _retry_io(lambda: _read_file_bytes(path)).decode("utf-8-sig")
     except FileNotFoundError:
         return STATE_MISSING, None
     except ValueError:              # 文字コードとして読めない（UnicodeDecodeError）
@@ -312,6 +313,9 @@ def is_corrupt(config) -> bool:
     return state_status(config) == STATE_CORRUPT
 
 
+# TODO(main.py の変更が解禁されたら): 記録が壊れているとき、`generate --variants` と
+# `variants score` はトレースバックで終わる（API は呼ばず、記録も変えない）。
+# StateCorruptError を捕まえて、この corrupt_message() だけを表示し、終了コード 1 にする。
 def corrupt_message(config) -> str:
     return (f"候補の記録が壊れているため保存できません: {config.variants_path}\n"
             f"  中身を直すか、`{REPAIR_COMMAND}` で修復してください"
@@ -404,11 +408,14 @@ def _empty_state() -> dict:
 # 排他制御（同時に書き込んでも、あとから来た更新で前の更新が消えないように）
 # ---------------------------------------------------------------------------
 LOCK_TIMEOUT_SEC = 20.0
-LOCK_STALE_SEC = 120.0                # 強制終了などで残ったロックを無効とみなす時間
+# 持ち主を確かめられない鍵（別のPCが作った・中身が読めない）を古いとみなすまでの時間
+LOCK_STALE_SEC = 120.0
+# 作られた直後で、まだ持ち主が書かれていない鍵を「作りかけ」とみなす時間
+LOCK_UNWRITTEN_GRACE_SEC = 5.0
+# 古い鍵を外す係（*.break.lock）が異常終了で残ったとみなす時間
+LOCK_BREAKER_STALE_SEC = 10.0
 _LOCKS: dict[str, threading.RLock] = {}
 _LOCKS_GUARD = threading.Lock()
-
-
 _HELD = threading.local()            # このスレッドがいま持っている鍵（入れ子で取れるように）
 
 
@@ -417,33 +424,171 @@ def _thread_lock(key: str) -> threading.RLock:
         return _LOCKS.setdefault(key, threading.RLock())
 
 
+def _held_keys() -> set:
+    held = getattr(_HELD, "keys", None)
+    if held is None:
+        held = _HELD.keys = set()
+    return held
+
+
 @contextmanager
-def file_lock(lock_path: Path, timeout: float = LOCK_TIMEOUT_SEC):
+def file_lock(lock_path: Path, timeout: float = LOCK_TIMEOUT_SEC, *, wait: bool = True):
     """指定のロックファイルで、プロセス内（GUIの複数リクエスト）とプロセス間を排他します。
 
     同じスレッドがすでに持っている鍵は、そのまま入れ子で使えます
     （ロックファイルを二重に作ろうとして自分自身を待ち続けないように）。
+    wait=False なら待たずに1回だけ試し、取れなければ LockBusyError にします。
     """
     lock_path = Path(lock_path)
     key = str(lock_path)
-    held = getattr(_HELD, "keys", None)
-    if held is None:
-        held = _HELD.keys = set()
+    held = _held_keys()
     if key in held:
         yield
         return
-    with _thread_lock(key):
+    rlock = _thread_lock(key)
+    if not rlock.acquire(blocking=wait):
+        raise LockBusyError(f"候補の記録が他の処理で使用中です（{lock_path}）。")
+    try:
         held.add(key)
         try:
-            with _exclusive_file(lock_path, timeout):
+            with _exclusive_file(lock_path, timeout if wait else 0.0):
                 yield
         finally:
             held.discard(key)
+    finally:
+        rlock.release()
+
+
+# --- 鍵の持ち主（強制終了で残った鍵を見分けるため） -------------------------
+def _this_host() -> str:
+    import socket
+
+    return socket.gethostname()
+
+
+def _process_start(pid: int) -> tuple[bool, int | None]:
+    """(生きているか, 起動時刻の目印)。起動時刻は PID の再利用を見分けるために使います。
+
+    確かめられない場合（権限がない等）は「生きている・起動時刻は不明」とみなします
+    （誤って他人の鍵を外すより、待つほうが安全なため）。
+    """
+    if pid <= 0:
+        return False, None
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+        query_limited, still_active = 0x1000, 259
+        handle = kernel32.OpenProcess(query_limited, False, pid)
+        if not handle:
+            err = ctypes.get_last_error()
+            return (False, None) if err == 87 else (True, None)   # 87: その PID のプロセスは無い
+        try:
+            code = wintypes.DWORD()
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)) and code.value != still_active:
+                return False, None                                 # 終了済み（ハンドルだけ残っている）
+            times = [wintypes.FILETIME() for _ in range(4)]
+            if kernel32.GetProcessTimes(handle, *[ctypes.byref(t) for t in times]):
+                created = times[0]
+                return True, (created.dwHighDateTime << 32) | created.dwLowDateTime
+            return True, None
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False, None
+    except PermissionError:
+        return True, None
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        return True, int(fields[19])                               # starttime
+    except (OSError, IndexError, ValueError):
+        return True, None
+
+
+_SELF_START = None
+
+
+def _lock_owner_info() -> bytes:
+    global _SELF_START
+    if _SELF_START is None:
+        _SELF_START = _process_start(os.getpid())[1]
+    return json.dumps({"pid": os.getpid(), "host": _this_host(), "started": _SELF_START,
+                       "created": time.time()}).encode("utf-8")
+
+
+def _lock_is_stale(lock_path: Path) -> bool:
+    """残っている鍵が、もう誰も持っていない（古い）か。
+
+    - 同じPCの鍵: 持ち主のプロセスが無い、または PID が別のプロセスに再利用されている → 古い
+    - 別のPCの鍵・持ち主が読めない鍵: 作られてからの時間で判断（LOCK_STALE_SEC）
+    - 作られた直後でまだ持ち主が書かれていない鍵は、少し待ちます
+    """
+    try:
+        stat = lock_path.stat()
+        text = _retry_io(lambda: _read_file_bytes(lock_path)).decode("utf-8", "replace").strip()
+    except FileNotFoundError:
+        return False                      # もう無い（外す必要もない）
+    except OSError:
+        return False
+    age = time.time() - stat.st_mtime
+    if not text:
+        return age > LOCK_UNWRITTEN_GRACE_SEC
+    try:
+        info = json.loads(text)
+        if not isinstance(info, dict):
+            raise ValueError
+    except ValueError:
+        info = {"pid": int(text)} if text.isdigit() else {}   # 以前の形式（PID だけ）
+    pid = info.get("pid")
+    if not isinstance(pid, int):
+        return age > LOCK_STALE_SEC
+    if info.get("host") not in (None, _this_host()):
+        return age > LOCK_STALE_SEC       # 別のPCのプロセスは確かめられない
+    alive, started = _process_start(pid)
+    if not alive:
+        return True
+    recorded = info.get("started")
+    return recorded is not None and started is not None and recorded != started
+
+
+def _break_stale_lock(lock_path: Path) -> bool:
+    """古い鍵を外します。外す係は1つの処理だけで、係になってから古さを確かめ直します。
+
+    （2つの処理が同時に「古い」と判断して、片方が取り直したばかりの鍵をもう片方が
+    消してしまうことを防ぐため）
+    """
+    breaker = lock_path.with_suffix(".break.lock")
+    try:
+        fd = os.open(breaker, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        try:
+            if time.time() - breaker.stat().st_mtime > LOCK_BREAKER_STALE_SEC:
+                breaker.unlink(missing_ok=True)       # 係が異常終了して残ったもの
+        except OSError:
+            pass
+        return False
+    except PermissionError:
+        return False
+    try:
+        os.close(fd)
+        if _lock_is_stale(lock_path):
+            _retry_io(lambda: lock_path.unlink(missing_ok=True))
+            return True
+        return False
+    finally:
+        _retry_io(lambda: breaker.unlink(missing_ok=True))
 
 
 @contextmanager
 def _exclusive_file(lock_path: Path, timeout: float):
-    """ロックファイルを O_EXCL で作ってプロセス間を排他します。"""
+    """ロックファイルを O_EXCL で作ってプロセス間を排他します（持ち主の情報を書き込みます）。"""
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + timeout
     fd = None
@@ -452,21 +597,17 @@ def _exclusive_file(lock_path: Path, timeout: float):
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             break
         except FileExistsError:
-            try:    # 古いロックは、異常終了の置き土産とみなして外します
-                if time.time() - lock_path.stat().st_mtime > LOCK_STALE_SEC:
-                    lock_path.unlink(missing_ok=True)
-                    continue
-            except OSError:
-                pass
+            if _break_stale_lock(lock_path):   # 強制終了などで残った鍵なら、すぐ取り直す
+                continue
         except PermissionError:
             pass    # Windows: 削除処理中のロックファイルは一時的に開けません
-        if time.monotonic() > deadline:
-            raise VariantError(
+        if time.monotonic() >= deadline:
+            raise LockBusyError(
                 f"候補の記録が他の処理で使用中です（{lock_path}）。"
                 "しばらく待ってからやり直してください。") from None
         time.sleep(0.05)
     try:
-        os.write(fd, str(os.getpid()).encode())
+        os.write(fd, _lock_owner_info())
         os.close(fd)
         fd = None
         yield
@@ -481,6 +622,10 @@ def state_lock(config, timeout: float = LOCK_TIMEOUT_SEC):
     return file_lock(Path(str(config.variants_path) + ".lock"), timeout)
 
 
+def _adopt_lock_path(config, sticker_id: str) -> Path:
+    return config.variants_path.with_name(f"variants.adopt-{sticker_id}.lock")
+
+
 def adopt_lock(config, sticker_id: str, timeout: float = LOCK_TIMEOUT_SEC):
     """1スタンプの採用処理の鍵。
 
@@ -488,7 +633,10 @@ def adopt_lock(config, sticker_id: str, timeout: float = LOCK_TIMEOUT_SEC):
     並行すると「記録は A、画像は B」という食い違いが起きます。状態ファイルの鍵とは別に、
     スタンプ単位で採用だけを直列化します（別のスタンプの採用や、評価・判断は止めません）。
     """
-    return file_lock(config.variants_path.with_name(f"variants.adopt-{sticker_id}.lock"), timeout)
+    return file_lock(_adopt_lock_path(config, sticker_id), timeout)
+
+
+UNCHANGED = object()    # update() の mutate がこれを返したら、保存しません（変更なし）
 
 
 def update(config, mutate, *, timeout: float = LOCK_TIMEOUT_SEC):
@@ -499,6 +647,7 @@ def update(config, mutate, *, timeout: float = LOCK_TIMEOUT_SEC):
 
     Args:
         mutate: 最新の state を受け取って書き換える関数。戻り値はそのまま返します。
+            UNCHANGED を返した場合は保存しません（repair の「変更なし」など）。
     """
     with state_lock(config, timeout):
         status, state = _read_state_file(config)
@@ -509,6 +658,8 @@ def update(config, mutate, *, timeout: float = LOCK_TIMEOUT_SEC):
         state.setdefault("schema", SCHEMA)
         state.setdefault("defaults", {})
         result = mutate(state)
+        if result is UNCHANGED:
+            return result
         try:
             save(config, state)
         except PermissionError as exc:      # 再試行しても置き換えられなかった（元のファイルは無傷）
@@ -516,6 +667,37 @@ def update(config, mutate, *, timeout: float = LOCK_TIMEOUT_SEC):
                 f"候補の記録を一時的に保存できませんでした（他の処理が使用中の可能性）: "
                 f"{config.variants_path}\n  少し待ってからやり直してください（{exc}）") from exc
         return result
+
+
+def update_sticker(config, sticker_id: str, mutate, *, timeout: float = LOCK_TIMEOUT_SEC):
+    """1スタンプの記録を変更する update()。
+
+    記録の無いスタンプでは、変更の中で generated/<id>.png を v001 としてコピーします。
+    その画像は取り込み・採用がスタンプ単位の鍵を持って書き換えるため、コピーも同じ鍵を
+    持って行う必要があります。鍵の順序は「スタンプの鍵 → 記録の鍵」（採用と同じ）です。
+    普段は記録の鍵だけで済ませ、コピーが必要なのにスタンプの鍵を取れなかったときだけ、
+    スタンプの鍵を先に取ってからやり直します（順序を逆にして待つと、互いに待ち合って止まるため）。
+    """
+    try:
+        return update(config, mutate, timeout=timeout)
+    except StickerLockNeeded:
+        with adopt_lock(config, sticker_id, timeout):
+            return update(config, mutate, timeout=timeout)
+
+
+@contextmanager
+def _sticker_lock_for_copy(config, sticker_id: str):
+    """generated を v001 にコピーする間、スタンプの鍵を持ちます。
+
+    すでに持っていればそのまま。持っていなければ待たずに1回だけ試し、他の処理
+    （取り込み・採用）が持っていれば StickerLockNeeded にします（呼び出し側がやり直す）。
+    """
+    try:
+        with file_lock(_adopt_lock_path(config, sticker_id), wait=False):
+            yield
+    except LockBusyError as exc:
+        raise StickerLockNeeded(
+            f"同じスタンプを他の処理（取り込み・採用）が使用中です: {sticker_id}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -597,16 +779,6 @@ def get_sticker(config, sticker_id: str, data: dict | None = None) -> StickerVar
         rollback_failed=record.get("rollback_failed")
         if isinstance(record.get("rollback_failed"), dict) else None,
     )
-
-
-def file_stamp(path: str | Path) -> dict | None:
-    """ファイルの目印（サイズ・更新日時・SHA1）。差し替えの検出に使います。"""
-    p = Path(path)
-    try:
-        stat = p.stat()
-    except OSError:
-        return None
-    return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns, "sha1": sha1_file(p)}
 
 
 def _generated_mismatch(config, sticker_id: str, record: dict) -> bool:
@@ -701,7 +873,8 @@ def ensure_record(config, data: dict, sticker_id: str) -> dict:
         # 記録に残す時点で、候補置き場へ実体をコピーします。
         # generated/<id>.png は採用のたびに中身が変わるため、そこを指したままだと
         # v001 が「いま採用中の画像」の別名になり、元の絵が追えなくなります。
-        kept, stamp = _materialize_legacy(config, sticker_id, legacy.variants[0])
+        with _sticker_lock_for_copy(config, sticker_id):
+            kept, stamp = _materialize_legacy(config, sticker_id, legacy.variants[0])
         seq = int(kept.variant_id[1:])
         record = {
             "adopted": kept.variant_id,
@@ -715,6 +888,18 @@ def ensure_record(config, data: dict, sticker_id: str) -> dict:
         record = {"adopted": None, "adopted_at": None, "next_seq": 1, "variants": []}
     stickers[sticker_id] = record
     return record
+
+
+def _is_complete_png(path: Path) -> bool:
+    """最後まで読み込める PNG か（書きかけのファイルを候補として保存しないため）。"""
+    from PIL import Image
+
+    try:
+        with Image.open(path) as img:
+            img.load()
+        return True
+    except Exception:  # noqa: BLE001 - 読めない理由は問いません
+        return False
 
 
 def _is_readable_png(path: Path) -> bool:
@@ -737,6 +922,8 @@ def _materialize_legacy(config, sticker_id: str, variant: Variant) -> tuple[Vari
         (候補, generated の目印 {size, mtime_ns, sha1})
     """
     src = variant.path(config)
+    if not _is_complete_png(src):
+        raise VariantError(f"原画を読めないため、候補として保存できません（書き込み中の可能性）: {src}")
     stat = src.stat()
     src_sha = sha1_file(src)
     stamp = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns, "sha1": src_sha}
@@ -857,7 +1044,7 @@ def _generate_for_entry(config, entry, count: int, generator, results: list[dict
             record = ensure_record(config, state, entry.id)
             return allocate_variant(config, record, entry.id)
 
-        variant_id, path = update(config, reserve)      # 番号は先に確定・保存
+        variant_id, path = update_sticker(config, entry.id, reserve)    # 番号は先に確定・保存
 
         result = generator.generate_one(entry, output_path=path)
         if result.status == "generated" and path.exists():
@@ -868,7 +1055,7 @@ def _generate_for_entry(config, entry, count: int, generator, results: list[dict
                 register_variant(config, record, variant_id, path, meta=meta)
 
             # PNG が出来てから記録します（記録だけ残る状態を作らない）
-            update(config, register)
+            update_sticker(config, entry.id, register)
             results.append({"id": entry.id, "variant_id": variant_id, "status": "generated",
                             "path": path, "detail": ""})
         else:
@@ -888,6 +1075,14 @@ class VariantError(Exception):
 
 class StateCorruptError(VariantError):
     """variants.json が壊れていて、上書きすると記録を失う場合に送出されます。"""
+
+
+class LockBusyError(VariantError):
+    """鍵を他の処理が持っている（待たずに取ろうとして取れなかった場合も含む）。"""
+
+
+class StickerLockNeeded(LockBusyError):
+    """記録の無いスタンプの原画をコピーするのに、スタンプの鍵が必要（update_sticker がやり直す）。"""
 
 
 class StateBusyError(VariantError):
@@ -936,7 +1131,7 @@ def set_verdict(config, sticker_id: str, variant_id: str, verdict: str) -> dict:
         item["verdict"] = verdict
         return item
 
-    return update(config, mutate)
+    return update_sticker(config, sticker_id, mutate)
 
 
 def set_rating(config, sticker_id: str, variant_id: str, rating: int | None) -> dict:
@@ -954,7 +1149,7 @@ def set_rating(config, sticker_id: str, variant_id: str, rating: int | None) -> 
         item["human_rating"] = rating
         return item
 
-    return update(config, mutate)
+    return update_sticker(config, sticker_id, mutate)
 
 
 # ---------------------------------------------------------------------------
@@ -1205,33 +1400,61 @@ def list_all(config, sticker_ids, data: dict | None = None) -> dict[str, Sticker
 _VARIANT_FILE = "v[0-9][0-9][0-9].png"
 
 
-def repair_state(config) -> dict:
-    """候補の記録を修復します。
+REPAIR_OK = "ok"                    # 記録は正常
+REPAIR_CORRUPT = "corrupt"          # 壊れていたので退避して作り直した
+REPAIR_MISSING = "missing"          # 記録ファイルが無い
+REPAIR_TEMP_ONLY = "temp_only"      # 記録ファイルは無く、書き込み途中の一時ファイルだけが残っている
 
-    1. variants.json が壊れていれば、消さずに variants.json.corrupt-<日時>-<一意ID> へ退避
-    2. 候補フォルダ（output/variants/<id>/vNNN.png）を調べ、記録に無い画像を候補として戻す
-       - 記録が無いスタンプは作り直し、generated/<id>.png と中身が同じ候補を「採用中」にします
-         （同じものが無ければ generated を legacy 候補として保存して採用中にします）
-       - 記録があるスタンプは、採用状態・判断・評価を変えず、足りない候補だけ追加します
+
+def _leftover_state_temps(config) -> list[str]:
+    path = config.variants_path
+    names = sorted(p.name for p in path.parent.glob(f".{path.name}.*.tmp"))
+    if path.with_suffix(".json.tmp").exists():             # 以前の版の一時ファイル名
+        names.append(path.with_suffix(".json.tmp").name)
+    return names
+
+
+def repair_state(config) -> dict:
+    """候補の記録を修復します。表示と実際の変更が一致するよう、結果を分類して返します。
+
+    - 正常: 記録に無い候補画像があれば追加します。何も無ければ **保存しません**。
+    - 壊れている: 消さずに variants.json.corrupt-<日時>-<一意ID> へ退避し、候補フォルダの
+      画像から作り直します（generated/<id>.png と中身が同じ候補を「採用中」にします）。
+    - 記録ファイルが無い: 候補フォルダに画像があれば作り直し、無ければ何も作りません。
+    - 一時ファイルだけがある: 中身が最新かどうか分からないので、自動では使いません（変更なし）。
     画像ファイルは消しも上書きもしません。
 
     Returns:
-        {"quarantined": 退避先 or None, "stickers": {id: {"added": [...], "adopted": id|None}},
-         "unreadable": [読めなかった画像]}
+        {"kind": 上の分類, "changed": 保存したか, "quarantined": 退避先 or None,
+         "stickers": {id: {"added": [...], "adopted": id|None, "rebuilt": bool}},
+         "unreadable": [読めなかった画像], "temp_files": [一時ファイル名]}
     """
-    report: dict = {"quarantined": None, "stickers": {}, "unreadable": []}
-    with state_lock(config):
-        moved = quarantine_corrupt_state(config)
-        report["quarantined"] = str(moved) if moved else None
+    report: dict = {"kind": None, "changed": False, "quarantined": None, "stickers": {},
+                    "unreadable": [], "temp_files": []}
+    root = config.dir_variants
+    sticker_ids = sorted(p.name for p in root.iterdir() if p.is_dir()) if root.exists() else []
+    with ExitStack() as locks:
+        # 鍵の順序は「スタンプの鍵（ID順）→ 記録の鍵」。採用・取り込みと同じ順序です
+        for sid in sticker_ids:
+            locks.enter_context(adopt_lock(config, sid))
+        locks.enter_context(state_lock(config))
+
+        status = state_status(config)
+        if status == STATE_MISSING and _leftover_state_temps(config):
+            report["kind"] = REPAIR_TEMP_ONLY
+            report["temp_files"] = _leftover_state_temps(config)
+            return report
+        if status == STATE_CORRUPT:
+            report["kind"] = REPAIR_CORRUPT
+            report["quarantined"] = str(quarantine_corrupt_state(config))
+        else:
+            report["kind"] = REPAIR_OK if status == STATE_OK else REPAIR_MISSING
 
         def mutate(state):
             stickers = state.setdefault("stickers", {})
-            root = config.dir_variants
-            folders = sorted(p for p in root.iterdir() if p.is_dir()) if root.exists() else []
-            for folder in folders:
-                sid = folder.name
+            for sid in sticker_ids:
                 files = []
-                for path in sorted(folder.glob(_VARIANT_FILE)):
+                for path in sorted((root / sid).glob(_VARIANT_FILE)):
                     if _is_readable_png(path):
                         files.append(path)
                     else:
@@ -1240,7 +1463,8 @@ def repair_state(config) -> dict:
                 if isinstance(record, dict) and record.get("variants"):
                     added = _add_missing_variants(config, record, files)
                     if added:
-                        report["stickers"][sid] = {"added": added, "adopted": record.get("adopted")}
+                        report["stickers"][sid] = {"added": added, "adopted": record.get("adopted"),
+                                                   "rebuilt": False}
                     continue
                 if not files:
                     continue
@@ -1248,10 +1472,11 @@ def repair_state(config) -> dict:
                 stickers[sid] = record
                 report["stickers"][sid] = {
                     "added": [v["variant_id"] for v in record["variants"]],
-                    "adopted": record.get("adopted"),
+                    "adopted": record.get("adopted"), "rebuilt": True,
                 }
+            return None if report["stickers"] else UNCHANGED
 
-        update(config, mutate)
+        report["changed"] = update(config, mutate) is not UNCHANGED
     return report
 
 
@@ -1286,7 +1511,8 @@ def _rebuild_record(config, sticker_id: str, files: list[Path]) -> dict:
         match = next((item for item, path in zip(items, files) if sha1_file(path) == gen_sha), None)
         if match is None:
             legacy = ensure_legacy_variant(config, sticker_id)
-            kept, _stamp = _materialize_legacy(config, sticker_id, legacy.variants[0])
+            with _sticker_lock_for_copy(config, sticker_id):     # repair_state が持っています
+                kept, _stamp = _materialize_legacy(config, sticker_id, legacy.variants[0])
             match = kept.to_dict()
             items.append(match)
             items.sort(key=lambda v: v["variant_id"])
@@ -1317,18 +1543,38 @@ def _main(argv: list[str] | None = None) -> int:
     except VariantError as exc:
         print(f"ERROR:\n  {exc}", file=sys.stderr)
         return 1
-    if report["quarantined"]:
+
+    kind = report["kind"]
+    if kind == REPAIR_TEMP_ONLY:
+        print(f"記録ファイルがありません: {config.variants_path}")
+        print("  書き込み途中の一時ファイルが残っています（内容が最新かは分からないため、自動では使いません）:")
+        for name in report["temp_files"]:
+            print(f"    {name}")
+        print("  内容を確認し、使う場合は variants.json に名前を変えてから、もう一度実行してください。"
+              "使わない場合は削除してから実行してください。")
+        return 1
+    if kind == REPAIR_CORRUPT:
         print(f"壊れた記録を退避しました（削除していません）: {report['quarantined']}")
+    elif kind == REPAIR_MISSING:
+        print(f"記録ファイルがありません: {config.variants_path}")
     else:
-        print("記録は壊れていませんでした（書き換えずに、足りない候補だけ確認しました）。")
+        print("記録は正常です。")
+
     for sid, info in report["stickers"].items():
-        print(f"  {sid}: 候補を戻しました {', '.join(info['added'])}"
-              f"（採用中: {info['adopted'] or '-'}）")
-    if not report["stickers"]:
-        print("  戻す候補はありませんでした。")
+        if info["rebuilt"]:
+            print(f"  {sid}: 候補フォルダの画像から記録を作り直しました {', '.join(info['added'])}"
+                  f"（採用中: {info['adopted'] or '-'}）")
+        else:
+            print(f"  {sid}: 記録に無かった候補を追加しました {', '.join(info['added'])}"
+                  f"（採用中は変えていません: {info['adopted'] or '-'}）")
     for path in report["unreadable"]:
         print(f"  WARNING: 読めない画像のため戻していません: {path}")
-    print("判断・評価は復元できないため、候補比較の画面で付け直してください。")
+
+    if not report["changed"]:
+        print("変更はありません（記録ファイルは書き換えていません）。" if kind != REPAIR_MISSING
+              else "候補フォルダに画像も無いため、直すものはありません（記録ファイルは作っていません）。")
+    elif any(info["rebuilt"] for info in report["stickers"].values()):
+        print("作り直した候補の判断・評価は復元できないため、候補比較の画面で付け直してください。")
     return 0
 
 

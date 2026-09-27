@@ -932,12 +932,16 @@ function cellHtml(s) {
   const vflag = (s.flags || []).length
     ? `<span class="tag vflag" title="${escapeHtml(s.flags.join(' / '))}">⚠</span>` : '';
   // 採用した候補と、いま使われている原画が食い違っている（作り直し・取り込みで差し替わった）
-  const mismatch = s.generated_mismatch
-    ? '<span class="tag mismatch" title="いまの原画は、採用した候補と違います。'
-      + '正しい候補をもう一度採用してください">⚠原画</span>' : '';
+  // 巻き戻しの失敗のほうが重大なので、同じ場所に優先して出します（表示が重ならないように）
+  const mismatch = s.rollback_failed
+    ? '<span class="tag mismatch" title="採用に失敗し、元の画像へ戻す処理も完了できませんでした。'
+      + '候補比較の画面を開いて確認し、候補をもう一度採用してください">⚠巻き戻し失敗</span>'
+    : s.generated_mismatch
+      ? '<span class="tag mismatch" title="いまの原画は、採用した候補と違います。'
+        + '正しい候補をもう一度採用してください">⚠原画</span>' : '';
   return `
     <div class="cell ${sel ? 'selected' : ''} ${s.sale ? `sale-${s.sale}` : ''}
-         ${s.generated_mismatch ? 'mismatch' : ''}" data-id="${s.id}">
+         ${s.generated_mismatch || s.rollback_failed ? 'mismatch' : ''}" data-id="${s.id}">
       <input class="pick" type="checkbox" ${sel ? 'checked' : ''} aria-label="選択">
       ${sale}${variants}${vflag}${mismatch}${tag}
       <div class="thumb" data-zoom="${s.id}">${thumb}</div>
@@ -2236,6 +2240,7 @@ function applyStickerResponse(requestedId, sticker) {
   if (row) {
     row.adopted = sticker.adopted;
     row.generated_mismatch = !!sticker.generated_mismatch;
+    row.rollback_failed = !!sticker.rollback_failed;
   }
   if (shownStickerId() !== requestedId) return false;
   vstate.sticker = sticker;

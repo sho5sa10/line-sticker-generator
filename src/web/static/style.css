@@ -833,4 +833,5 @@ main { padding: 16px; max-width: 1500px; margin: 0 auto; }
 .vcorrupt b, .vcorrupt span { display: block; }
 .vcorrupt .btn { margin-top: 6px; }
 .cell.mismatch { border-color: color-mix(in srgb, var(--warn) 60%, var(--line)); }
-.tag.mismatch { left: 34px; right: auto; color: var(--warn); }
+/* 「3案」「⚠」と同じ行だと重なるため、2段目に出します */
+.tag.mismatch { left: 34px; right: auto; top: 32px; color: var(--warn); }

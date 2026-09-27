@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import os
 import subprocess
@@ -255,6 +256,7 @@ def test_g_h_mixed_concurrent_operations_keep_state_valid(tmp_config):
     _add_candidates(tmp_config, "002", colors=(BLUE,))
     stop = threading.Event()
     errors, last = [], {}
+    alternate = itertools.cycle(["v003", "v002"])          # 採用する候補を交互に（時刻に依存しない）
 
     def loop(fn):
         while not stop.is_set():
@@ -276,7 +278,7 @@ def test_g_h_mixed_concurrent_operations_keep_state_valid(tmp_config):
     ops = [lambda: scoring.score_all(tmp_config, ["001", "002"], force=True),
            lambda: scoring.score_variant(tmp_config, "001", "v002"),
            rate, verdict,
-           lambda: vr.adopt(tmp_config, ENTRY, "v003" if time.time() % 2 < 1 else "v002"),
+           lambda: vr.adopt(tmp_config, ENTRY, next(alternate)),
            lambda: _generate_one(tmp_config, "002")]
     threads = [threading.Thread(target=loop, args=(op,)) for op in ops]
     [t.start() for t in threads]
@@ -728,22 +730,27 @@ def test_import_waits_for_adoption_and_is_detected_afterwards(tmp_config, monkey
     vr.adopt(tmp_config, ENTRY, "v002")
     buf = io.BytesIO()
     sticker_like(body=(30, 30, 30, 255)).save(buf, format="PNG")
-    started, results = threading.Event(), []
+    started, imported, results = threading.Event(), threading.Event(), []
     original_validate = vd.validate_sticker
+    importing = []
+
+    def run_import():
+        results.append(importer.import_image(
+            tmp_config, ENTRY, buf.getvalue(), TextStyle.from_config(tmp_config)))
+        imported.set()
 
     def validate_while_importing(*args, **kwargs):
         if not started.is_set():
             started.set()
-            threading.Thread(target=lambda: results.append(importer.import_image(
-                tmp_config, ENTRY, buf.getvalue(), TextStyle.from_config(tmp_config)))).start()
-            time.sleep(0.3)             # 取り込みが先に原画を書こうとしても、鍵で待たされる
+            importing.append(threading.Thread(target=run_import))
+            importing[0].start()
+            # 鍵が無ければ取り込みはここで終わってしまう。終わらないこと（待たされていること）を確かめる
+            assert not imported.wait(0.5)
         return original_validate(*args, **kwargs)
     monkeypatch.setattr(vd, "validate_sticker", validate_while_importing)
     vr.adopt(tmp_config, ENTRY, "v003")
     monkeypatch.undo()
-    deadline = time.time() + 30
-    while not results and time.time() < deadline:
-        time.sleep(0.05)
+    importing[0].join(30)
 
     record = _state(tmp_config)["stickers"]["001"]
     v003 = _sha(vr.variant_dir(tmp_config, "001") / "v003.png")
