@@ -202,6 +202,11 @@ def create_app(config=None) -> Flask:
             return jsonify({"error": "別のサイトからの操作は受け付けません"}), 403
         return None
 
+    @app.errorhandler(variants_mod.StateBusyError)
+    def variants_state_busy(exc):
+        """候補の記録を一時的に読み書きできない（他の処理が使用中）。壊れていないので 503。"""
+        return jsonify({"error": str(exc), "retry": True}), 503
+
     @app.after_request
     def no_stale_assets(response):
         """画面（HTML/CSS/JS）は毎回サーバーに確認させ、古いものが使われないようにします。"""
@@ -911,6 +916,8 @@ def create_app(config=None) -> Flask:
 
     def _variant_error(exc) -> tuple:
         """候補の操作エラーをAPIの形にします（記録が壊れている場合は 409）。"""
+        if isinstance(exc, variants_mod.StateBusyError):
+            return jsonify({"error": str(exc), "retry": True}), 503
         status = 409 if isinstance(exc, variants_mod.StateCorruptError) else 400
         return jsonify({"error": str(exc)}), status
 

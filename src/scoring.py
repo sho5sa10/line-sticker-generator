@@ -201,76 +201,102 @@ def needs_scoring(item: dict, *, force: bool = False) -> bool:
     return scores.get("formula") != SCORING_FORMULA
 
 
-def score_sticker(config, sticker_id: str, data: dict, *, force: bool = False) -> list[dict]:
-    """1スタンプ分の候補を評価して記録に書き込みます（保存は呼び出し側）。"""
-    sticker = vr.get_sticker(config, sticker_id, data)
-    if sticker is None:
-        return []
-    record = vr.ensure_record(config, data, sticker_id)
+def _prepare(config, sticker_id: str):
+    """評価の前の準備。記録が無い legacy のスタンプだけ、先に記録を作ります（v001 を実体化）。
+
+    壊れた記録には何も書かないよう、計算を始める前に止めます。
+    """
+    if vr.is_corrupt(config):
+        raise vr.StateCorruptError(vr.corrupt_message(config))
+    sticker = vr.get_sticker(config, sticker_id)
+    if sticker is not None and sticker.legacy:
+        vr.update(config, lambda state: vr.ensure_record(config, state, sticker_id))
+        sticker = vr.get_sticker(config, sticker_id)
+    return sticker
+
+
+def _measure_sticker(config, sticker, *, force: bool, only: str | None = None) -> list[dict]:
+    """候補の画像を計算します（記録には書きません。重い処理なので鍵の外で行います）。"""
     results: list[dict] = []
-    for item in record.get("variants", []):
-        if not isinstance(item, dict):
+    for variant in sticker.variants:
+        if only is not None and variant.variant_id != only:
             continue
-        variant_id = str(item.get("variant_id", ""))
+        item = variant.to_dict()
+        base = {"id": sticker.sticker_id, "variant_id": variant.variant_id}
         if not needs_scoring(item, force=force):
-            results.append({"id": sticker_id, "variant_id": variant_id, "status": "skipped",
-                            "scores": item.get("derived_scores"), "flags": item.get("flags") or []})
+            results.append({**base, "status": "skipped", "scores": item.get("derived_scores"),
+                            "flags": item.get("flags") or []})
             continue
-        variant = sticker.find(variant_id)
         try:
             metrics = measure(variant.path(config))
         except ScoringError as exc:
             # 画像が無い・壊れているときは記録を変えません（人が対処します）
-            results.append({"id": sticker_id, "variant_id": variant_id, "status": "error",
-                            "detail": str(exc), "scores": None, "flags": []})
+            results.append({**base, "status": "error", "detail": str(exc), "scores": None,
+                            "flags": []})
             continue
         scores, flags = evaluate(metrics)
-        item["raw_metrics"] = metrics
-        item["derived_scores"] = scores
-        item["flags"] = flags
-        results.append({"id": sticker_id, "variant_id": variant_id, "status": "scored",
-                        "scores": scores, "flags": flags})
+        results.append({**base, "status": "scored", "scores": scores, "flags": flags,
+                        "_file": variant.file, "_metrics": metrics})
     return results
 
 
-def score_variant(config, sticker_id: str, variant_id: str, *, force: bool = True,
-                  data: dict | None = None) -> dict:
+def _write_scores(config, sticker_id: str, results: list[dict]) -> None:
+    """計算結果を、鍵を取って **最新の記録に** 書き込みます（評価の項目だけ）。
+
+    計算中に候補が消えた・参照先の画像が変わった場合は、古い画像の結果を書かずに
+    status="stale" にします。採用状態・人の判断・他の候補には触れません。
+    """
+    pending = [r for r in results if r["status"] == "scored"]
+    if pending:
+        def apply(state):
+            record = (state.get("stickers") or {}).get(sticker_id)
+            variants = record.get("variants") if isinstance(record, dict) else None
+            items = {v.get("variant_id"): v for v in (variants or []) if isinstance(v, dict)}
+            for r in pending:
+                item = items.get(r["variant_id"])
+                if item is None or item.get("file") != r["_file"]:
+                    r["status"] = "stale"
+                    continue
+                item["raw_metrics"] = r["_metrics"]
+                item["derived_scores"] = r["scores"]
+                item["flags"] = r["flags"]
+
+        vr.update(config, apply)
+    for r in results:
+        r.pop("_file", None)
+        r.pop("_metrics", None)
+
+
+def score_variant(config, sticker_id: str, variant_id: str, *, force: bool = True) -> dict:
     """候補1件だけを評価して保存します（GUIの「再評価」用）。
 
     画像・採用状態・人の判断（verdict / human_rating）は変更しません。
     """
-    state = vr.load(config) if data is None else data
-    sticker = vr.get_sticker(config, sticker_id, state)
+    sticker = _prepare(config, sticker_id)
     if sticker is None or sticker.find(variant_id) is None:
         raise ScoringError(f"候補が見つかりません: {sticker_id}/{variant_id}")
-    record = vr.ensure_record(config, state, sticker_id)
-    item = next((v for v in record.get("variants", [])
-                 if isinstance(v, dict) and v.get("variant_id") == variant_id), None)
-    if item is None:  # pragma: no cover - get_sticker と同じ元を見ています
-        raise ScoringError(f"候補が見つかりません: {sticker_id}/{variant_id}")
-    if not needs_scoring(item, force=force):
-        return {"id": sticker_id, "variant_id": variant_id, "status": "skipped",
-                "scores": item.get("derived_scores"), "flags": item.get("flags") or []}
-
-    metrics = measure(sticker.find(variant_id).path(config))     # 失敗時は ScoringError
-    scores, flags = evaluate(metrics)
-    item["raw_metrics"] = metrics
-    item["derived_scores"] = scores
-    item["flags"] = flags
-    vr.save(config, state)
-    return {"id": sticker_id, "variant_id": variant_id, "status": "scored",
-            "scores": scores, "flags": flags}
+    result = _measure_sticker(config, sticker, force=force, only=variant_id)[0]
+    if result["status"] == "error":
+        raise ScoringError(result["detail"])
+    _write_scores(config, sticker_id, [result])
+    if result["status"] == "stale":
+        raise ScoringError(f"評価中に候補が変更されたため、結果を保存しませんでした。"
+                           f"もう一度評価してください: {sticker_id}/{variant_id}")
+    return result
 
 
-def score_all(config, sticker_ids, *, force: bool = False, data: dict | None = None) -> list[dict]:
-    """複数スタンプを評価し、variants.json を既存の保存方式で更新します。"""
-    state = vr.load(config) if data is None else data
+def score_all(config, sticker_ids, *, force: bool = False) -> list[dict]:
+    """複数スタンプを評価し、スタンプごとに最新の記録へ書き込みます。"""
     results: list[dict] = []
-    changed = False
     for sticker_id in sticker_ids:
-        part = score_sticker(config, sticker_id, state, force=force)
+        sticker = _prepare(config, sticker_id)
+        if sticker is None:
+            continue
+        part = _measure_sticker(config, sticker, force=force)
+        _write_scores(config, sticker_id, part)
+        for r in part:
+            if r["status"] == "stale":      # CLI の表示では「保存しなかった」を失敗として出します
+                r.update(status="error", scores=None, flags=[],
+                         detail="評価中に候補が変更されたため保存しませんでした（再実行してください）")
         results.extend(part)
-        changed = changed or any(r["status"] == "scored" for r in part)
-    if changed:
-        vr.save(config, state)
     return results

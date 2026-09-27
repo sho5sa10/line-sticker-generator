@@ -20,8 +20,10 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -100,6 +102,8 @@ class StickerVariants:
     # 採用したときの generated/<id>.png と、いまのファイルが食い違っているか
     # （「AIで作り直す」「画像を入れる」など、採用以外の操作で差し替わった場合に True）
     generated_mismatch: bool = False
+    # 採用に失敗し、さらに元に戻す処理も失敗した記録（画像が採用前と違う可能性がある）
+    rollback_failed: dict | None = None
 
     @property
     def variant_count(self) -> int:
@@ -120,6 +124,7 @@ class StickerVariants:
             "legacy": self.legacy,
             "variant_count": self.variant_count,
             "generated_mismatch": self.generated_mismatch,
+            "rollback_failed": self.rollback_failed,
             "variants": [v.to_dict() for v in self.variants],
         }
 
@@ -149,22 +154,156 @@ STATE_OK = "ok"
 STATE_CORRUPT = "corrupt"
 
 
+# Windows では、他の処理が開いているファイルの読み取り・置き換えが一時的に
+# PermissionError になります。壊れているわけではないので、短い間隔で再試行します。
+IO_RETRY_DELAYS = (0.01, 0.025, 0.05, 0.1, 0.2, 0.4)
+REPAIR_COMMAND = "python -m src.variants repair"
+
+
+def _retry_io(fn):
+    """PermissionError のときだけ、決まった回数だけ待って再試行します（無限には待ちません）。"""
+    for delay in (*IO_RETRY_DELAYS, None):
+        try:
+            return fn()
+        except PermissionError:
+            if delay is None:
+                raise
+            time.sleep(delay)
+
+
+def _replace_with_retry(src: Path, dest: Path) -> None:
+    _retry_io(lambda: _replace_file(src, dest))
+
+
+def _replace_file(src, dest) -> None:
+    """src で dest を原子的に置き換えます（テストで失敗を注入する入口もここ）。
+
+    Windows では POSIX 意味論の名前変更を使います。os.replace（MoveFileEx）は、
+    置き換え先を誰かが開いていると必ず失敗しますが、こちらは読み取り側が
+    FILE_SHARE_DELETE で開いていれば置き換えられます（Windows 10 1709 以降・NTFS）。
+    使えない環境では os.replace に戻ります。
+    """
+    if os.name == "nt" and _posix_replace_windows(src, dest):
+        return
+    os.replace(src, dest)
+
+
+def _posix_replace_windows(src, dest) -> bool:
+    """成功なら True、この方式が使えない環境なら False（呼び出し側が os.replace に切り替え）。"""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                     wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
+                                     wintypes.HANDLE]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.SetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                                    ctypes.c_void_p, wintypes.DWORD]
+    kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+    delete_access, generic_read, share_all, open_existing, normal = (
+        0x00010000, 0x80000000, 0x7, 3, 0x80)
+    handle = kernel32.CreateFileW(str(src), delete_access | generic_read, share_all, None,
+                                  open_existing, normal, None)
+    if handle is None or handle == wintypes.HANDLE(-1).value:
+        _raise_windows_error(ctypes.get_last_error(), src)
+    try:
+        name = os.path.abspath(str(dest))
+
+        class RenameInfo(ctypes.Structure):
+            _fields_ = [("Flags", wintypes.DWORD), ("RootDirectory", wintypes.HANDLE),
+                        ("FileNameLength", wintypes.DWORD),
+                        ("FileName", wintypes.WCHAR * (len(name) + 1))]
+
+        replace_if_exists, posix_semantics, file_rename_info_ex = 0x1, 0x2, 22
+        info = RenameInfo(replace_if_exists | posix_semantics, None, len(name) * 2, name)
+        if kernel32.SetFileInformationByHandle(handle, file_rename_info_ex, ctypes.byref(info),
+                                               ctypes.sizeof(info)):
+            return True
+        err = ctypes.get_last_error()
+        if err in (1, 50, 87, 124):     # この方式に未対応（古いWindows・FAT・ネットワーク共有など）
+            return False
+        _raise_windows_error(err, dest)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _raise_windows_error(err: int, path) -> None:
+    import ctypes
+
+    message = ctypes.FormatError(err).strip()
+    if err in (2, 3):
+        raise FileNotFoundError(2, message, str(path))
+    if err in (5, 32, 33):                  # アクセス拒否・共有違反・ロック違反（一時的なことが多い）
+        raise PermissionError(13, message, str(path))
+    raise OSError(err, message, str(path))
+
+
+def _read_file_bytes(path: Path) -> bytes:
+    """ファイルを読みます。Windows では、読んでいる間も置き換え（os.replace）を妨げない開き方にします。
+
+    Python の open() は Windows で「削除・名前変更の共有」を許さないため、誰かが読んでいる
+    瞬間に保存（置き換え）すると PermissionError になります。GUI は頻繁に記録を読むので、
+    読み取り側が FILE_SHARE_DELETE を付けて開き、保存が失敗しないようにします。
+    """
+    if os.name != "nt":
+        return Path(path).read_bytes()
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create = kernel32.CreateFileW
+    create.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                       wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    create.restype = wintypes.HANDLE
+    generic_read, share_all, open_existing, normal = 0x80000000, 0x7, 3, 0x80
+    handle = create(str(path), generic_read, share_all, None, open_existing, normal, None)
+    if handle is None or handle == wintypes.HANDLE(-1).value:
+        _raise_windows_error(ctypes.get_last_error(), path)
+    try:
+        fd = msvcrt.open_osfhandle(handle, os.O_RDONLY)
+    except OSError:
+        kernel32.CloseHandle(handle)
+        raise
+    with os.fdopen(fd, "rb") as f:
+        return f.read()
+
+
+def _read_state_file(config) -> tuple[str, dict | None]:
+    """variants.json を1回だけ読み、(状態, 中身) を返します。
+
+    「無い」「壊れている（JSONとして読めない・形が違う）」「一時的に読めない」を区別します。
+    一時的に読めない場合は StateReadError にします（壊れている扱いにはしません）。
+    """
+    path = config.variants_path
+    try:
+        text = _retry_io(lambda: _read_file_bytes(path)).decode("utf-8")
+    except FileNotFoundError:
+        return STATE_MISSING, None
+    except ValueError:              # 文字コードとして読めない（UnicodeDecodeError）
+        return STATE_CORRUPT, None
+    except OSError as exc:
+        raise StateReadError(
+            f"候補の記録を一時的に読めませんでした（他の処理が使用中の可能性）: {path}\n"
+            f"  少し待ってからやり直してください（{type(exc).__name__}: {exc}）") from exc
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return STATE_CORRUPT, None
+    if not isinstance(data, dict) or not isinstance(data.get("stickers"), dict):
+        return STATE_CORRUPT, None
+    return STATE_OK, data
+
+
 def state_status(config) -> str:
     """variants.json の状態。"missing" / "ok" / "corrupt"。
 
     「ファイルが無い」と「壊れている」を区別します。壊れているときに空の状態で
     上書きすると、採用状態や人の判断がすべて消えてしまうためです。
+    一時的に読めないだけのときは StateReadError を送出します（壊れている扱いにしません）。
     """
-    path = config.variants_path
-    if not path.exists():
-        return STATE_MISSING
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return STATE_CORRUPT
-    if not isinstance(data, dict) or not isinstance(data.get("stickers"), dict):
-        return STATE_CORRUPT
-    return STATE_OK
+    return _read_state_file(config)[0]
 
 
 def is_corrupt(config) -> bool:
@@ -173,46 +312,55 @@ def is_corrupt(config) -> bool:
 
 def corrupt_message(config) -> str:
     return (f"候補の記録が壊れているため保存できません: {config.variants_path}\n"
-            "  中身を直すか、`python -m src.main variants repair` で退避してください"
-            "（退避すると、候補の採用状態・判断・評価は失われます）。")
+            f"  中身を直すか、`{REPAIR_COMMAND}` で修復してください"
+            "（壊れたファイルは消さずに別名で残し、候補フォルダの画像から記録を作り直します。"
+            "判断・評価は失われます）。")
 
 
 def quarantine_corrupt_state(config) -> Path | None:
-    """壊れた variants.json を variants.json.corrupt-<日時> へ退避します（削除しません）。"""
+    """壊れた variants.json を variants.json.corrupt-<日時>-<一意ID> へ退避します（削除しません）。
+
+    同じ秒に何度実行しても、前に退避したファイルを上書きしません。
+    """
     path = config.variants_path
-    if state_status(config) != STATE_CORRUPT:
-        return None
-    dest = path.with_name(f"{path.name}.corrupt-{datetime.now():%Y%m%d_%H%M%S}")
-    path.replace(dest)
-    return dest
+    with state_lock(config):
+        if state_status(config) != STATE_CORRUPT:
+            return None
+        while True:
+            dest = path.with_name(
+                f"{path.name}.corrupt-{datetime.now():%Y%m%d_%H%M%S}-{uuid.uuid4().hex[:8]}")
+            if not dest.exists():
+                break
+        _replace_with_retry(path, dest)
+        return dest
 
 
 def load(config) -> dict:
     """variants.json を読みます。
 
-    無い場合・壊れている場合は空の状態を返します（例外は投げません）。
+    無い場合・壊れている場合は空の状態を返します。
     壊れている場合だけ、既存の StateStore と同じ方式で警告を出します。
     ただし、この状態のまま save() すると記録を失うため、保存側で拒否します。
+    一時的に読めない場合は StateReadError を送出します。
     """
-    path = config.variants_path
-    status = state_status(config)
+    status, data = _read_state_file(config)
     if status == STATE_MISSING:
         return _empty_state()
     if status == STATE_CORRUPT:
-        print(f"WARNING: 候補の記録を読めないため、generated/ の画像だけを使います: {path}",
-              file=sys.stderr)
+        print(f"WARNING: 候補の記録を読めないため、generated/ の画像だけを使います: "
+              f"{config.variants_path}", file=sys.stderr)
         return _empty_state()
-    data = json.loads(path.read_text(encoding="utf-8"))
     data.setdefault("schema", SCHEMA)
     data.setdefault("defaults", {})
     return data
 
 
 def save(config, data: dict, *, force: bool = False) -> Path:
-    """variants.json を原子的に書き換えます（.tmp に書いてから置換）。
+    """variants.json を原子的に書き換えます（一意な一時ファイルに書いてから置換）。
 
     壊れたファイルがある状態では、既存の記録を消さないために拒否します
     （force=True は、退避したあとの書き込みなど、明示的に上書きしたい場合だけ）。
+    通常は直接呼ばず、update() を通してください（鍵と読み直しのため）。
     """
     if not force and is_corrupt(config):
         raise StateCorruptError(corrupt_message(config))
@@ -223,10 +371,27 @@ def save(config, data: dict, *, force: bool = False) -> Path:
     out.setdefault("defaults", {})
     out.setdefault("stickers", {})
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    _atomic_write_bytes(path, json.dumps(out, ensure_ascii=False, indent=2).encode("utf-8"))
     return path
+
+
+def _atomic_write_bytes(path: Path, payload: bytes) -> None:
+    """同じフォルダの一意な一時ファイルへ書き、fsync してから置き換えます。
+
+    一時ファイル名を毎回変えるのは、同時に保存する処理どうしが同じ一時ファイルを
+    上書きし合うと、中身が混ざった JSON が出来てしまうためです。
+    """
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        _replace_with_retry(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _empty_state() -> dict:
@@ -242,6 +407,9 @@ _LOCKS: dict[str, threading.RLock] = {}
 _LOCKS_GUARD = threading.Lock()
 
 
+_HELD = threading.local()            # このスレッドがいま持っている鍵（入れ子で取れるように）
+
+
 def _thread_lock(key: str) -> threading.RLock:
     with _LOCKS_GUARD:
         return _LOCKS.setdefault(key, threading.RLock())
@@ -249,37 +417,61 @@ def _thread_lock(key: str) -> threading.RLock:
 
 @contextmanager
 def file_lock(lock_path: Path, timeout: float = LOCK_TIMEOUT_SEC):
-    """指定のロックファイルで、プロセス内（GUIの複数リクエスト）とプロセス間を排他します。"""
+    """指定のロックファイルで、プロセス内（GUIの複数リクエスト）とプロセス間を排他します。
+
+    同じスレッドがすでに持っている鍵は、そのまま入れ子で使えます
+    （ロックファイルを二重に作ろうとして自分自身を待ち続けないように）。
+    """
     lock_path = Path(lock_path)
-    with _thread_lock(str(lock_path)):
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        deadline = time.monotonic() + timeout
-        fd = None
-        while True:
-            try:
-                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                break
-            except FileExistsError:
-                try:    # 古いロックは、異常終了の置き土産とみなして外します
-                    if time.time() - lock_path.stat().st_mtime > LOCK_STALE_SEC:
-                        lock_path.unlink(missing_ok=True)
-                        continue
-                except OSError:
-                    pass
-                if time.monotonic() > deadline:
-                    raise VariantError(
-                        f"候補の記録が他の処理で使用中です（{lock_path}）。"
-                        "しばらく待ってからやり直してください。") from None
-                time.sleep(0.05)
+    key = str(lock_path)
+    held = getattr(_HELD, "keys", None)
+    if held is None:
+        held = _HELD.keys = set()
+    if key in held:
+        yield
+        return
+    with _thread_lock(key):
+        held.add(key)
         try:
-            os.write(fd, str(os.getpid()).encode())
-            os.close(fd)
-            fd = None
-            yield
+            with _exclusive_file(lock_path, timeout):
+                yield
         finally:
-            if fd is not None:
-                os.close(fd)
-            lock_path.unlink(missing_ok=True)
+            held.discard(key)
+
+
+@contextmanager
+def _exclusive_file(lock_path: Path, timeout: float):
+    """ロックファイルを O_EXCL で作ってプロセス間を排他します。"""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + timeout
+    fd = None
+    while True:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            try:    # 古いロックは、異常終了の置き土産とみなして外します
+                if time.time() - lock_path.stat().st_mtime > LOCK_STALE_SEC:
+                    lock_path.unlink(missing_ok=True)
+                    continue
+            except OSError:
+                pass
+        except PermissionError:
+            pass    # Windows: 削除処理中のロックファイルは一時的に開けません
+        if time.monotonic() > deadline:
+            raise VariantError(
+                f"候補の記録が他の処理で使用中です（{lock_path}）。"
+                "しばらく待ってからやり直してください。") from None
+        time.sleep(0.05)
+    try:
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+        fd = None
+        yield
+    finally:
+        if fd is not None:
+            os.close(fd)
+        _retry_io(lambda: lock_path.unlink(missing_ok=True))
 
 
 def state_lock(config, timeout: float = LOCK_TIMEOUT_SEC):
@@ -307,11 +499,20 @@ def update(config, mutate, *, timeout: float = LOCK_TIMEOUT_SEC):
         mutate: 最新の state を受け取って書き換える関数。戻り値はそのまま返します。
     """
     with state_lock(config, timeout):
-        if is_corrupt(config):
+        status, state = _read_state_file(config)
+        if status == STATE_CORRUPT:
             raise StateCorruptError(corrupt_message(config))
-        state = load(config)
+        if state is None:
+            state = _empty_state()
+        state.setdefault("schema", SCHEMA)
+        state.setdefault("defaults", {})
         result = mutate(state)
-        save(config, state)
+        try:
+            save(config, state)
+        except PermissionError as exc:      # 再試行しても置き換えられなかった（元のファイルは無傷）
+            raise StateWriteError(
+                f"候補の記録を一時的に保存できませんでした（他の処理が使用中の可能性）: "
+                f"{config.variants_path}\n  少し待ってからやり直してください（{exc}）") from exc
         return result
 
 
@@ -368,6 +569,8 @@ def get_sticker(config, sticker_id: str, data: dict | None = None) -> StickerVar
         variants=variants,
         legacy=False,
         generated_mismatch=_generated_mismatch(config, sticker_id, record) if adopted else False,
+        rollback_failed=record.get("rollback_failed")
+        if isinstance(record.get("rollback_failed"), dict) else None,
     )
 
 
@@ -570,8 +773,7 @@ def _prompt_file(config, sticker_id: str) -> str | None:
     return relative_file(config, path) if path.exists() else None
 
 
-def generate_variants(config, entries, count: int, generator, *, data: dict | None = None,
-                      on_event=None) -> list[dict]:
+def generate_variants(config, entries, count: int, generator, *, on_event=None) -> list[dict]:
     """各スタンプについて count 枚の候補を生成します（generated/ には触れません）。
 
     Args:
@@ -584,12 +786,12 @@ def generate_variants(config, entries, count: int, generator, *, data: dict | No
     """
     results: list[dict] = []
     for entry in entries:
-        _generate_for_entry(config, entry, count, generator, results, on_event, data)
+        _generate_for_entry(config, entry, count, generator, results, on_event)
     return results
 
 
 def _generate_for_entry(config, entry, count: int, generator, results: list[dict],
-                        on_event, data: dict | None) -> None:
+                        on_event) -> None:
     """1スタンプ分。番号の確保と記録は、そのつど最新の状態に対して行います。
 
     生成には時間がかかるため、その間ずっと古い状態を持たないようにしています
@@ -608,10 +810,7 @@ def _generate_for_entry(config, entry, count: int, generator, results: list[dict
             record = ensure_record(config, state, entry.id)
             return allocate_variant(config, record, entry.id)
 
-        if data is not None:
-            variant_id, path = reserve(data)
-        else:
-            variant_id, path = update(config, reserve)      # 番号は先に確定・保存
+        variant_id, path = update(config, reserve)      # 番号は先に確定・保存
 
         result = generator.generate_one(entry, output_path=path)
         if result.status == "generated" and path.exists():
@@ -622,10 +821,7 @@ def _generate_for_entry(config, entry, count: int, generator, results: list[dict
                 register_variant(config, record, variant_id, path, meta=meta)
 
             # PNG が出来てから記録します（記録だけ残る状態を作らない）
-            if data is not None:
-                register(data)
-            else:
-                update(config, register)
+            update(config, register)
             results.append({"id": entry.id, "variant_id": variant_id, "status": "generated",
                             "path": path, "detail": ""})
         else:
@@ -647,6 +843,18 @@ class StateCorruptError(VariantError):
     """variants.json が壊れていて、上書きすると記録を失う場合に送出されます。"""
 
 
+class StateBusyError(VariantError):
+    """variants.json を一時的に読み書きできない場合（他の処理が使用中など）。壊れてはいません。"""
+
+
+class StateReadError(StateBusyError):
+    """variants.json を一時的に読めない場合に送出されます（壊れているとは限りません）。"""
+
+
+class StateWriteError(StateBusyError):
+    """variants.json を一時的に保存できない場合に送出されます（元のファイルはそのまま）。"""
+
+
 class AdoptError(VariantError):
     """候補を採用できない場合に送出されます（状態ファイルは更新されません）。"""
 
@@ -665,8 +873,7 @@ def _find_item(config, data: dict, sticker_id: str, variant_id: str) -> tuple[di
     return record, item
 
 
-def set_verdict(config, sticker_id: str, variant_id: str, verdict: str,
-                *, data: dict | None = None) -> dict:
+def set_verdict(config, sticker_id: str, variant_id: str, verdict: str) -> dict:
     """人の判断（pending / rejected / regen）を記録します。
 
     いま採用中かどうか（sticker.adopted）は変更しません。採用の切り替えは adopt() です。
@@ -682,13 +889,10 @@ def set_verdict(config, sticker_id: str, variant_id: str, verdict: str,
         item["verdict"] = verdict
         return item
 
-    if data is not None:            # 呼び出し側が状態を持っている場合はその場で変更
-        return mutate(data)
     return update(config, mutate)
 
 
-def set_rating(config, sticker_id: str, variant_id: str, rating: int | None,
-               *, data: dict | None = None) -> dict:
+def set_rating(config, sticker_id: str, variant_id: str, rating: int | None) -> dict:
     """人の5段階評価を記録します（None で消します）。
 
     スコアリングには使いません。将来の重み決めのために残すだけです。
@@ -703,63 +907,158 @@ def set_rating(config, sticker_id: str, variant_id: str, rating: int | None,
         item["human_rating"] = rating
         return item
 
-    if data is not None:
-        return mutate(data)
     return update(config, mutate)
 
 
-def _rollback_adoption(config, entry, style, dest: Path, archived, final_path: Path,
-                       had_final: bool) -> None:
-    """採用に失敗したとき、原画と完成画像を元の状態に戻します（できる範囲で）。"""
-    from . import pipeline
+# ---------------------------------------------------------------------------
+# 採用の一時退避と巻き戻し
+# ---------------------------------------------------------------------------
+def adopt_backup_root(config) -> Path:
+    """採用中だけ使う一時退避の置き場（成功すれば消します。巻き戻しに失敗したときだけ残ります）。"""
+    return config.root / "output" / "archive" / "adopt-backup"
 
+
+def _copy_verified(src: Path, dest: Path, expected_sha: str | None = None,
+                   *, keep_times: bool = False) -> None:
+    """src を dest へ「一時ファイルにコピー → fsync → SHA1確認 → 置き換え」で書きます。
+
+    途中で失敗しても dest は元のまま（半端なファイルを dest に作らない）。
+    keep_times=True なら更新日時も写します（元の画像に戻すとき用）。
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=dest.parent, prefix=f".{dest.name}.", suffix=".tmp")
+    os.close(fd)
+    tmp = Path(tmp_name)
     try:
-        if archived is not None and Path(archived).exists():
-            Path(archived).replace(dest)         # 退避した原画を戻す
-        else:
-            dest.unlink(missing_ok=True)         # 元々無かったので作りかけを消す
-        if dest.exists():
-            pipeline.render_final(config, entry, style)     # 完成画像も元の原画から作り直す
-        elif not had_final:
-            final_path.unlink(missing_ok=True)
-    except Exception as exc:  # noqa: BLE001 - 巻き戻しの失敗で元の原因を隠さない
-        print(f"WARNING: 採用の巻き戻しに失敗しました: {type(exc).__name__}: {exc}",
-              file=sys.stderr)
+        shutil.copyfile(src, tmp)
+        if keep_times:
+            shutil.copystat(src, tmp)
+        with open(tmp, "rb+") as f:
+            os.fsync(f.fileno())
+        want = expected_sha or sha1_file(src)
+        if sha1_file(tmp) != want:
+            raise OSError(f"コピーした画像の中身が一致しません: {src} → {dest}")
+        _replace_with_retry(tmp, dest)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
-def adopt(config, entry, variant_id: str, *, style=None, data: dict | None = None) -> dict:
+def _restore_file(saved: Path | None, dest: Path) -> None:
+    """採用前の状態へ戻します（saved=None なら「元々無かった」ので消します）。"""
+    if saved is None:
+        _retry_io(lambda: dest.unlink(missing_ok=True))
+    else:
+        _copy_verified(saved, dest, keep_times=True)
+
+
+def _sha_or_none(path: Path) -> str | None:
+    return sha1_file(path) if path.exists() else None
+
+
+@dataclass
+class _AdoptionBackup:
+    """採用を始める前の generated / final を、中身ごと控えておきます。
+
+    「退避（archive）に成功したか」ではなく「採用前に原画があったか」で戻し方を決めるため、
+    採用処理の最初に作ります。
+    """
+
+    folder: Path
+    generated: Path | None          # 控えのパス（採用前に無ければ None）
+    generated_sha: str | None
+    final: Path | None
+    final_sha: str | None
+
+    @classmethod
+    def capture(cls, config, sticker_id: str, dest: Path, final_path: Path) -> "_AdoptionBackup":
+        folder = adopt_backup_root(config) / (
+            f"{sticker_id}-{datetime.now():%Y%m%d_%H%M%S}-{uuid.uuid4().hex[:8]}")
+        saved = {}
+        try:
+            for name, path in (("generated", dest), ("final", final_path)):
+                if path.exists():
+                    copy = folder / f"{name}.png"
+                    _copy_verified(path, copy, keep_times=True)
+                    saved[name] = (copy, sha1_file(copy))
+                else:
+                    saved[name] = (None, None)
+        except BaseException:
+            shutil.rmtree(folder, ignore_errors=True)   # まだ何も触っていないので控えも不要
+            raise
+        return cls(folder, *saved["generated"], *saved["final"])
+
+    def restore(self, dest: Path, final_path: Path, archived) -> list[str]:
+        """採用前の状態へ戻し、戻せなかったものを返します（空なら完全に戻せた）。"""
+        problems: list[str] = []
+        archived = Path(archived) if archived else None
+        # 退避で動かした原画があれば、それ自体を元の場所へ戻します（退避に余計なものを残さない）
+        if archived is not None and archived.exists() and self.generated is not None:
+            try:
+                if sha1_file(archived) == self.generated_sha:
+                    _replace_with_retry(archived, dest)
+            except OSError as exc:
+                problems.append(f"退避した原画を戻せません: {archived} ({exc})")
+        for label, saved, want, path in (("原画", self.generated, self.generated_sha, dest),
+                                         ("完成画像", self.final, self.final_sha, final_path)):
+            try:
+                if _sha_or_none(path) != want:
+                    _restore_file(saved, path)
+                if _sha_or_none(path) != want:
+                    raise OSError("戻したあとの中身が採用前と一致しません")
+            except Exception as exc:  # noqa: BLE001 - 戻せなかった理由をすべて集めます
+                problems.append(f"{label}を採用前に戻せません: {path} ({type(exc).__name__}: {exc})")
+        if (archived is not None and archived.exists() and not problems
+                and sha1_file(archived) == self.generated_sha):
+            archived.unlink(missing_ok=True)    # 原画は控えから戻せたので、この退避は不要
+        return problems
+
+    def discard(self) -> None:
+        shutil.rmtree(self.folder, ignore_errors=True)
+
+
+def _record_rollback_failure(config, sticker_id: str, detail: str, backup: _AdoptionBackup) -> None:
+    """巻き戻しの失敗を記録に残します（画面と CLI で気付けるように）。記録できなくても続けます。"""
+    def mutate(state):
+        record = ensure_record(config, state, sticker_id)
+        record["rollback_failed"] = {
+            "at": datetime.now().isoformat(timespec="seconds"),
+            "detail": detail,
+            "backup": relative_file(config, backup.folder),
+        }
+    try:
+        update(config, mutate)
+    except Exception as exc:  # noqa: BLE001 - 元の失敗を隠さない
+        print(f"ERROR: 巻き戻しの失敗を記録できませんでした: {exc}", file=sys.stderr)
+
+
+def adopt(config, entry, variant_id: str, *, style=None) -> dict:
     """候補を「採用中の原画」にして、既存の合成・検証をそのまま通します。
 
     順序:
-      記録を読む → 候補とPNGを確認 → 既存原画を退避（既存の archive_existing）
-      → 候補を generated/<id>.png にコピー → 既存の pipeline.render_final
-      → 既存の validator → 最後に variants.json を更新（原子的に保存）
+      候補とPNGを確認 → 採用前の generated / final を控える → 既存原画を退避
+      → 候補を generated/<id>.png に置く（一時ファイル→確認→置き換え）
+      → 既存の pipeline.render_final → 既存の validator → 最新の記録に採用状態を書く
 
-    途中で失敗した場合、variants.json は更新しません（adopted は前のまま）。
+    途中で失敗したら（Ctrl+C を含む）、generated / final / 退避 を採用前へ戻してから
+    例外を送出します。variants.json は最後にしか書かないので、採用状態も前のままです。
     候補ファイル（variants/ 側）は移動も削除もしません。
     """
-    from . import image_processor as ip
-    from . import pipeline
-    from . import validator as vd
-    from .importer import archive_existing
-    from .text_renderer import TextStyle
-
     if is_corrupt(config):          # 壊れた記録を上書きしないよう、何より先に止めます
         raise StateCorruptError(corrupt_message(config))
 
-    with adopt_lock(config, entry.id):      # 同じスタンプの採用どうしだけを直列化します
-        return _adopt_locked(config, entry, variant_id, style=style, data=data)
+    with adopt_lock(config, entry.id):      # 同じスタンプの採用・取り込みを直列化します
+        return _adopt_locked(config, entry, variant_id, style=style)
 
 
-def _adopt_locked(config, entry, variant_id: str, *, style=None, data=None) -> dict:
+def _adopt_locked(config, entry, variant_id: str, *, style=None) -> dict:
     from . import image_processor as ip
     from . import pipeline
     from . import validator as vd
     from .importer import archive_existing
     from .text_renderer import TextStyle
 
-    state = load(config) if data is None else data
-    sticker = get_sticker(config, entry.id, state)
+    sticker = get_sticker(config, entry.id)
     if sticker is None:
         raise AdoptError(f"候補がありません: {entry.id}")
     variant = sticker.find(variant_id)
@@ -774,20 +1073,24 @@ def _adopt_locked(config, entry, variant_id: str, *, style=None, data=None) -> d
         ip.load_rgba(src)          # 既存の読み込み処理で、壊れたPNGをここで弾きます
     except Exception as exc:       # noqa: BLE001 - 破損画像の例外は多岐にわたる
         raise AdoptError(f"候補の画像を読めません: {src} ({type(exc).__name__}: {exc})") from exc
+    # 指紋は「採用を始めた時点の候補」から取ります（後から generated を読み直すと、
+    # その間に別の処理が書いた画像を、採用した画像として記録してしまうため）
+    src_sha = sha1_file(src)
 
     dest = config.dir_generated / f"{entry.id}.png"
     final_path = config.dir_final / f"{entry.id}.png"
-    had_final = final_path.exists()
-    archived = None
     style = style or TextStyle.from_config(config)
-
     # legacy の候補（generated/<id>.png 自身）を採用する場合は、退避もコピーも不要です。
     same_file = src.resolve() == dest.resolve()
+
+    backup = _AdoptionBackup.capture(config, entry.id, dest, final_path)
+    archived = None
     try:
         if not same_file:
             archived = archive_existing(config, entry.id)      # 既存の退避処理を再利用
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(src, dest)
+            _copy_verified(src, dest, src_sha)
+        stat = dest.stat()
+        stamp = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns, "sha1": src_sha}
 
         # ここから先は既存の正式な経路をそのまま使います（final を直接コピーしない）
         final_path, size_bytes, warnings = pipeline.render_final(config, entry, style)
@@ -797,32 +1100,34 @@ def _adopt_locked(config, entry, variant_id: str, *, style=None, data=None) -> d
                 "採用した画像がLINE仕様を満たしませんでした（採用状態は変更していません）:\n  "
                 + "\n  ".join(i.message for i in report.errors)
             )
-    except Exception:
-        # 失敗したら、触ったファイルを元に戻します（記録と画像が食い違わないように）
-        if not same_file:
-            _rollback_adoption(config, entry, style, dest, archived, final_path, had_final)
-        raise
 
-    stamp = file_stamp(dest)
+        def apply(state_now):
+            record = ensure_record(config, state_now, entry.id)
+            if not any(isinstance(v, dict) and v.get("variant_id") == variant_id
+                       for v in record.get("variants", [])):
+                raise AdoptError(f"候補が見つかりません: {entry.id}/{variant_id}")
+            for item in record.get("variants", []):
+                if isinstance(item, dict) and item.get("variant_id") == variant_id:
+                    item["verdict"] = VERDICT_ADOPTED       # 採用した候補だけ変えます
+            record["adopted"] = variant_id                  # ほかの候補の verdict は触りません
+            record["adopted_at"] = datetime.now().isoformat(timespec="seconds")
+            record["adopted_file"] = stamp                  # 別処理での差し替えを検出するため
+            record.pop("rollback_failed", None)             # 採用し直せたので解消
 
-    def apply(state_now):
-        record = ensure_record(config, state_now, entry.id)
-        if not any(isinstance(v, dict) and v.get("variant_id") == variant_id
-                   for v in record.get("variants", [])):
-            raise AdoptError(f"候補が見つかりません: {entry.id}/{variant_id}")
-        for item in record.get("variants", []):
-            if isinstance(item, dict) and item.get("variant_id") == variant_id:
-                item["verdict"] = VERDICT_ADOPTED       # 採用した候補だけ変えます
-        record["adopted"] = variant_id                  # ほかの候補の verdict は触りません
-        record["adopted_at"] = datetime.now().isoformat(timespec="seconds")
-        record["adopted_file"] = stamp                  # 別処理での差し替えを検出するため
-
-    # 画像の処理が終わってから、最新の記録を読み直して採用状態だけを更新します
-    if data is not None:
-        apply(data)
-        save(config, data)
-    else:
+        # 画像の処理が終わってから、最新の記録を読み直して採用状態だけを更新します
         update(config, apply)
+    except BaseException as exc:
+        # Ctrl+C も含め、触ったファイルを採用前へ戻してから、元の例外をそのまま送出します
+        problems = backup.restore(dest, final_path, archived)
+        if problems:
+            detail = "採用の巻き戻しに失敗しました: " + " / ".join(problems)
+            print(f"ERROR: {detail}\n  採用前の画像の控え: {backup.folder}", file=sys.stderr)
+            exc.add_note(f"{detail}（採用前の画像の控え: {backup.folder}）")
+            _record_rollback_failure(config, entry.id, detail, backup)
+        else:
+            backup.discard()
+        raise
+    backup.discard()
 
     return {
         "sticker_id": entry.id,
