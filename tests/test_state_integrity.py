@@ -585,3 +585,168 @@ def test_save_that_stays_blocked_reports_busy_and_keeps_the_file(tmp_config, mon
     monkeypatch.undo()
     assert tmp_config.variants_path.read_bytes() == before
     assert [p for p in tmp_config.variants_path.parent.iterdir() if p.name.endswith(".tmp")] == []
+
+
+# ===========================================================================
+# C1: legacy v001 の実体化は「一時ファイル → 確認 → 置き換え」。半端なファイルを使わない
+# ===========================================================================
+def _legacy_only(cfg, color=YELLOW):
+    sticker_like(body=color).save(cfg.dir_generated / "001.png", format="PNG")
+    return _sha(cfg.dir_generated / "001.png")
+
+
+def test_c1_copy_failure_midway_leaves_no_partial_v001(tmp_config, monkeypatch):
+    original = _legacy_only(tmp_config)
+
+    def half_copy(src, dst, *args, **kwargs):
+        data = Path(src).read_bytes()
+        Path(dst).write_bytes(data[: len(data) // 2])
+        raise OSError("容量不足")
+    monkeypatch.setattr(vr.shutil, "copyfile", half_copy)
+    with pytest.raises(OSError):
+        vr.set_rating(tmp_config, "001", "v001", 3)
+    monkeypatch.undo()
+
+    folder = vr.variant_dir(tmp_config, "001")
+    assert not (folder / "v001.png").exists()
+    assert not folder.exists() or [p.name for p in folder.iterdir()] == []    # 一時ファイルも無い
+    assert not tmp_config.variants_path.exists()                             # 記録も作らない
+
+    vr.set_rating(tmp_config, "001", "v001", 3)                              # やり直せる
+    assert _sha(folder / "v001.png") == original
+
+
+def test_c1_broken_leftover_v001_is_rematerialized(tmp_config):
+    original = _legacy_only(tmp_config)
+    folder = vr.variant_dir(tmp_config, "001")
+    folder.mkdir(parents=True)
+    data = (tmp_config.dir_generated / "001.png").read_bytes()
+    (folder / "v001.png").write_bytes(data[: len(data) // 2])                # 以前の版の半端なコピー
+
+    vr.set_rating(tmp_config, "001", "v001", 3)
+    assert _sha(folder / "v001.png") == original
+    assert vr.adopt(tmp_config, ENTRY, "v001")["validation_ok"] is True
+
+
+def test_c1_existing_different_image_is_never_overwritten(tmp_config):
+    """記録を失ったあとなど、置き場に別の画像の v001.png がある場合は上書きしない。"""
+    original = _legacy_only(tmp_config)
+    other = _generate_file(tmp_config, "001", "v001", BLUE)
+    other_sha = _sha(other)
+
+    vr.set_rating(tmp_config, "001", _legacy_id(tmp_config), 2)
+    assert _sha(other) == other_sha                                          # 消さない
+    st = vr.get_sticker(tmp_config, "001")
+    legacy = st.find(st.adopted)
+    assert legacy.source == "legacy" and legacy.variant_id != "v001"
+    assert _sha(legacy.path(tmp_config)) == original
+
+
+def _generate_file(cfg, sid, vid, color):
+    path = vr.variant_dir(cfg, sid) / f"{vid}.png"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sticker_like(body=color).save(path, format="PNG")
+    return path
+
+
+def _legacy_id(cfg):
+    return vr.get_sticker(cfg, "001").variants[0].variant_id
+
+
+def test_c1_concurrent_materialization_threads(tmp_config):
+    original = _legacy_only(tmp_config)
+    ops = [lambda: vr.set_rating(tmp_config, "001", "v001", 4),
+           lambda: vr.set_verdict(tmp_config, "001", "v001", "regen"),
+           lambda: vr.adopt(tmp_config, ENTRY, "v001"),
+           lambda: scoring.score_all(tmp_config, ["001"])] * 2
+    errors = []
+    threads = [threading.Thread(target=lambda op=op: errors.extend(_run_in_thread(op))) for op in ops]
+    [t.start() for t in threads]
+    [t.join(60) for t in threads]
+    assert errors == []
+    record = _state(tmp_config)["stickers"]["001"]
+    assert [v["variant_id"] for v in record["variants"]] == ["v001"]
+    assert _sha(vr.variant_dir(tmp_config, "001") / "v001.png") == original
+    assert record["variants"][0]["human_rating"] == 4 and record["variants"][0]["verdict"] in ("regen", "adopted")
+
+
+def test_c1_concurrent_materialization_processes(tmp_config):
+    original = _legacy_only(tmp_config)
+    procs = [_spawn(tmp_config, "rate:v001", 3) for _ in range(4)]
+    for p in procs:
+        out, err = p.communicate(timeout=240)
+        assert p.returncode == 0, err
+    record = _state(tmp_config)["stickers"]["001"]
+    assert [v["variant_id"] for v in record["variants"]] == ["v001"]
+    assert _sha(vr.variant_dir(tmp_config, "001") / "v001.png") == original
+
+
+def test_c1_round_trips_always_return_to_the_original(tmp_config):
+    _add_candidates(tmp_config)
+    original = _sha(vr.variant_dir(tmp_config, "001") / "v001.png")
+    for _ in range(3):
+        for vid in ("v002", "v001", "v003", "v001"):
+            vr.adopt(tmp_config, ENTRY, vid)
+            if vid == "v001":
+                assert _sha(tmp_config.dir_generated / "001.png") == original
+    assert _sha(vr.variant_dir(tmp_config, "001") / "v001.png") == original
+
+
+# ===========================================================================
+# STEP 7: legacy の記録にも原画の目印を付け、差し替えに気付けるようにする
+# ===========================================================================
+def test_legacy_record_has_a_fingerprint_and_detects_replacement(tmp_config):
+    original = _legacy_only(tmp_config)
+    vr.set_rating(tmp_config, "001", "v001", 4)
+    stamp = _state(tmp_config)["stickers"]["001"]["adopted_file"]
+    assert stamp["sha1"] == original
+    assert not vr.get_sticker(tmp_config, "001").generated_mismatch
+
+    time.sleep(0.02)
+    sticker_like(body=GREEN).save(tmp_config.dir_generated / "001.png", format="PNG")
+    assert vr.get_sticker(tmp_config, "001").generated_mismatch
+
+
+def test_reading_legacy_still_creates_nothing(tmp_config):
+    _legacy_only(tmp_config)
+    vr.get_sticker(tmp_config, "001")
+    vr.list_all(tmp_config, ["001"])
+    assert not tmp_config.variants_path.exists()
+    assert not vr.variant_dir(tmp_config, "001").exists()
+
+
+# ===========================================================================
+# STEP 6: 採用と取り込みが同じ原画を奪い合わない
+# ===========================================================================
+def test_import_waits_for_adoption_and_is_detected_afterwards(tmp_config, monkeypatch):
+    import io
+    from src.text_renderer import TextStyle
+
+    _add_candidates(tmp_config)
+    vr.adopt(tmp_config, ENTRY, "v002")
+    buf = io.BytesIO()
+    sticker_like(body=(30, 30, 30, 255)).save(buf, format="PNG")
+    started, results = threading.Event(), []
+    original_validate = vd.validate_sticker
+
+    def validate_while_importing(*args, **kwargs):
+        if not started.is_set():
+            started.set()
+            threading.Thread(target=lambda: results.append(importer.import_image(
+                tmp_config, ENTRY, buf.getvalue(), TextStyle.from_config(tmp_config)))).start()
+            time.sleep(0.3)             # 取り込みが先に原画を書こうとしても、鍵で待たされる
+        return original_validate(*args, **kwargs)
+    monkeypatch.setattr(vd, "validate_sticker", validate_while_importing)
+    vr.adopt(tmp_config, ENTRY, "v003")
+    monkeypatch.undo()
+    deadline = time.time() + 30
+    while not results and time.time() < deadline:
+        time.sleep(0.05)
+
+    record = _state(tmp_config)["stickers"]["001"]
+    v003 = _sha(vr.variant_dir(tmp_config, "001") / "v003.png")
+    assert record["adopted"] == "v003"
+    assert record["adopted_file"]["sha1"] == v003          # 目印は採用した候補のもの
+    assert results and results[0].ok                       # 取り込みは採用のあとに行われた
+    assert _sha(tmp_config.dir_generated / "001.png") != v003
+    assert vr.get_sticker(tmp_config, "001").generated_mismatch   # 取り込みで差し替わったと分かる

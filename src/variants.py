@@ -15,6 +15,7 @@ Phase 1a では **読み取りだけ** を担当します。候補の生成・�
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -528,15 +529,38 @@ def ensure_legacy_variant(config, sticker_id: str) -> StickerVariants | None:
     src = config.dir_generated / f"{sticker_id}.png"
     if not src.exists():
         return None
+    # 実体化したときと同じ番号で見せます（置き場に別の画像の v001 があれば、その次）
+    slot, _reuse = _legacy_slot(config, sticker_id, src)
+    vid = slot.stem
     v = Variant(
-        variant_id="v001",
+        variant_id=vid,
         file=relative_file(config, src),
         source=SOURCE_LEGACY,
         verdict=VERDICT_ADOPTED,
         created_at=None,
     )
-    return StickerVariants(sticker_id=sticker_id, adopted="v001", next_seq=2,
+    return StickerVariants(sticker_id=sticker_id, adopted=vid, next_seq=int(vid[1:]) + 1,
                            variants=[v], legacy=True)
+
+
+def _legacy_slot(config, sticker_id: str, src: Path, src_sha: str | None = None) -> tuple[Path, bool]:
+    """legacy の画像を置く場所と、その場所の既存ファイルをそのまま使えるか。
+
+    置き場に v001.png が無ければ v001（普段はここで終わり、ハッシュも計算しません）。
+    ある場合は: 中身が同じ → そのまま使う / 読めない → 作り直す / 別の画像 → 次の番号。
+    """
+    folder = variant_dir(config, sticker_id)
+    seq = 1
+    while True:
+        dest = folder / f"v{seq:03d}.png"
+        if not dest.exists():
+            return dest, False
+        src_sha = src_sha or sha1_file(src)
+        if sha1_file(dest) == src_sha:
+            return dest, True
+        if not _is_readable_png(dest):
+            return dest, False          # 半端なコピーなど。作り直します
+        seq += 1                        # 別の候補の画像。消さずに次の番号へ
 
 
 def get_sticker(config, sticker_id: str, data: dict | None = None) -> StickerVariants | None:
@@ -662,8 +686,8 @@ def sha1_file(path: str | Path) -> str | None:
 def ensure_record(config, data: dict, sticker_id: str) -> dict:
     """variants.json 内の1スタンプ分の記録を用意します（無ければ作る）。
 
-    記録が無く generated/<id>.png がある環境では、その画像を v001(legacy・採用中)
-    として記録に残します。**ファイルはコピーせず、generated/ のパスを指したままです。**
+    記録が無く generated/<id>.png がある環境では、その画像を候補置き場へコピーして
+    v001(legacy・採用中) として記録に残し、原画の目印（adopted_file）も付けます。
     """
     stickers = data.setdefault("stickers", {})
     record = stickers.get(sticker_id)
@@ -676,15 +700,15 @@ def ensure_record(config, data: dict, sticker_id: str) -> dict:
         # 記録に残す時点で、候補置き場へ実体をコピーします。
         # generated/<id>.png は採用のたびに中身が変わるため、そこを指したままだと
         # v001 が「いま採用中の画像」の別名になり、元の絵が追えなくなります。
-        items = []
-        for v in legacy.variants:
-            kept = _materialize_legacy(config, sticker_id, v)
-            items.append(kept.to_dict())
+        kept, stamp = _materialize_legacy(config, sticker_id, legacy.variants[0])
+        seq = int(kept.variant_id[1:])
         record = {
-            "adopted": legacy.adopted,
+            "adopted": kept.variant_id,
             "adopted_at": None,
-            "next_seq": legacy.next_seq,
-            "variants": items,
+            "next_seq": max(legacy.next_seq, seq + 1),
+            "variants": [kept.to_dict()],
+            # いまの generated/<id>.png の目印。これ以降の差し替えに気付けるようにします
+            "adopted_file": stamp,
         }
     else:
         record = {"adopted": None, "adopted_at": None, "next_seq": 1, "variants": []}
@@ -692,15 +716,37 @@ def ensure_record(config, data: dict, sticker_id: str) -> dict:
     return record
 
 
-def _materialize_legacy(config, sticker_id: str, variant: Variant) -> Variant:
-    """legacy の候補（generated/<id>.png）を候補置き場へコピーして、そちらを指させます。"""
+def _is_readable_png(path: Path) -> bool:
+    from PIL import Image
+
+    try:
+        with Image.open(path) as img:
+            img.verify()
+        return True
+    except Exception:  # noqa: BLE001 - 読めない理由は問いません
+        return False
+
+
+def _materialize_legacy(config, sticker_id: str, variant: Variant) -> tuple[Variant, dict]:
+    """legacy の候補（generated/<id>.png）を候補置き場へコピーして、そちらを指させます。
+
+    コピーは「一時ファイル → SHA1確認 → 置き換え」で行い、途中で失敗しても半端な
+    vNNN.png を残しません。置き場所の決め方は _legacy_slot() を参照。
+    Returns:
+        (候補, generated の目印 {size, mtime_ns, sha1})
+    """
     src = variant.path(config)
-    dest = variant_dir(config, sticker_id) / f"{variant.variant_id}.png"
-    if not src.exists() or dest.exists():
-        return variant if not dest.exists() else _with_file(config, variant, dest)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(src, dest)
-    return _with_file(config, variant, dest)
+    stat = src.stat()
+    src_sha = sha1_file(src)
+    stamp = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns, "sha1": src_sha}
+    dest, reuse = _legacy_slot(config, sticker_id, src, src_sha)
+    if not reuse:
+        _copy_verified(src, dest, src_sha)
+    return _with_id_and_file(config, variant, dest), stamp
+
+
+def _with_id_and_file(config, variant: Variant, path: Path) -> Variant:
+    return dataclasses.replace(_with_file(config, variant, path), variant_id=path.stem)
 
 
 def _with_file(config, variant: Variant, path: Path) -> Variant:
