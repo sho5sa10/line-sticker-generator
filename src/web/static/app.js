@@ -912,9 +912,30 @@ function gridFilter() {
     || (v === 'unsold' ? !s.sale : s.sale === v));
 }
 
+/**
+ * 「最初の候補を作る」を出すスタンプか。候補が1件も無く、原画も無いもの（原画の仮想の v001 と
+ * 混ぜないため）、または途中で止まった初回生成があるもの（続きから）。実行中のものには出しません。
+ * 最終的な対象はサーバーが確かめ直します。
+ */
+function canStartInitial(s) {
+  if (s.initial_run === 'running') return false;
+  if (s.initial_run === 'pending') return true;
+  return (s.variant_count || 0) === 0 && !s.has_raw;
+}
+
+/**
+ * 候補の比較画面を開けるスタンプか。候補が2件以上、または未採用の候補が1件
+ * （初回生成で作った候補を選んで採用するため）。原画の v001 だけ（採用中の1件）は従来どおり拡大表示。
+ */
+function canCompare(s) {
+  const n = s.variant_count || 0;
+  return n >= 2 || (n >= 1 && !s.adopted);
+}
+
 function cellHtml(s) {
   const sel = state.selected.has(s.id);
-  let thumb = '<span class="empty">未生成</span>';
+  let thumb = (s.variant_count || 0) >= 1 && !s.adopted
+    ? `<span class="empty">候補${s.variant_count}案・未採用</span>` : '<span class="empty">未生成</span>';
   let tag = '';
   if (s.has_final) {
     thumb = `<img loading="lazy" src="/img/final/${s.id}.png?t=${s.final_mtime}" alt="${escapeHtml(s.text)}">`;
@@ -924,9 +945,15 @@ function cellHtml(s) {
     tag = '<span class="tag raw">原画のみ</span>';
   }
   const sale = s.sale ? `<span class="sale-badge ${s.sale}">${SALE_LABELS[s.sale]}</span>` : '';
-  // 候補が2件以上あるときだけ小さなバッジを出します（候補が無いセルは今までどおりの見た目）
-  const variants = (s.variant_count || 0) >= 2
+  // 比較できる候補があるときだけ小さなバッジを出します（候補が無いセルは今までどおりの見た目）
+  const variants = canCompare(s)
     ? `<span class="tag variants" data-variants="${s.id}" title="候補を見比べる">${s.variant_count}案</span>`
+    : '';
+  // 候補がまだ無いスタンプ（途中で止まった初回生成の続きを含む）にだけ出します
+  const initial = canStartInitial(s)
+    ? `<div class="rowbtns"><button class="btn initial" data-act="initial"
+         data-tip="候補がまだ無いスタンプに、最初の候補を作ります（課金されます。枚数は上の「最初の候補を作る」の横で選べます。生成しただけでは採用しません）">${
+        s.initial_run === 'pending' ? '最初の候補の続きを作る' : '最初の候補を作る'}</button></div>`
     : '';
   // flags は保存済みの値があるときだけ表示します（ここでは計算しません）
   const vflag = (s.flags || []).length
@@ -948,6 +975,7 @@ function cellHtml(s) {
       <div class="cid">${s.id}${s.size_kb ? ` · ${s.size_kb}KB` : ''}</div>
       <div class="ctext">${escapeHtml(s.text)}</div>
       <div class="meta">${escapeHtml(s.action || '')}</div>
+      ${initial}
       <div class="rowbtns">
         <button class="btn" data-act="upload"
                 data-tip="この番号に手持ちの画像を入れます。文字入れ・検証まで自動で行います（無料）">画像を入れる</button>
@@ -1053,9 +1081,9 @@ $('#grid').addEventListener('click', async (e) => {
     updateSelectionUi();
     return;
   }
-  // 候補バッジ、または候補が2件以上あるスタンプの画像 → 候補の比較画面
+  // 候補バッジ、または比較できる候補があるスタンプの画像 → 候補の比較画面
   if (e.target.closest('[data-variants]')
-      || (e.target.closest('[data-zoom]') && (sticker.variant_count || 0) >= 2)) {
+      || (e.target.closest('[data-zoom]') && canCompare(sticker))) {
     openVariantModal(id);
     return;
   }
@@ -1074,6 +1102,10 @@ $('#grid').addEventListener('click', async (e) => {
     input.dataset.target = id;
     input.value = '';
     input.click();
+    return;
+  }
+  if (act === 'initial') {
+    startInitial([id]);
     return;
   }
   if (act === 'regen') {
@@ -1136,6 +1168,7 @@ async function updateSelectionUi() {
   if (packageMode() === 'selected') updatePlan();
   $('#btn-generate').disabled = n === 0;
   $('#btn-render').disabled = n === 0;
+  $('#btn-initial').disabled = n === 0;
 
   const force = $('#opt-force').checked;
   const willCall = force
@@ -1167,6 +1200,52 @@ $('#btn-generate').addEventListener('click', async () => {
 });
 
 $('#btn-render').addEventListener('click', () => runRender([...state.selected].sort()));
+
+/* --- 最初の候補を作る（Phase 7）: 候補がまだ無いスタンプだけ。既存の「AIで作り直す」とは別の操作 --- */
+const INITIAL_SKIP_LABEL = { has_candidates: '候補あり', has_original: '原画あり', running: '実行中' };
+
+/**
+ * まず dry-run で対象・枚数・費用を出し（APIは呼ばず、何も書きません）、確認できたら、
+ * 確認画面で見た合計枚数（expected_total）を添えて実行します。キャンセルなら何もしません。
+ */
+async function startInitial(ids) {
+  const count = Number($('#initial-count').value);
+  let plan;
+  try {
+    plan = await api('/api/variants/initial', { method: 'POST', body: { ids, count, dry_run: true } });
+  } catch (e) { toast(e.message, true); return; }
+  if (!plan.target_count) {
+    toast('最初の候補を作れるスタンプがありません（候補・原画があるか、実行中です）', true);
+    return;
+  }
+  const usd = plan.usd === null ? '不明' : `約 $${plan.usd.toFixed(2)} USD（${plan.model} / ${plan.quality}）`;
+  const resumed = plan.targets.filter((t) => t.resume);
+  const recovered = plan.targets.reduce((a, t) => a + (t.recovered || 0), 0);
+  const lines = [
+    '最初の候補を作ります。',
+    `対象スタンプ: ${plan.target_count}件（${plan.target_ids.join(', ')}）`,
+    `1スタンプあたり: ${plan.count}枚`,
+    `合計: ${plan.total}枚（expected_total: ${plan.expected_total}）`,
+    `推定費用: ${usd}`,
+  ];
+  if (resumed.length) {
+    lines.push(`うち途中からの続き: ${resumed.length}件（残りの枚数だけ作ります`
+      + `${recovered ? `。前回できていた ${recovered}枚はAPIを呼ばずに登録` : ''}）`);
+  }
+  if (plan.skipped.length) {
+    lines.push(`対象外: ${plan.skipped.map((s) => `${s.id}（${INITIAL_SKIP_LABEL[s.reason] || s.reason}）`).join(', ')}`);
+  }
+  lines.push('', '生成しただけでは採用しません。候補比較の画面で選んで採用してください。', '実行しますか？');
+  if (!confirm(lines.join('\n'))) return;
+  try {
+    resetJobUi('最初の候補を作っています');
+    await api('/api/variants/initial', {
+      method: 'POST', body: { ids: plan.target_ids, count, expected_total: plan.expected_total },
+    });
+    startPolling();
+  } catch (e) { toast(e.message, true); closeJobBar(); }
+}
+$('#btn-initial').addEventListener('click', () => startInitial([...state.selected].sort()));
 
 /* ------------------------------------------------------------------ */
 /* 手持ち画像の取り込み（APIを呼ばない＝無料）                          */
@@ -1365,7 +1444,7 @@ async function pollJob() {
           job.status === 'failed');
     if (job.kind === 'master') await afterMasterChanged();
     else await refreshStickers();
-    if (job.kind === 'variants' && vstate.open) await reloadVariantModal();
+    if ((job.kind === 'variants' || job.kind === 'initial') && vstate.open) await reloadVariantModal();
   }
 }
 
@@ -2204,7 +2283,10 @@ function vmsg(text, kind = '') {
   el.className = `vmsg ${kind}`;
 }
 
-/** 候補が2件以上あるスタンプだけを対象にします（1件のものは従来どおり拡大表示）。 */
+/**
+ * 候補が1件以上あるスタンプを順に見られます。開くのは canCompare のスタンプから
+ * （採用中の1件だけのものは、一覧では従来どおり拡大表示）。
+ */
 async function openVariantModal(stickerId) {
   vstate.ids = gridFilter().filter((s) => (s.variant_count || 0) >= 1).map((s) => s.id);
   vstate.index = Math.max(vstate.ids.indexOf(stickerId), 0);
@@ -2507,6 +2589,9 @@ const REGEN_MAX_COUNT = 8;
 const REGEN_DEFAULT_COUNT = 4;
 for (let n = 1; n <= REGEN_MAX_COUNT; n++) {
   $('#v-regen-count').insertAdjacentHTML('beforeend',
+    `<option value="${n}" ${n === REGEN_DEFAULT_COUNT ? 'selected' : ''}>${n}枚ずつ</option>`);
+  // 最初の候補の枚数も、再生成と同じ制限です
+  $('#initial-count').insertAdjacentHTML('beforeend',
     `<option value="${n}" ${n === REGEN_DEFAULT_COUNT ? 'selected' : ''}>${n}枚ずつ</option>`);
 }
 

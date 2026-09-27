@@ -1187,6 +1187,15 @@ def _regen_recover(config, sticker_id: str, record: dict, run: dict, *, apply: b
     ファイルは使いません）。一時ファイル（.png.part）のままなら、正式な名前に置き換えてから登録します。
     apply=False なら数えるだけで、何も書きません。
     """
+    return _recover_reserved(config, sticker_id, record, run, apply=apply, meta={"regen_recovered": True})
+
+
+def _recover_reserved(config, sticker_id: str, record: dict, run: dict, *, apply: bool, meta: dict) -> int:
+    """実行の記録（reserved / done）から、課金済みで未登録の画像を数える・登録する（再生成・初回生成で共通）。
+
+    run の reserved のうち done に無い番号で、最後まで読める vNNN.png か vNNN.png.part があるものが対象です。
+    apply=True なら .part を正式な名前に置き換え、未登録なら meta を付けて登録し、done に加えます。
+    """
     done = run.get("done") or []
     known = {v.get("variant_id") for v in record.get("variants") or [] if isinstance(v, dict)}
     recovered = 0
@@ -1204,7 +1213,7 @@ def _regen_recover(config, sticker_id: str, record: dict, run: dict, *, apply: b
         if source == part:
             _replace_with_retry(part, path)
         if variant_id not in known:
-            register_variant(config, record, variant_id, path, meta={"regen_recovered": True})
+            register_variant(config, record, variant_id, path, meta=dict(meta))
         run.setdefault("done", []).append(variant_id)
     return recovered
 
@@ -1379,6 +1388,196 @@ def finish_regen(config, sticker_id: str, token: str) -> bool:
         if len(run.get("done") or []) >= run["count"]:
             record["regen_generated_at"] = run["since"]        # 開始時刻（それ以降の印は次回の対象）
             record.pop("regen_run", None)
+            return True
+        run["owner"] = None
+        return False
+
+    result = update_sticker(config, sticker_id, mutate)
+    return result is True
+
+
+# ---------------------------------------------------------------------------
+# 初回候補生成（Phase 7）: 候補が1件も無いスタンプに、最初の候補を作る
+# ---------------------------------------------------------------------------
+# 実行の記録は initial_run（regen_run とは別です。regen の印・regen_generated_at とは関係しません）。
+# 枚数の制限は再生成と同じにします。
+INITIAL_DEFAULT_COUNT = REGEN_DEFAULT_COUNT
+INITIAL_MAX_COUNT = REGEN_MAX_COUNT
+INITIAL_MAX_TOTAL = REGEN_MAX_TOTAL
+
+INITIAL_SKIP_CANDIDATES = "has_candidates"   # 候補が1件以上ある
+INITIAL_SKIP_ORIGINAL = "has_original"       # 原画（generated/<id>.png）だけがある（仮想の v001 と混ぜない）
+INITIAL_SKIP_RUNNING = "running"             # 別の処理が、このスタンプの初回生成を実行中
+
+
+def initial_status(record) -> str | None:
+    """一覧の表示用。"running"（実行中）/ "pending"（途中で止まった実行がある）/ None。"""
+    run = record.get("initial_run") if isinstance(record, dict) else None
+    if not isinstance(run, dict):
+        return None
+    return "running" if _regen_owner_alive(run.get("owner")) else "pending"
+
+
+def _initial_decide(config, sticker_id: str, record, count: int, *, apply: bool) -> dict:
+    """1スタンプの初回生成を、続きから・新しく・しない、のどれにするかを決めます。
+
+    途中で止まった実行（initial_run の持ち主が動いていない）は、候補が既にあっても続きからです。
+    前回の記録前に落ちた課金済みの画像は、作り直さずに登録します（apply=False なら数えるだけ）。
+
+    Returns:
+        {"skip": 理由} … 対象外
+        {"resume": True, "run": 実行, "remaining": n, "recovered": n} … 続き（n=0 なら締めるだけ）
+        {"new": True, "remaining": count, "recovered": 0} … 新しい実行
+    """
+    run = record.get("initial_run") if isinstance(record, dict) else None
+    if isinstance(run, dict):
+        if _regen_owner_alive(run.get("owner")):
+            return {"skip": INITIAL_SKIP_RUNNING}
+        work = run if apply else copy.deepcopy(run)
+        recovered = _recover_reserved(config, sticker_id, record, work, apply=apply,
+                                      meta={"initial_recovered": True})
+        made = len(work.get("done") or []) + (0 if apply else recovered)
+        planned = work.get("count")
+        if not isinstance(planned, int) or isinstance(planned, bool):
+            planned = made                      # 枚数の分からない記録は、作れた分で締めます
+        return {"resume": True, "run": work, "remaining": max(planned - made, 0), "recovered": recovered}
+    if isinstance(record, dict) and record.get("variants"):
+        return {"skip": INITIAL_SKIP_CANDIDATES}
+    if (config.dir_generated / f"{sticker_id}.png").exists():
+        return {"skip": INITIAL_SKIP_ORIGINAL}
+    return {"new": True, "remaining": int(count), "recovered": 0}
+
+
+def initial_plan(config, sticker_ids, count: int) -> dict:
+    """初回生成の対象と枚数を計算します（読み取りだけ。何も書かず、プロバイダも作りません）。
+
+    Returns:
+        {"targets": [{"id", "count": 作る枚数, "resume": 続きか, "recovered": 作らずに登録する枚数}],
+         "skipped": [{"id", "reason"}], "busy": [実行中のスタンプ], "total": 合計枚数}
+    """
+    stickers = load(config).get("stickers") or {}
+    targets, skipped, busy = [], [], []
+    for sid in sticker_ids:
+        decision = _initial_decide(config, sid, stickers.get(sid), count, apply=False)
+        if "skip" in decision:
+            skipped.append({"id": sid, "reason": decision["skip"]})
+            if decision["skip"] == INITIAL_SKIP_RUNNING:
+                busy.append(sid)
+            continue
+        targets.append({"id": sid, "count": decision["remaining"], "resume": bool(decision.get("resume")),
+                        "recovered": decision["recovered"]})
+    return {"targets": targets, "skipped": skipped, "busy": busy,
+            "total": sum(t["count"] for t in targets)}
+
+
+def begin_initial(config, sticker_id: str, count: int) -> dict | None:
+    """1スタンプの初回生成を始めます（記録の鍵の中で、対象かどうかを確かめ直してから）。
+
+    実行中の目印（owner）を書くので、同じスタンプを2つの処理が同時に初回生成することはありません。
+
+    Returns:
+        {"claim": {"token", "since", "remaining"} or None（作らずに締めた）, "recovered": 登録した枚数}。
+        対象でない・実行中なら None。
+    """
+    def mutate(state):
+        stickers = state.setdefault("stickers", {})
+        record = stickers.get(sticker_id)
+        decision = _initial_decide(config, sticker_id, record, count, apply=True)
+        if "skip" in decision:
+            return UNCHANGED
+        if decision.get("resume"):
+            run = decision["run"]
+            if decision["remaining"] <= 0:
+                # 全部できている（締めの前に止まった・残りを復元できた）: 作らずに完了として締めます
+                record.pop("initial_run", None)
+                return {"claim": None, "recovered": decision["recovered"]}
+        else:
+            record = ensure_record(config, state, sticker_id)
+            run = {"since": _regen_now(), "count": int(count), "done": [], "reserved": []}
+            record["initial_run"] = run
+        run["owner"] = _regen_owner()
+        return {"claim": {"token": run["owner"]["token"], "since": run["since"],
+                          "remaining": decision["remaining"]},
+                "recovered": decision["recovered"]}
+
+    result = update_sticker(config, sticker_id, mutate)
+    return None if result is UNCHANGED else result
+
+
+def _initial_run_of(state: dict, sticker_id: str, token: str) -> tuple[dict, dict] | tuple[None, None]:
+    record = (state.get("stickers") or {}).get(sticker_id)
+    run = record.get("initial_run") if isinstance(record, dict) else None
+    owner = run.get("owner") if isinstance(run, dict) else None
+    if not isinstance(owner, dict) or owner.get("token") != token:
+        return None, None
+    return record, run
+
+
+def initial_reserve_hook(sticker_id: str, token: str):
+    """generate_variants の on_reserved: 番号の確保と同じ保存で initial_run.reserved に記録します。"""
+    def hook(state, record_for_sticker, variant_id):
+        _record, run = _initial_run_of(state, sticker_id, token)
+        if run is not None:
+            run.setdefault("reserved", []).append(variant_id)
+    return hook
+
+
+def initial_register_hook(sticker_id: str, token: str):
+    """generate_variants の on_registered: 候補の登録と同じ保存で initial_run.done に記録します。"""
+    def hook(state, record_for_sticker, variant_id):
+        _record, run = _initial_run_of(state, sticker_id, token)
+        if run is not None:
+            run.setdefault("done", []).append(variant_id)
+    return hook
+
+
+def run_initial(config, entry, count: int, generator, *, on_start=None, on_event=None,
+                should_stop=None) -> dict:
+    """1スタンプの初回生成を最後まで行います（GUI のジョブが1スタンプずつ呼びます）。
+
+    始める → 候補を作る（番号の予約と登録は、それぞれ記録の鍵の中の1回の保存）→ 締める。
+    API を呼んでいる間は鍵を持ちません。
+
+    Returns:
+        {"claimed": 候補を作り始めたか, "closed": 作らずに締めたか, "recovered": 作らずに登録した枚数,
+         "remaining": 作ろうとした枚数, "complete": 全部そろったか}
+    """
+    begun = begin_initial(config, entry.id, count)
+    if begun is None:
+        return {"claimed": False, "closed": False, "recovered": 0, "remaining": 0, "complete": False}
+    claim = begun["claim"]
+    if claim is None:
+        return {"claimed": False, "closed": True, "recovered": begun["recovered"], "remaining": 0,
+                "complete": True}
+    if on_start:
+        on_start(claim["remaining"], begun["recovered"])
+    try:
+        generate_variants(
+            config, [entry], claim["remaining"], generator, on_event=on_event,
+            on_reserved=initial_reserve_hook(entry.id, claim["token"]),
+            on_registered=initial_register_hook(entry.id, claim["token"]),
+            should_stop=should_stop)
+    finally:
+        complete = finish_initial(config, entry.id, claim["token"])
+    return {"claimed": True, "closed": False, "recovered": begun["recovered"],
+            "remaining": claim["remaining"], "complete": complete}
+
+
+def finish_initial(config, sticker_id: str, token: str) -> bool:
+    """1スタンプの初回生成を終えます。全部作れたら initial_run を消します（完了）。
+
+    途中で失敗・中止した場合は、作れた分（done）と予約（reserved）を残して実行中の目印だけ外します
+    （次回は残りの枚数だけを作ります）。
+
+    Returns:
+        全部作れたなら True。
+    """
+    def mutate(state):
+        record, run = _initial_run_of(state, sticker_id, token)
+        if run is None:
+            return UNCHANGED
+        if len(run.get("done") or []) >= run["count"]:
+            record.pop("initial_run", None)
             return True
         run["owner"] = None
         return False

@@ -198,6 +198,13 @@
                data-tip="APIを一切呼ばずに、送信予定のプロンプトだけを確認します。料金はかかりません">
           <input type="checkbox" id="opt-dryrun"> dry-run（APIを呼ばない）</label>
       </div>
+      <div class="group">
+        <span class="vinitial"
+              data-tip="選んだスタンプのうち、候補がまだ1件も無いもの（原画も無いもの）に、最初の候補を作ります。画像生成APIを使います。実行前に対象・枚数・費用を確認します。生成しただけでは採用しません">
+          <select id="initial-count" aria-label="1スタンプあたりの最初の候補の枚数"></select>
+          <button class="btn" id="btn-initial" disabled>最初の候補を作る</button>
+        </span>
+      </div>
       <div class="group right">
         <span class="cost" id="cost-label"
               data-tip="実際にAPIを呼ぶ枚数と概算料金です。すでに画像があるものは数に入りません">—</span>

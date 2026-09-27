@@ -340,6 +340,8 @@ def create_app(config=None) -> Flask:
             row["generated_mismatch"] = bool(sv and sv.generated_mismatch)
             # 採用に失敗し、元に戻す処理も完了できなかった（画像が採用前と違う可能性）
             row["rollback_failed"] = bool(sv and sv.rollback_failed)
+            # 初回候補生成の実行中（running）・途中で止まった実行がある（pending）
+            row["initial_run"] = variants_mod.initial_status((vstate.get("stickers") or {}).get(e.id))
             out.append(row)
         return out
 
@@ -1098,6 +1100,121 @@ def create_app(config=None) -> Flask:
         try:
             job = jobs.start("variants", total, _run_regen, [t["id"] for t in plan["targets"]], count)
         except RuntimeError as exc:                         # ほかの処理が実行中（同時のリクエストを含む）
+            return jsonify({"error": str(exc)}), 409
+        return jsonify({**summary, "job": job.to_dict()})
+
+    # ------------------------------------------------------------------
+    # 初回候補生成（Phase 7）: 候補が1件も無いスタンプに、最初の候補を作る
+    # ------------------------------------------------------------------
+    def _run_initial(job: Job, ids: list[str], count: int) -> None:
+        """初回生成の候補を作るジョブ。API を呼んでいる間は鍵を持ちません（記録の更新時だけ）。"""
+        cfg_ = current_config()
+        logger = RunLogger(cfg_.log_path, echo=False)
+        state = StateStore(cfg_.state_path)
+        generator = ImageGenerator(cfg_, logger, state, dry_run=False)
+        by_id = {e.id: e for e in entries_or_error()}
+
+        for sticker_id in ids:
+            if jobs.cancelled():
+                job.log("warn", "ユーザー操作により中止しました（作れた候補は残し、次回は残りだけ作ります）")
+                break
+            entry = by_id.get(sticker_id)
+            if entry is None:
+                job.log("error", "CSVに存在しません", sticker_id)
+                continue
+
+            def on_start(remaining, recovered, sid=sticker_id):
+                if recovered:
+                    job.log("ok", f"前回作れていた {recovered} 枚を登録しました（APIは呼びません）", sid)
+                job.log("info", f"最初の候補を {remaining} 枚作ります", sid)
+
+            def on_event(sid, variant_id, status, detail):
+                job.api_calls += 1
+                job.done += 1
+                if status == "generated":
+                    job.log("ok", f"{variant_id} を作りました", sid)
+                else:
+                    job.log("error", f"{variant_id}: {detail}", sid)
+
+            # 記録の鍵の中で対象かどうかを確かめ直し、実行中の目印を付けてから作ります
+            outcome = variants_mod.run_initial(cfg_, entry, count, generator, on_start=on_start,
+                                               on_event=on_event, should_stop=jobs.cancelled)
+            if outcome["closed"]:
+                job.log("ok", f"前回の続きを締めました（登録 {outcome['recovered']} 枚、APIは呼びません）",
+                        sticker_id)
+            elif not outcome["claimed"]:
+                job.log("skip", "対象ではなくなったか、別の処理が実行中のため作りませんでした", sticker_id)
+            elif outcome["complete"]:
+                job.log("ok", "最初の候補を作り終えました（採用は候補比較の画面で行います）", sticker_id)
+            else:
+                job.log("warn", "途中で止まりました（作れた候補は残し、次回は残りだけ作ります）", sticker_id)
+        job.result["api_calls"] = job.api_calls
+
+    @app.post("/api/variants/initial")
+    def api_variants_initial():
+        """候補が1件も無いスタンプに、最初の候補を作ります（途中で止まった初回生成の続きも）。
+
+        dry_run=true なら対象・枚数・費用だけを返します（プロバイダを作らず、何も書きません）。
+        実行するときは、確認画面で見た合計枚数（expected_total）を添えてください（再生成と同じ）。
+        """
+        cfg_ = current_config()
+        body = request.get_json(silent=True) or {}
+        ids = body.get("ids")
+        if (not isinstance(ids, list) or not ids
+                or not all(isinstance(i, str) and i.strip() for i in ids)):
+            return jsonify({"error": "対象のスタンプ（ids）を1件以上選んでください"}), 400
+        ids = [i.strip() for i in ids]
+        if len(set(ids)) != len(ids):
+            return jsonify({"error": "同じスタンプが重複して指定されています"}), 400
+        try:
+            count = _regen_count(body)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        try:
+            entries = entries_or_error()
+        except CsvLoadError as exc:
+            return jsonify({"error": str(exc)}), 400
+        known = {e.id for e in entries}
+        unknown = [i for i in ids if i not in known]
+        if unknown:
+            return jsonify({"error": f"IDが見つかりません: {', '.join(unknown)}"}), 400
+        if variants_state(cfg_) == "corrupt":
+            return _variant_error(variants_mod.StateCorruptError(variants_mod.corrupt_message(cfg_)))
+
+        plan = variants_mod.initial_plan(cfg_, ids, count)
+        total = plan["total"]
+        summary = {
+            "ids": ids, "count": count, "targets": plan["targets"],
+            "target_ids": [t["id"] for t in plan["targets"]], "target_count": len(plan["targets"]),
+            "skipped": plan["skipped"], "busy": plan["busy"], "total": total, "expected_total": total,
+            "usd": estimate_cost_usd(cfg_.model, cfg_.quality, total),
+            "model": cfg_.model, "quality": cfg_.quality,
+            "max_count": variants_mod.INITIAL_MAX_COUNT, "max_total": variants_mod.INITIAL_MAX_TOTAL,
+        }
+        if total > variants_mod.INITIAL_MAX_TOTAL:
+            return jsonify({**summary, "error": (
+                f"1回に作れる候補は {variants_mod.INITIAL_MAX_TOTAL} 枚までです（今回 {total} 枚）。"
+                "1スタンプあたりの枚数か、スタンプの数を減らしてください")}), 400
+        if body.get("dry_run"):
+            return jsonify(summary)
+
+        expected = body.get("expected_total")
+        if isinstance(expected, bool) or not isinstance(expected, int):
+            return jsonify({"error": "確認画面の合計枚数（expected_total）を指定してください"}), 400
+        if not plan["targets"]:
+            return jsonify({**summary, "error": "初回生成の対象がありません（候補・原画があるか、実行中です）"}), 400
+        if expected != total:
+            return jsonify({**summary, "error": "対象が変わりました。もう一度確認してから実行してください"}), 409
+        if not cfg_.api_key:
+            return jsonify({"error": "OPENAI_API_KEY が未設定です。.env に記入してください。"}), 400
+        try:
+            image_generator_mod.create_provider(cfg_)      # 設定の誤りをここで知らせる（通信はしません）
+            check_master_image(cfg_)
+        except (ProviderError, ValueError, MasterImageMissingError) as exc:
+            return jsonify({"error": str(exc)}), 400
+        try:
+            job = jobs.start("initial", total, _run_initial, summary["target_ids"], count)
+        except JobBusyError as exc:                         # ほかの処理が実行中（同時のリクエストを含む）
             return jsonify({"error": str(exc)}), 409
         return jsonify({**summary, "job": job.to_dict()})
 

@@ -747,6 +747,10 @@ main { padding: 16px; max-width: 1500px; margin: 0 auto; }
 .vstats { font-size: 12px; color: var(--muted); margin-left: auto; }
 .vregen { display: inline-flex; gap: 4px; align-items: center; }
 .vregen select { font-size: 12px; }
+/* 最初の候補を作る（候補がまだ無いスタンプ）。「AIで作り直す」と見分けやすいよう色を分けます */
+.vinitial { display: inline-flex; gap: 4px; align-items: center; }
+.vinitial select { font-size: 12px; }
+.cell .rowbtns .btn.initial { color: var(--accent); border-color: var(--accent); }
 .vcards {
   display: flex; gap: 12px; overflow-x: auto; padding: 14px 16px; align-items: flex-start;
 }
