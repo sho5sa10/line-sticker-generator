@@ -780,6 +780,7 @@ main { padding: 16px; max-width: 1500px; margin: 0 auto; }
 .vverdict.rejected { color: var(--danger); }
 .vverdict.regen { color: var(--warn); }
 .vverdict.adopted { color: var(--ok); }
+.vverdict.current { color: var(--ok); }
 .vstars { display: flex; gap: 2px; margin-left: auto; }
 .vstars button {
   border: none; background: none; cursor: pointer; font-size: 15px; line-height: 1;
@@ -820,6 +821,16 @@ main { padding: 16px; max-width: 1500px; margin: 0 auto; }
   margin: 0 16px; padding: 8px 12px; border-radius: 8px; font-size: 13px; font-weight: 700;
   color: var(--fg); background: color-mix(in srgb, var(--warn) 16%, var(--surface));
   border: 1px solid color-mix(in srgb, var(--warn) 50%, var(--line));
+  white-space: pre-line;
 }
+/* 候補の記録ファイルが壊れているときの警告（一覧の上） */
+.vcorrupt {
+  margin: 8px 0 12px; padding: 10px 12px; border-radius: 8px; font-size: 13px; line-height: 1.6;
+  color: var(--fg); background: color-mix(in srgb, var(--danger) 12%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--danger) 50%, var(--line));
+}
+.vcorrupt[hidden] { display: none; }
+.vcorrupt b, .vcorrupt span { display: block; }
+.vcorrupt .btn { margin-top: 6px; }
 .cell.mismatch { border-color: color-mix(in srgb, var(--warn) 60%, var(--line)); }
 .tag.mismatch { left: 34px; right: auto; color: var(--warn); }

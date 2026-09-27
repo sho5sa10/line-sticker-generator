@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -327,7 +328,8 @@ print("ok")
 def _spawn(cfg, mode, n):
     return subprocess.Popen(
         [sys.executable, "-c", _WORKER, str(PROJECT), str(cfg.path), mode, str(n)],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"})
 
 
 def test_f_scoring_rating_and_adoption_from_separate_processes(tmp_config):
@@ -750,3 +752,126 @@ def test_import_waits_for_adoption_and_is_detected_afterwards(tmp_config, monkey
     assert results and results[0].ok                       # 取り込みは採用のあとに行われた
     assert _sha(tmp_config.dir_generated / "001.png") != v003
     assert vr.get_sticker(tmp_config, "001").generated_mismatch   # 取り込みで差し替わったと分かる
+
+
+# ===========================================================================
+# C2 周辺: 退避名の一意化・修復コマンド・画面での表示
+# ===========================================================================
+def _run_module(*args):
+    """python -m src.variants を別プロセスで実行します（出力は UTF-8 で受け取る）。"""
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+    return subprocess.run([sys.executable, "-m", "src.variants", *args], cwd=PROJECT, env=env,
+                          capture_output=True, text=True, encoding="utf-8", timeout=120)
+
+
+def _all_pngs(cfg) -> dict:
+    return {str(p.relative_to(cfg.root)): _sha(p) for p in (cfg.root / "output").rglob("*.png")}
+
+
+def test_quarantine_twice_in_the_same_second_keeps_both(tmp_config):
+    tmp_config.variants_path.write_text("{A", encoding="utf-8")
+    first = vr.quarantine_corrupt_state(tmp_config)
+    tmp_config.variants_path.write_text("{B", encoding="utf-8")
+    second = vr.quarantine_corrupt_state(tmp_config)
+    assert first != second
+    kept = sorted(p.read_text(encoding="utf-8")
+                  for p in tmp_config.variants_path.parent.glob("variants.json.corrupt-*"))
+    assert kept == ["{A", "{B"]
+
+
+def test_corrupt_message_names_a_command_that_exists(tmp_config):
+    assert "python -m src.variants repair" in vr.corrupt_message(tmp_config)
+    out = _run_module("--help")
+    assert out.returncode == 0 and "repair" in out.stdout
+
+
+def test_repair_command_recovers_candidates_after_corruption(tmp_config):
+    """壊れた記録を退避し、候補フォルダから記録を作り直す（採用中は generated と同じ候補）。"""
+    _add_candidates(tmp_config)
+    vr.adopt(tmp_config, ENTRY, "v003")
+    broken = tmp_config.variants_path.read_text(encoding="utf-8")[:-40]
+    tmp_config.variants_path.write_text(broken, encoding="utf-8")
+    images = _all_pngs(tmp_config)
+
+    out = _run_module("--config", str(tmp_config.path), "repair")
+    assert out.returncode == 0, out.stderr
+
+    kept = list(tmp_config.variants_path.parent.glob("variants.json.corrupt-*"))
+    assert [p.read_text(encoding="utf-8") for p in kept] == [broken]      # 壊れたファイルは残す
+    st = vr.get_sticker(tmp_config, "001")
+    assert [v.variant_id for v in st.variants] == ["v001", "v002", "v003"]
+    assert st.adopted == "v003" and not st.generated_mismatch
+    assert _all_pngs(tmp_config) == images                                 # 画像は消さない・変えない
+    assert vr.adopt(tmp_config, ENTRY, "v001")["validation_ok"] is True    # そのまま使える
+
+
+def test_repair_on_a_healthy_state_only_adds_missing_candidates(tmp_config):
+    _add_candidates(tmp_config)
+    vr.set_rating(tmp_config, "001", "v002", 5)
+    vr.set_verdict(tmp_config, "001", "v003", "rejected")
+    before = _state(tmp_config)["stickers"]["001"]
+    _generate_file(tmp_config, "001", "v007", GREEN)                       # 記録に無い画像
+    (vr.variant_dir(tmp_config, "001") / "v008.png").write_bytes(b"not a png")
+
+    report = vr.repair_state(tmp_config)
+    assert report["quarantined"] is None
+    assert report["stickers"]["001"]["added"] == ["v007"]
+    assert any("v008.png" in p for p in report["unreadable"])
+    after = _state(tmp_config)["stickers"]["001"]
+    assert after["adopted"] == before["adopted"]
+    assert _item(tmp_config, "001", "v002")["human_rating"] == 5
+    assert _item(tmp_config, "001", "v003")["verdict"] == "rejected"
+    assert [v["variant_id"] for v in after["variants"]] == ["v001", "v002", "v003", "v007"]
+    assert _generate_one(tmp_config, "001") == "v009"                      # 番号は重複しない
+
+
+def test_repair_when_generated_matches_no_candidate(tmp_config):
+    _generate_file(tmp_config, "001", "v001", BLUE)
+    original = _legacy_only(tmp_config, YELLOW)                           # 記録なし・別の原画
+    tmp_config.variants_path.write_text("{壊れ", encoding="utf-8")
+    vr.repair_state(tmp_config)
+    st = vr.get_sticker(tmp_config, "001")
+    adopted = st.find(st.adopted)
+    assert adopted.source == "legacy" and _sha(adopted.path(tmp_config)) == original
+    assert st.find("v001").source == "recovered"
+
+
+def test_gui_shows_corruption_and_can_repair(web, tmp_config):
+    _add_candidates(tmp_config)
+    tmp_config.variants_path.write_text("{壊れ", encoding="utf-8")
+    assert web.get("/api/state").get_json()["variants_state"] == "corrupt"
+    assert web.get("/api/variants").get_json()["state_status"] == "corrupt"
+
+    r = web.post("/api/variants/repair", json={}, headers={"X-Sticker-Client": "1"})
+    assert r.status_code == 200
+    assert r.get_json()["variants_state"] == "ok"
+    assert web.get("/api/state").get_json()["variants_state"] == "ok"
+    r = web.post("/api/variants/repair", data="x", content_type="text/plain",
+                 headers={"Origin": "https://evil.example"})
+    assert r.status_code == 403
+
+
+# ===========================================================================
+# GET も Host を確認する（DNS rebinding で記録・画像を読ませない）
+# ===========================================================================
+@pytest.mark.parametrize("host, expected", [
+    ("127.0.0.1:8765", 200), ("localhost:8765", 200), ("[::1]:8765", 200), ("[::1]", 200),
+    ("192.168.1.20:8765", 200),                  # --host 0.0.0.0 で IP から開く場合は読める
+    ("evil.example:8765", 403), ("localhost.evil.example", 403), ("127.0.0.1.nip.io:8765", 403),
+])
+def test_reads_check_the_host_name(web, tmp_config, host, expected):
+    _add_candidates(tmp_config)
+    for path in ("/api/variants", "/api/state", "/img/variants/001/v002.png"):
+        assert web.get(path, headers={"Host": host}).status_code == expected, path
+
+
+def test_ip_host_can_read_but_not_write(web, tmp_config):
+    _add_candidates(tmp_config)
+    r = web.post("/api/variants/001/v002/rating", json={"rating": 3},
+                 headers={"Host": "192.168.1.20:8765"})
+    assert r.status_code == 403
+
+
+def test_foreign_forwarded_host_is_rejected(web, tmp_config):
+    assert web.get("/api/state", headers={"X-Forwarded-Host": "evil.example"}).status_code == 403
+    assert web.get("/api/state", headers={"X-Forwarded-Host": "localhost"}).status_code == 200

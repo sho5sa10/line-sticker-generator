@@ -957,7 +957,26 @@ function cellHtml(s) {
     </div>`;
 }
 
+/** 候補の記録ファイルが壊れていたら、一覧の上に警告と修復ボタンを出します。 */
+function renderVariantsState() {
+  const corrupt = !!(state.info && state.info.variants_state === 'corrupt');
+  $('#variants-corrupt').hidden = !corrupt;
+}
+
+$('#btn-variants-repair').addEventListener('click', async () => {
+  if (!confirm('壊れた記録ファイルを別名で残し、候補フォルダの画像から記録を作り直します。\n'
+               + '判断・評価は失われます（画像は消えません）。修復しますか？')) return;
+  try {
+    const d = await api('/api/variants/repair', { method: 'POST', body: {} });
+    const n = Object.keys(d.report.stickers || {}).length;
+    toast(`記録を修復しました（候補を戻したスタンプ: ${n}件）`
+      + (d.report.quarantined ? '。壊れたファイルは別名で残しています' : ''));
+    await loadState();
+  } catch (e) { toast(`✕ 修復できませんでした：${e.message}`, true); }
+});
+
 function renderGrid() {
+  renderVariantsState();
   const shown = gridFilter();
   let html;
   if ($('#grid-by-genre').checked) {
@@ -2156,6 +2175,17 @@ const vstate = { ids: [], index: 0, sticker: null, picked: 0, open: false, all: 
 // 過去に採用したことがある候補は「過去に採用」と表示して、CURRENT と混同しないようにします。
 const VERDICT_LABEL = { pending: '未評価', adopted: '過去に採用', rejected: '除外', regen: '再生成したい' };
 
+/**
+ * カードに出す判断の表示。いま採用中の候補は「採用中」（★CURRENT と同じ意味）、
+ * 「過去に採用」は、いま採用中ではない候補にだけ付けます。
+ * 採用中の候補に人が「除外」などを付けている場合は、それも併記します。
+ */
+function verdictLabel(v, isCurrent) {
+  if (!isCurrent) return VERDICT_LABEL[v.verdict] || v.verdict;
+  if (v.verdict === 'adopted' || v.verdict === 'pending') return '採用中';
+  return `採用中（判断: ${VERDICT_LABEL[v.verdict] || v.verdict}）`;
+}
+
 function variantImageUrl(v, sticker_id) {
   // legacy の候補は generated/ を指しています（コピーしていないため）
   return v.source === 'legacy'
@@ -2186,6 +2216,30 @@ function closeVariantModal() {
   vstate.open = false;
   $('#variant-modal').hidden = true;
   vmsg('');
+  renderGrid();                    // 採用し直した結果（⚠原画の解消など）を一覧にも反映します
+}
+
+/** いま画面に出しているスタンプのID（閉じているときは null）。 */
+function shownStickerId() {
+  return vstate.open ? vstate.ids[vstate.index] : null;
+}
+
+/**
+ * 操作の応答を反映します。応答が届いた時点で、そのスタンプがまだ表示中のときだけ画面を
+ * 書き換えます（遅れて届いた応答で、別のスタンプの画面を上書きしないため）。
+ * 集計（vstate.all）と一覧の行は、表示中かどうかに関係なく最新にします。
+ */
+function applyStickerResponse(requestedId, sticker) {
+  if (!sticker || sticker.sticker_id !== requestedId) return false;
+  vstate.all[requestedId] = sticker;
+  const row = state.stickers.find((s) => s.id === requestedId);
+  if (row) {
+    row.adopted = sticker.adopted;
+    row.generated_mismatch = !!sticker.generated_mismatch;
+  }
+  if (shownStickerId() !== requestedId) return false;
+  vstate.sticker = sticker;
+  return true;
 }
 
 async function loadVariantSticker() {
@@ -2194,13 +2248,17 @@ async function loadVariantSticker() {
   $('#v-title').textContent = `${id}「${sticker ? sticker.text : ''}」`;
   $('#v-position').textContent = `[${vstate.index + 1} / ${vstate.ids.length}]`;
   $('#v-cards').innerHTML = '<p class="hint">読み込み中…</p>';
+  // 読み込みが終わるまでは、前のスタンプのデータで操作できないようにします
+  vstate.sticker = null;
+  renderGeneratedMismatch();
+  let loaded;
   try {
-    vstate.sticker = await api(`/api/variants/${id}`);
-    vstate.all[id] = vstate.sticker;
+    loaded = await api(`/api/variants/${id}`);
   } catch (e) {
-    $('#v-cards').innerHTML = `<p class="hint">${escapeHtml(e.message)}</p>`;
+    if (shownStickerId() === id) $('#v-cards').innerHTML = `<p class="hint">${escapeHtml(e.message)}</p>`;
     return;
   }
+  if (!applyStickerResponse(id, loaded)) return;     // その間に別のスタンプへ移動した
   // 現在の採用は必ず sticker.adopted を使います（verdict では判定しません）
   const adopted = vstate.sticker.adopted;
   const pickedIdx = vstate.sticker.variants.findIndex((v) => v.variant_id === adopted);
@@ -2282,7 +2340,7 @@ function renderVariantCards() {
           </div>
         </div>
         <div class="vmeta">
-          <span class="vverdict ${v.verdict}">${VERDICT_LABEL[v.verdict] || v.verdict}</span>
+          <span class="vverdict ${isCurrent ? 'current' : v.verdict}">${verdictLabel(v, isCurrent)}</span>
           <span class="vstars">${stars}</span>
         </div>
         ${scoreBlock}
@@ -2300,13 +2358,19 @@ function renderVariantCards() {
 
 /** 採用した画像が、採用以外の操作（作り直し・取り込み）で差し替わっていたら知らせます。 */
 function renderGeneratedMismatch() {
-  const warn = vstate.sticker && vstate.sticker.generated_mismatch;
+  const s = vstate.sticker;
+  const lines = [];
+  if (s && s.rollback_failed) {
+    lines.push('⚠ 前回の採用に失敗し、元の画像へ戻す処理も完了できませんでした。'
+      + `採用前の画像の控え: ${s.rollback_failed.backup}。候補をもう一度「採用」してください。`);
+  }
+  if (s && s.generated_mismatch) {
+    lines.push('⚠ いま使われている原画は、この採用候補と違います（作り直しや取り込みで差し替わっています）。'
+      + '正しい候補をもう一度「採用」してください。');
+  }
   const el = $('#v-mismatch');
-  el.hidden = !warn;
-  el.textContent = warn
-    ? '⚠ いま使われている原画は、この採用候補と違います（作り直しや取り込みで差し替わっています）。'
-      + '正しい候補をもう一度「採用」してください。'
-    : '';
+  el.hidden = !lines.length;
+  el.textContent = lines.join('\n');
 }
 
 function renderVariantStats() {
@@ -2338,86 +2402,98 @@ async function moveSticker(step) {
   await loadVariantSticker();
 }
 
+/**
+ * 操作の対象（表示中のスタンプと、選んでいる候補）。読み込み中や、表示とデータが
+ * 食い違っているときは null を返し、操作させません。
+ */
+function operationTarget() {
+  const id = shownStickerId();
+  const v = currentVariant();
+  if (!id || !v || !vstate.sticker || vstate.sticker.sticker_id !== id) return null;
+  return { id, v };
+}
+
 /** 採用（generated→final→検証は既存の variants.adopt に任せます）。 */
 async function adoptCurrent({ advance = false } = {}) {
-  const v = currentVariant();
-  if (!v) return false;
-  const id = vstate.sticker.sticker_id;
+  if (vstate.busy) return false;
+  const target = operationTarget();
+  if (!target) return false;
+  const { id, v } = target;
   // 原画が別の操作で差し替わっているときは、同じ候補でも採用し直して直せるようにします
   if (vstate.sticker.adopted === v.variant_id && !vstate.sticker.generated_mismatch) {
-    vmsg(`${v.variant_id} はすでに採用中です`);
+    vmsg(`${id}/${v.variant_id} はすでに採用中です`);
     if (advance) await moveSticker(1);
     return true;
   }
   vstate.busy = true;                       // 採用中は他の操作を受け付けません
-  vmsg(`${v.variant_id} を採用処理中…`, 'busy');
+  vmsg(`${id}/${v.variant_id} を採用処理中…`, 'busy');
   $$('#v-cards [data-vact]').forEach((b) => { b.disabled = true; });
+  let ok = false;
   try {
     const d = await api(`/api/variants/${id}/${v.variant_id}/adopt`, { method: 'POST', body: {} });
-    vstate.sticker = d.sticker;
-    vstate.all[id] = d.sticker;
+    const shown = applyStickerResponse(id, d.sticker);
     const row = state.stickers.find((s) => s.id === id);
-    if (row) { row.adopted = d.sticker.adopted; row.has_final = true; row.final_mtime = Date.now() / 1000; }
+    if (row) { row.has_final = true; row.final_mtime = Date.now() / 1000; }
     if (state.info) { state.info.validation = d.validation; state.info.packages_status = d.packages_status; }
-    renderVariantCards();
+    if (shown) {
+      renderVariantCards();
+      renderGeneratedMismatch();
+    }
     renderVariantStats();
-    renderGeneratedMismatch();
-    vmsg(`✓ ${v.variant_id} を採用しました`, 'ok');
+    vmsg(`✓ ${id}/${v.variant_id} を採用しました`, 'ok');
     d.warnings.forEach((w) => toast(w, true));
-    if (advance) await moveSticker(1);
-    return true;
+    ok = true;
   } catch (e) {
-    vmsg(`✕ 採用に失敗しました：${e.message}`, 'bad');
-    renderVariantCards();          // 一覧は壊さず、そのまま比較を続けられます
-    return false;
+    vmsg(`✕ ${id}/${v.variant_id} の採用に失敗しました：${e.message}`, 'bad');
+    if (shownStickerId() === id && vstate.sticker) renderVariantCards();   // 比較はそのまま続けられます
   } finally {
     vstate.busy = false;
   }
+  // 「採用して次へ」: 採用が終わって操作を受け付ける状態に戻ってから、同じスタンプを
+  // 表示したままのときだけ次へ進みます
+  if (ok && advance && shownStickerId() === id) await moveSticker(1);
+  return ok;
 }
 
 /** 候補1件の再評価。計算はサーバー側の scoring.py だけが行います。 */
 async function rescoreCurrent() {
   if (vstate.busy) return;
-  const v = currentVariant();
-  if (!v) return;
-  vmsg(`${v.variant_id} を評価中…`, 'busy');
+  const target = operationTarget();
+  if (!target) return;
+  const { id, v } = target;
+  vmsg(`${id}/${v.variant_id} を評価中…`, 'busy');
   try {
-    const d = await api(`/api/variants/${vstate.sticker.sticker_id}/${v.variant_id}/score`,
-                        { method: 'POST', body: {} });
-    vstate.sticker = d.sticker;
-    vstate.all[d.sticker.sticker_id] = d.sticker;
-    renderVariantCards();
-    vmsg(`${v.variant_id} を評価しました（式 ${d.formula}）`, 'ok');
-  } catch (e) { vmsg(`✕ ${e.message}`, 'bad'); }
+    const d = await api(`/api/variants/${id}/${v.variant_id}/score`, { method: 'POST', body: {} });
+    if (applyStickerResponse(id, d.sticker)) renderVariantCards();
+    vmsg(`${id}/${v.variant_id} を評価しました（式 ${d.formula}）`, 'ok');
+  } catch (e) { vmsg(`✕ ${id}/${v.variant_id}: ${e.message}`, 'bad'); }
 }
 
 async function setVerdict(verdict) {
   if (vstate.busy) return;
-  const v = currentVariant();
-  if (!v) return;
+  const target = operationTarget();
+  if (!target) return;
+  const { id, v } = target;
   try {
-    const d = await api(`/api/variants/${vstate.sticker.sticker_id}/${v.variant_id}/verdict`,
+    const d = await api(`/api/variants/${id}/${v.variant_id}/verdict`,
                         { method: 'POST', body: { verdict } });
-    vstate.sticker = d.sticker;
-    vstate.all[d.sticker.sticker_id] = d.sticker;
-    renderVariantCards();
+    if (applyStickerResponse(id, d.sticker)) renderVariantCards();
     renderVariantStats();
-    vmsg(`${v.variant_id} を「${VERDICT_LABEL[verdict]}」にしました`, 'ok');
-  } catch (e) { vmsg(`✕ ${e.message}`, 'bad'); }
+    vmsg(`${id}/${v.variant_id} を「${VERDICT_LABEL[verdict]}」にしました`, 'ok');
+  } catch (e) { vmsg(`✕ ${id}/${v.variant_id}: ${e.message}`, 'bad'); }
 }
 
 async function setRating(rating) {
   if (vstate.busy) return;
-  const v = currentVariant();
-  if (!v) return;
+  const target = operationTarget();
+  if (!target) return;
+  const { id, v } = target;
   try {
-    const d = await api(`/api/variants/${vstate.sticker.sticker_id}/${v.variant_id}/rating`,
+    const d = await api(`/api/variants/${id}/${v.variant_id}/rating`,
                         { method: 'POST', body: { rating } });
-    vstate.sticker = d.sticker;
-    vstate.all[d.sticker.sticker_id] = d.sticker;
-    renderVariantCards();
-    vmsg(`${v.variant_id} の評価を ${rating === null ? 'なし' : rating} にしました`, 'ok');
-  } catch (e) { vmsg(`✕ ${e.message}`, 'bad'); }
+    if (applyStickerResponse(id, d.sticker)) renderVariantCards();
+    vmsg(`${id}/${v.variant_id} の評価を ${rating === null ? 'なし' : rating} にしました`, 'ok');
+  } catch (e) { vmsg(`✕ ${id}/${v.variant_id}: ${e.message}`, 'bad'); }
 }
 
 /* --- 操作 --- */

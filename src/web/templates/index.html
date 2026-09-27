@@ -254,6 +254,13 @@
         </div>
       </div>
     </div>
+    <div class="vcorrupt" id="variants-corrupt" hidden>
+      <b>⚠ 候補の記録ファイル（variants.json）が壊れています。</b>
+      候補・採用状態が表示されず、採用・評価・判断・候補の生成も止めています（記録をこれ以上失わないため）。
+      <span>「記録を修復する」で、壊れたファイルを別名で残したまま、候補フォルダの画像から記録を作り直します
+        （判断・評価は失われます）。コマンドなら <code>python -m src.variants repair</code>。</span>
+      <button class="btn" id="btn-variants-repair">記録を修復する</button>
+    </div>
     <div class="grid" id="grid"></div>
   </section>
 

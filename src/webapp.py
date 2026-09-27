@@ -10,6 +10,7 @@ CLI と同じパイプライン（pipeline / image_generator / validator / packa
 from __future__ import annotations
 
 import io
+import ipaddress
 import os
 import threading
 import traceback
@@ -180,11 +181,36 @@ def create_app(config=None) -> Flask:
     def _local(hostname: str | None) -> bool:
         return bool(hostname) and hostname.strip("[]") in LOCAL_HOSTS
 
+    def _host_name(value: str | None) -> str | None:
+        """Host ヘッダ（"127.0.0.1:8765" や "[::1]:8765"）からホスト名だけを取り出します。"""
+        try:
+            return urlsplit(f"//{value or ''}").hostname
+        except ValueError:
+            return None
+
+    def _readable_host(hostname: str | None) -> bool:
+        """読み取りを許すホスト名。このPCの名前か、IPアドレスそのもの（--host 0.0.0.0 で
+        スマホ等から IP で開く場合）。DNS rebinding は必ず「名前」で来るので、ここで止まります。"""
+        if _local(hostname):
+            return True
+        try:
+            ipaddress.ip_address((hostname or "").strip("[]"))
+            return True
+        except ValueError:
+            return False
+
     @app.before_request
     def block_cross_site_writes():
+        host = _host_name(request.host)
+        forwarded = request.headers.get("X-Forwarded-Host")
+        if forwarded and not _local(_host_name(forwarded.split(",")[0].strip())):
+            return jsonify({"error": "このアドレスからは操作できません"}), 403
         if request.method in ("GET", "HEAD", "OPTIONS"):
+            # 別サイトの名前で届いた読み取り（DNS rebinding）で、記録や画像を読まれないように
+            if not _readable_host(host):
+                return jsonify({"error": "このアドレスからは開けません"}), 403
             return None
-        if not _local((request.host or "").rsplit(":", 1)[0]):
+        if not _local(host):
             return jsonify({"error": "このアドレスからは操作できません"}), 403
         origin = request.headers.get("Origin")
         if origin and not _local(urlsplit(origin).hostname):
@@ -280,6 +306,13 @@ def create_app(config=None) -> Flask:
         stale = not finals or latest_final > latest_zip
         return {"count": len(zips), "latest": int(latest_zip), "stale": stale}
 
+    def variants_state(cfg_) -> str:
+        """"ok" / "missing" / "corrupt" / "busy"（一時的に読めない）。"""
+        try:
+            return variants_mod.state_status(cfg_)
+        except variants_mod.StateBusyError:
+            return "busy"
+
     def statuses(cfg_, entries) -> list[dict]:
         sales = sales_mod.load_sales(cfg_)
         # 候補の件数だけ一覧に載せます（variants.json の読み込みは1リクエストに1回）
@@ -347,6 +380,8 @@ def create_app(config=None) -> Flask:
                 "packages": packages,
                 "packages_status": packages_status(cfg_),
                 "validation": vd.load_result(cfg_),
+                # 候補の記録の状態（壊れていたら一覧に警告と修復ボタンを出します）
+                "variants_state": variants_state(cfg_),
                 "line_spec": {
                     "sticker": list(cfg_.sticker_size),
                     "main": list(cfg_.main_size),
@@ -886,6 +921,7 @@ def create_app(config=None) -> Flask:
         return jsonify({
             "schema": state.get("schema", variants_mod.SCHEMA),
             "state_exists": cfg_.variants_path.exists(),
+            "state_status": variants_state(cfg_),
             "stickers": {sid: sv.to_dict() for sid, sv in found.items()},
         })
 
@@ -920,6 +956,16 @@ def create_app(config=None) -> Flask:
             return jsonify({"error": str(exc), "retry": True}), 503
         status = 409 if isinstance(exc, variants_mod.StateCorruptError) else 400
         return jsonify({"error": str(exc)}), status
+
+    @app.post("/api/variants/repair")
+    def api_variants_repair():
+        """壊れた記録を退避し、候補フォルダの画像から記録を作り直します（画像は消しません）。"""
+        cfg_ = current_config()
+        try:
+            report = variants_mod.repair_state(cfg_)
+        except variants_mod.VariantError as exc:
+            return _variant_error(exc)
+        return jsonify({"report": report, "variants_state": variants_state(cfg_)})
 
     @app.post("/api/variants/<sticker_id>/<variant_id>/adopt")
     def api_variants_adopt(sticker_id: str, variant_id: str):

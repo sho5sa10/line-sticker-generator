@@ -36,6 +36,7 @@ SCHEMA = 1
 SOURCE_API = "api"          # 画像生成APIで作った
 SOURCE_IMPORT = "import"    # 手持ち画像を取り込んだ
 SOURCE_LEGACY = "legacy"    # variants.json 導入前からある generated/<id>.png
+SOURCE_RECOVERED = "recovered"  # 記録を失ったあと、候補フォルダの画像から復元した
 
 # 人間の判断。Phase 1a では読み取るだけで、変更するAPIは作りません。
 VERDICT_PENDING = "pending"
@@ -1196,3 +1197,144 @@ def list_all(config, sticker_ids, data: dict | None = None) -> dict[str, Sticker
         if sticker is not None:
             out[sid] = sticker
     return out
+
+
+# ---------------------------------------------------------------------------
+# 修復（python -m src.variants repair）
+# ---------------------------------------------------------------------------
+_VARIANT_FILE = "v[0-9][0-9][0-9].png"
+
+
+def repair_state(config) -> dict:
+    """候補の記録を修復します。
+
+    1. variants.json が壊れていれば、消さずに variants.json.corrupt-<日時>-<一意ID> へ退避
+    2. 候補フォルダ（output/variants/<id>/vNNN.png）を調べ、記録に無い画像を候補として戻す
+       - 記録が無いスタンプは作り直し、generated/<id>.png と中身が同じ候補を「採用中」にします
+         （同じものが無ければ generated を legacy 候補として保存して採用中にします）
+       - 記録があるスタンプは、採用状態・判断・評価を変えず、足りない候補だけ追加します
+    画像ファイルは消しも上書きもしません。
+
+    Returns:
+        {"quarantined": 退避先 or None, "stickers": {id: {"added": [...], "adopted": id|None}},
+         "unreadable": [読めなかった画像]}
+    """
+    report: dict = {"quarantined": None, "stickers": {}, "unreadable": []}
+    with state_lock(config):
+        moved = quarantine_corrupt_state(config)
+        report["quarantined"] = str(moved) if moved else None
+
+        def mutate(state):
+            stickers = state.setdefault("stickers", {})
+            root = config.dir_variants
+            folders = sorted(p for p in root.iterdir() if p.is_dir()) if root.exists() else []
+            for folder in folders:
+                sid = folder.name
+                files = []
+                for path in sorted(folder.glob(_VARIANT_FILE)):
+                    if _is_readable_png(path):
+                        files.append(path)
+                    else:
+                        report["unreadable"].append(relative_file(config, path))
+                record = stickers.get(sid)
+                if isinstance(record, dict) and record.get("variants"):
+                    added = _add_missing_variants(config, record, files)
+                    if added:
+                        report["stickers"][sid] = {"added": added, "adopted": record.get("adopted")}
+                    continue
+                if not files:
+                    continue
+                record = _rebuild_record(config, sid, files)
+                stickers[sid] = record
+                report["stickers"][sid] = {
+                    "added": [v["variant_id"] for v in record["variants"]],
+                    "adopted": record.get("adopted"),
+                }
+
+        update(config, mutate)
+    return report
+
+
+def _recovered_item(config, path: Path) -> dict:
+    created = datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds")
+    return {"variant_id": path.stem, "file": relative_file(config, path), "created_at": created,
+            "source": SOURCE_RECOVERED, "verdict": VERDICT_PENDING, "human_rating": None,
+            "note": "修復で候補フォルダから復元"}
+
+
+def _add_missing_variants(config, record: dict, files: list[Path]) -> list[str]:
+    known = {str(v.get("variant_id")) for v in record.get("variants", []) if isinstance(v, dict)}
+    added = []
+    for path in files:
+        if path.stem not in known:
+            record["variants"].append(_recovered_item(config, path))
+            added.append(path.stem)
+    if added:
+        record["variants"].sort(key=lambda v: str(v.get("variant_id", "")) if isinstance(v, dict) else "")
+        highest = max(int(v["variant_id"][1:]) for v in record["variants"]
+                      if isinstance(v, dict) and str(v.get("variant_id", ""))[1:].isdigit())
+        record["next_seq"] = max(int(record.get("next_seq") or 1), highest + 1)
+    return added
+
+
+def _rebuild_record(config, sticker_id: str, files: list[Path]) -> dict:
+    items = [_recovered_item(config, path) for path in files]
+    record = {"adopted": None, "adopted_at": None, "variants": items}
+    generated = config.dir_generated / f"{sticker_id}.png"
+    if generated.exists():
+        gen_sha = sha1_file(generated)
+        match = next((item for item, path in zip(items, files) if sha1_file(path) == gen_sha), None)
+        if match is None:
+            legacy = ensure_legacy_variant(config, sticker_id)
+            kept, _stamp = _materialize_legacy(config, sticker_id, legacy.variants[0])
+            match = kept.to_dict()
+            items.append(match)
+            items.sort(key=lambda v: v["variant_id"])
+        match["verdict"] = VERDICT_ADOPTED
+        record["adopted"] = match["variant_id"]
+        stat = generated.stat()
+        record["adopted_file"] = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns, "sha1": gen_sha}
+    record["next_seq"] = max(int(v["variant_id"][1:]) for v in items) + 1
+    return record
+
+
+def _main(argv: list[str] | None = None) -> int:
+    """python -m src.variants repair [--config 設定ファイル]"""
+    import argparse
+
+    from .config import load_config
+
+    parser = argparse.ArgumentParser(prog="python -m src.variants",
+                                     description="候補の記録（variants.json）の保守")
+    parser.add_argument("--config", help="設定ファイルのパス")
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("repair", help="壊れた記録を退避し、候補フォルダの画像から記録を作り直す")
+    args = parser.parse_args(argv)
+
+    config = load_config(args.config, load_env=False)
+    try:
+        report = repair_state(config)
+    except VariantError as exc:
+        print(f"ERROR:\n  {exc}", file=sys.stderr)
+        return 1
+    if report["quarantined"]:
+        print(f"壊れた記録を退避しました（削除していません）: {report['quarantined']}")
+    else:
+        print("記録は壊れていませんでした（書き換えずに、足りない候補だけ確認しました）。")
+    for sid, info in report["stickers"].items():
+        print(f"  {sid}: 候補を戻しました {', '.join(info['added'])}"
+              f"（採用中: {info['adopted'] or '-'}）")
+    if not report["stickers"]:
+        print("  戻す候補はありませんでした。")
+    for path in report["unreadable"]:
+        print(f"  WARNING: 読めない画像のため戻していません: {path}")
+    print("判断・評価は復元できないため、候補比較の画面で付け直してください。")
+    return 0
+
+
+if __name__ == "__main__":
+    # 「python -m src.variants」で実行したときも、通常の import と同じモジュールの
+    # 関数を使います（鍵の管理などを二重に持たないため）
+    from src.variants import _main as _run
+
+    sys.exit(_run())
