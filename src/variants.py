@@ -992,7 +992,22 @@ def allocate_variant(config, record: dict, sticker_id: str) -> tuple[str, Path]:
 
 
 def register_variant(config, record: dict, variant_id: str, path: Path, *, meta: dict) -> dict:
-    """生成できた候補をメタデータ付きで記録します（PNGが実在する前提で呼びます）。"""
+    """生成できた候補をメタデータ付きで記録します（PNGが実在する前提で呼びます）。
+
+    同じ番号が既に記録にあれば、2件目は加えません（repair が先に取り込んだ場合など）。
+    その候補が同じファイルを指していれば、既存の項目をそのまま使い、無い情報だけを補います
+    （間に付いた判断・評価は上書きしません）。別のファイルを指していれば、矛盾なので例外にします。
+    """
+    file = relative_file(config, path)
+    existing = next((v for v in record.get("variants") or []
+                     if isinstance(v, dict) and v.get("variant_id") == variant_id), None)
+    if existing is not None:
+        if existing.get("file") != file:
+            raise VariantError(f"同じ番号の候補が別のファイルを指しています: {variant_id}"
+                               f"（記録: {existing.get('file')} / 今回: {file}）")
+        for key, value in meta.items():
+            existing.setdefault(key, value)
+        return existing
     item = {
         "variant_id": variant_id,
         "file": relative_file(config, path),
@@ -1366,8 +1381,9 @@ def regen_register_hook(sticker_id: str, token: str):
     """
     def hook(state, record_for_sticker, variant_id):
         _record, run = _regen_run_of(state, sticker_id, token)
-        if run is not None:
-            run.setdefault("done", []).append(variant_id)
+        done = run.setdefault("done", []) if run is not None else None
+        if done is not None and variant_id not in done:     # 同じ番号を二度数えない
+            done.append(variant_id)
     return hook
 
 
@@ -1554,8 +1570,9 @@ def initial_register_hook(sticker_id: str, token: str):
     """generate_variants の on_registered: 候補の登録と同じ保存で initial_run.done に記録します。"""
     def hook(state, record_for_sticker, variant_id):
         _record, run = _initial_run_of(state, sticker_id, token)
-        if run is not None:
-            run.setdefault("done", []).append(variant_id)
+        done = run.setdefault("done", []) if run is not None else None
+        if done is not None and variant_id not in done:     # 同じ番号を二度数えない
+            done.append(variant_id)
     return hook
 
 
@@ -2007,13 +2024,18 @@ def repair_state(config) -> dict:
         def mutate(state):
             stickers = state.setdefault("stickers", {})
             for sid in sticker_ids:
+                record = stickers.get(sid)
+                # 動いている実行（初回生成・再生成）が予約中の番号は、その実行が登録します。
+                # 画像ができてから登録するまでの間に取り込むと、同じ番号が二重に登録されるため加えません
+                active = _live_run_reservations(record)
                 files = []
                 for path in sorted((root / sid).glob(_VARIANT_FILE)):
+                    if path.stem in active:
+                        continue
                     if _is_readable_png(path):
                         files.append(path)
                     else:
                         report["unreadable"].append(relative_file(config, path))
-                record = stickers.get(sid)
                 if isinstance(record, dict) and record.get("variants"):
                     added = _add_missing_variants(config, record, files)
                     if added:
@@ -2079,6 +2101,25 @@ def _rebuild_record(config, sticker_id: str, files: list[Path]) -> dict:
         record["adopted_file"] = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns, "sha1": gen_sha}
     record["next_seq"] = max(int(v["variant_id"][1:]) for v in items) + 1
     return record
+
+
+def _live_run_reservations(record) -> set[str]:
+    """動いている実行（owner が生きている initial_run / regen_run）が予約し、まだ登録していない番号。
+
+    止まった実行（owner が動いていない）の番号は含めません。その画像は repair が取り込み、
+    再開したときに登録済みとして数えます（途中で落ちた実行の画像を失わないため）。
+    """
+    if not isinstance(record, dict):
+        return set()
+    active: set[str] = set()
+    for key in ("initial_run", "regen_run"):
+        run = record.get(key)
+        if not isinstance(run, dict) or not _regen_owner_alive(run.get("owner")):
+            continue
+        done = run.get("done") if isinstance(run.get("done"), list) else []
+        if isinstance(run.get("reserved"), list):
+            active.update(v for v in run["reserved"] if isinstance(v, str) and v not in done)
+    return active
 
 
 _REBUILT_KEYS = ("adopted", "adopted_at", "adopted_file", "variants")   # repair が候補フォルダから作り直す項目
