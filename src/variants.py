@@ -17,8 +17,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import sys
+import threading
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -93,6 +97,9 @@ class StickerVariants:
     next_seq: int = 1
     variants: list[Variant] = field(default_factory=list)
     legacy: bool = False                # variants.json に記録が無く、仮想的に作った
+    # 採用したときの generated/<id>.png と、いまのファイルが食い違っているか
+    # （「AIで作り直す」「画像を入れる」など、採用以外の操作で差し替わった場合に True）
+    generated_mismatch: bool = False
 
     @property
     def variant_count(self) -> int:
@@ -112,6 +119,7 @@ class StickerVariants:
             "next_seq": self.next_seq,
             "legacy": self.legacy,
             "variant_count": self.variant_count,
+            "generated_mismatch": self.generated_mismatch,
             "variants": [v.to_dict() for v in self.variants],
         }
 
@@ -136,35 +144,78 @@ def relative_file(config, path: str | Path) -> str:
 # ---------------------------------------------------------------------------
 # 読み書き
 # ---------------------------------------------------------------------------
+STATE_MISSING = "missing"
+STATE_OK = "ok"
+STATE_CORRUPT = "corrupt"
+
+
+def state_status(config) -> str:
+    """variants.json の状態。"missing" / "ok" / "corrupt"。
+
+    「ファイルが無い」と「壊れている」を区別します。壊れているときに空の状態で
+    上書きすると、採用状態や人の判断がすべて消えてしまうためです。
+    """
+    path = config.variants_path
+    if not path.exists():
+        return STATE_MISSING
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return STATE_CORRUPT
+    if not isinstance(data, dict) or not isinstance(data.get("stickers"), dict):
+        return STATE_CORRUPT
+    return STATE_OK
+
+
+def is_corrupt(config) -> bool:
+    return state_status(config) == STATE_CORRUPT
+
+
+def corrupt_message(config) -> str:
+    return (f"候補の記録が壊れているため保存できません: {config.variants_path}\n"
+            "  中身を直すか、`python -m src.main variants repair` で退避してください"
+            "（退避すると、候補の採用状態・判断・評価は失われます）。")
+
+
+def quarantine_corrupt_state(config) -> Path | None:
+    """壊れた variants.json を variants.json.corrupt-<日時> へ退避します（削除しません）。"""
+    path = config.variants_path
+    if state_status(config) != STATE_CORRUPT:
+        return None
+    dest = path.with_name(f"{path.name}.corrupt-{datetime.now():%Y%m%d_%H%M%S}")
+    path.replace(dest)
+    return dest
+
+
 def load(config) -> dict:
     """variants.json を読みます。
 
     無い場合・壊れている場合は空の状態を返します（例外は投げません）。
     壊れている場合だけ、既存の StateStore と同じ方式で警告を出します。
+    ただし、この状態のまま save() すると記録を失うため、保存側で拒否します。
     """
     path = config.variants_path
-    if not path.exists():
+    status = state_status(config)
+    if status == STATE_MISSING:
         return _empty_state()
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    if status == STATE_CORRUPT:
         print(f"WARNING: 候補の記録を読めないため、generated/ の画像だけを使います: {path}",
               file=sys.stderr)
         return _empty_state()
-    if not isinstance(data, dict) or not isinstance(data.get("stickers"), dict):
-        print(f"WARNING: 候補の記録の形式が不正です。generated/ の画像だけを使います: {path}",
-              file=sys.stderr)
-        return _empty_state()
+    data = json.loads(path.read_text(encoding="utf-8"))
     data.setdefault("schema", SCHEMA)
     data.setdefault("defaults", {})
     return data
 
 
-def save(config, data: dict) -> Path:
+def save(config, data: dict, *, force: bool = False) -> Path:
     """variants.json を原子的に書き換えます（.tmp に書いてから置換）。
 
-    Phase 1a では呼び出し箇所はありません（採用・生成は未実装）。
+    壊れたファイルがある状態では、既存の記録を消さないために拒否します
+    （force=True は、退避したあとの書き込みなど、明示的に上書きしたい場合だけ）。
     """
+    if not force and is_corrupt(config):
+        raise StateCorruptError(corrupt_message(config))
     path = config.variants_path
     out = dict(data)
     out["schema"] = SCHEMA
@@ -180,6 +231,88 @@ def save(config, data: dict) -> Path:
 
 def _empty_state() -> dict:
     return {"schema": SCHEMA, "defaults": {}, "stickers": {}}
+
+
+# ---------------------------------------------------------------------------
+# 排他制御（同時に書き込んでも、あとから来た更新で前の更新が消えないように）
+# ---------------------------------------------------------------------------
+LOCK_TIMEOUT_SEC = 20.0
+LOCK_STALE_SEC = 120.0                # 強制終了などで残ったロックを無効とみなす時間
+_LOCKS: dict[str, threading.RLock] = {}
+_LOCKS_GUARD = threading.Lock()
+
+
+def _thread_lock(key: str) -> threading.RLock:
+    with _LOCKS_GUARD:
+        return _LOCKS.setdefault(key, threading.RLock())
+
+
+@contextmanager
+def file_lock(lock_path: Path, timeout: float = LOCK_TIMEOUT_SEC):
+    """指定のロックファイルで、プロセス内（GUIの複数リクエスト）とプロセス間を排他します。"""
+    lock_path = Path(lock_path)
+    with _thread_lock(str(lock_path)):
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + timeout
+        fd = None
+        while True:
+            try:
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                break
+            except FileExistsError:
+                try:    # 古いロックは、異常終了の置き土産とみなして外します
+                    if time.time() - lock_path.stat().st_mtime > LOCK_STALE_SEC:
+                        lock_path.unlink(missing_ok=True)
+                        continue
+                except OSError:
+                    pass
+                if time.monotonic() > deadline:
+                    raise VariantError(
+                        f"候補の記録が他の処理で使用中です（{lock_path}）。"
+                        "しばらく待ってからやり直してください。") from None
+                time.sleep(0.05)
+        try:
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            fd = None
+            yield
+        finally:
+            if fd is not None:
+                os.close(fd)
+            lock_path.unlink(missing_ok=True)
+
+
+def state_lock(config, timeout: float = LOCK_TIMEOUT_SEC):
+    """variants.json を書き換える間だけ取る鍵。"""
+    return file_lock(Path(str(config.variants_path) + ".lock"), timeout)
+
+
+def adopt_lock(config, sticker_id: str, timeout: float = LOCK_TIMEOUT_SEC):
+    """1スタンプの採用処理の鍵。
+
+    採用は generated/<id>.png と final/<id>.png を書き換えるため、同じスタンプの採用が
+    並行すると「記録は A、画像は B」という食い違いが起きます。状態ファイルの鍵とは別に、
+    スタンプ単位で採用だけを直列化します（別のスタンプの採用や、評価・判断は止めません）。
+    """
+    return file_lock(config.variants_path.with_name(f"variants.adopt-{sticker_id}.lock"), timeout)
+
+
+def update(config, mutate, *, timeout: float = LOCK_TIMEOUT_SEC):
+    """鍵を取り、**最新の記録を読み直してから** 変更を適用して保存します。
+
+    古い状態をメモリに持ったまま保存すると、その間に入った他の更新
+    （評価・判断・採用）が消えてしまうため、必ずこの入口を通します。
+
+    Args:
+        mutate: 最新の state を受け取って書き換える関数。戻り値はそのまま返します。
+    """
+    with state_lock(config, timeout):
+        if is_corrupt(config):
+            raise StateCorruptError(corrupt_message(config))
+        state = load(config)
+        result = mutate(state)
+        save(config, state)
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +367,37 @@ def get_sticker(config, sticker_id: str, data: dict | None = None) -> StickerVar
         next_seq=next_seq,
         variants=variants,
         legacy=False,
+        generated_mismatch=_generated_mismatch(config, sticker_id, record) if adopted else False,
     )
+
+
+def file_stamp(path: str | Path) -> dict | None:
+    """ファイルの目印（サイズ・更新日時・SHA1）。差し替えの検出に使います。"""
+    p = Path(path)
+    try:
+        stat = p.stat()
+    except OSError:
+        return None
+    return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns, "sha1": sha1_file(p)}
+
+
+def _generated_mismatch(config, sticker_id: str, record: dict) -> bool:
+    """採用時に記録した目印と、いまの generated/<id>.png を比べます。
+
+    まずサイズ・更新日時だけを見て、違うときにだけ SHA1 を計算します
+    （毎回すべてのスタンプでハッシュを取ると一覧表示が重くなるため）。
+    """
+    stamp = record.get("adopted_file")
+    if not isinstance(stamp, dict):
+        return False                      # 採用時の記録が無い（古いデータ）ときは判定しません
+    path = config.dir_generated / f"{sticker_id}.png"
+    try:
+        stat = path.stat()
+    except OSError:
+        return True                       # 採用したはずの原画が無い
+    if stat.st_size == stamp.get("size") and stat.st_mtime_ns == stamp.get("mtime_ns"):
+        return False
+    return sha1_file(path) != stamp.get("sha1")
 
 
 def _variant_from_dict(item) -> Variant | None:
@@ -307,16 +470,43 @@ def ensure_record(config, data: dict, sticker_id: str) -> dict:
 
     legacy = ensure_legacy_variant(config, sticker_id)
     if legacy is not None:
+        # 記録に残す時点で、候補置き場へ実体をコピーします。
+        # generated/<id>.png は採用のたびに中身が変わるため、そこを指したままだと
+        # v001 が「いま採用中の画像」の別名になり、元の絵が追えなくなります。
+        items = []
+        for v in legacy.variants:
+            kept = _materialize_legacy(config, sticker_id, v)
+            items.append(kept.to_dict())
         record = {
             "adopted": legacy.adopted,
             "adopted_at": None,
             "next_seq": legacy.next_seq,
-            "variants": [v.to_dict() for v in legacy.variants],
+            "variants": items,
         }
     else:
         record = {"adopted": None, "adopted_at": None, "next_seq": 1, "variants": []}
     stickers[sticker_id] = record
     return record
+
+
+def _materialize_legacy(config, sticker_id: str, variant: Variant) -> Variant:
+    """legacy の候補（generated/<id>.png）を候補置き場へコピーして、そちらを指させます。"""
+    src = variant.path(config)
+    dest = variant_dir(config, sticker_id) / f"{variant.variant_id}.png"
+    if not src.exists() or dest.exists():
+        return variant if not dest.exists() else _with_file(config, variant, dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, dest)
+    return _with_file(config, variant, dest)
+
+
+def _with_file(config, variant: Variant, path: Path) -> Variant:
+    return Variant(
+        variant_id=variant.variant_id, file=relative_file(config, path),
+        source=variant.source, verdict=variant.verdict, created_at=variant.created_at,
+        human_rating=variant.human_rating, note=variant.note, flags=list(variant.flags),
+        extra=dict(variant.extra),
+    )
 
 
 def allocate_variant(config, record: dict, sticker_id: str) -> tuple[str, Path]:
@@ -392,21 +582,19 @@ def generate_variants(config, entries, count: int, generator, *, data: dict | No
         1件ごとの結果 [{"id","variant_id","status","path","detail"}]。
         status は generated | dry-run | error。
     """
-    state = load(config) if data is None else data
     results: list[dict] = []
     for entry in entries:
-        try:
-            _generate_for_entry(config, state, entry, count, generator, results, on_event)
-        finally:
-            # 途中で例外が出ても、そこまでの記録（と消費した番号）は残します
-            if not getattr(generator, "dry_run", False):
-                save(config, state)
+        _generate_for_entry(config, entry, count, generator, results, on_event, data)
     return results
 
 
-def _generate_for_entry(config, state: dict, entry, count: int, generator,
-                        results: list[dict], on_event) -> None:
-    record = ensure_record(config, state, entry.id)
+def _generate_for_entry(config, entry, count: int, generator, results: list[dict],
+                        on_event, data: dict | None) -> None:
+    """1スタンプ分。番号の確保と記録は、そのつど最新の状態に対して行います。
+
+    生成には時間がかかるため、その間ずっと古い状態を持たないようにしています
+    （持ったまま保存すると、途中で入った評価・判断・採用が消えます）。
+    """
     prompt = generator.prompt_for(entry)
     for _ in range(max(int(count), 1)):
         if getattr(generator, "dry_run", False):
@@ -416,12 +604,28 @@ def _generate_for_entry(config, state: dict, entry, count: int, generator,
                 on_event(entry.id, None, "dry-run", "")
             continue
 
-        variant_id, path = allocate_variant(config, record, entry.id)
+        def reserve(state):     # noqa: B023 - ループごとに即時実行します
+            record = ensure_record(config, state, entry.id)
+            return allocate_variant(config, record, entry.id)
+
+        if data is not None:
+            variant_id, path = reserve(data)
+        else:
+            variant_id, path = update(config, reserve)      # 番号は先に確定・保存
+
         result = generator.generate_one(entry, output_path=path)
         if result.status == "generated" and path.exists():
+            meta = generation_meta(config, generator, prompt, entry.id)
+
+            def register(state):    # noqa: B023 - 直後に実行します
+                record = ensure_record(config, state, entry.id)
+                register_variant(config, record, variant_id, path, meta=meta)
+
             # PNG が出来てから記録します（記録だけ残る状態を作らない）
-            register_variant(config, record, variant_id, path,
-                             meta=generation_meta(config, generator, prompt, entry.id))
+            if data is not None:
+                register(data)
+            else:
+                update(config, register)
             results.append({"id": entry.id, "variant_id": variant_id, "status": "generated",
                             "path": path, "detail": ""})
         else:
@@ -437,6 +641,10 @@ def _generate_for_entry(config, state: dict, entry, count: int, generator,
 # ---------------------------------------------------------------------------
 class VariantError(Exception):
     """候補の操作ができない場合に送出されます（状態ファイルは更新されません）。"""
+
+
+class StateCorruptError(VariantError):
+    """variants.json が壊れていて、上書きすると記録を失う場合に送出されます。"""
 
 
 class AdoptError(VariantError):
@@ -469,11 +677,14 @@ def set_verdict(config, sticker_id: str, variant_id: str, verdict: str,
             f"（指定できるのは {', '.join(SETTABLE_VERDICTS)}。"
             "採用は variants adopt を使ってください）"
         )
-    state = load(config) if data is None else data
-    _record, item = _find_item(config, state, sticker_id, variant_id)
-    item["verdict"] = verdict
-    save(config, state)
-    return item
+    def mutate(state):
+        _record, item = _find_item(config, state, sticker_id, variant_id)
+        item["verdict"] = verdict
+        return item
+
+    if data is not None:            # 呼び出し側が状態を持っている場合はその場で変更
+        return mutate(data)
+    return update(config, mutate)
 
 
 def set_rating(config, sticker_id: str, variant_id: str, rating: int | None,
@@ -487,11 +698,33 @@ def set_rating(config, sticker_id: str, variant_id: str, rating: int | None,
             raise VariantError(f"評価は整数で指定してください: {rating}")
         if not RATING_MIN <= rating <= RATING_MAX:
             raise VariantError(f"評価は{RATING_MIN}〜{RATING_MAX}で指定してください: {rating}")
-    state = load(config) if data is None else data
-    _record, item = _find_item(config, state, sticker_id, variant_id)
-    item["human_rating"] = rating
-    save(config, state)
-    return item
+    def mutate(state):
+        _record, item = _find_item(config, state, sticker_id, variant_id)
+        item["human_rating"] = rating
+        return item
+
+    if data is not None:
+        return mutate(data)
+    return update(config, mutate)
+
+
+def _rollback_adoption(config, entry, style, dest: Path, archived, final_path: Path,
+                       had_final: bool) -> None:
+    """採用に失敗したとき、原画と完成画像を元の状態に戻します（できる範囲で）。"""
+    from . import pipeline
+
+    try:
+        if archived is not None and Path(archived).exists():
+            Path(archived).replace(dest)         # 退避した原画を戻す
+        else:
+            dest.unlink(missing_ok=True)         # 元々無かったので作りかけを消す
+        if dest.exists():
+            pipeline.render_final(config, entry, style)     # 完成画像も元の原画から作り直す
+        elif not had_final:
+            final_path.unlink(missing_ok=True)
+    except Exception as exc:  # noqa: BLE001 - 巻き戻しの失敗で元の原因を隠さない
+        print(f"WARNING: 採用の巻き戻しに失敗しました: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
 
 
 def adopt(config, entry, variant_id: str, *, style=None, data: dict | None = None) -> dict:
@@ -505,6 +738,20 @@ def adopt(config, entry, variant_id: str, *, style=None, data: dict | None = Non
     途中で失敗した場合、variants.json は更新しません（adopted は前のまま）。
     候補ファイル（variants/ 側）は移動も削除もしません。
     """
+    from . import image_processor as ip
+    from . import pipeline
+    from . import validator as vd
+    from .importer import archive_existing
+    from .text_renderer import TextStyle
+
+    if is_corrupt(config):          # 壊れた記録を上書きしないよう、何より先に止めます
+        raise StateCorruptError(corrupt_message(config))
+
+    with adopt_lock(config, entry.id):      # 同じスタンプの採用どうしだけを直列化します
+        return _adopt_locked(config, entry, variant_id, style=style, data=data)
+
+
+def _adopt_locked(config, entry, variant_id: str, *, style=None, data=None) -> dict:
     from . import image_processor as ip
     from . import pipeline
     from . import validator as vd
@@ -529,31 +776,53 @@ def adopt(config, entry, variant_id: str, *, style=None, data: dict | None = Non
         raise AdoptError(f"候補の画像を読めません: {src} ({type(exc).__name__}: {exc})") from exc
 
     dest = config.dir_generated / f"{entry.id}.png"
+    final_path = config.dir_final / f"{entry.id}.png"
+    had_final = final_path.exists()
     archived = None
-    # legacy の候補（generated/<id>.png 自身）を採用する場合は、退避もコピーも不要です。
-    if src.resolve() != dest.resolve():
-        archived = archive_existing(config, entry.id)      # 既存の退避処理を再利用
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(src, dest)
-
-    # ここから先は既存の正式な経路をそのまま使います（final を直接コピーしない）
     style = style or TextStyle.from_config(config)
-    final_path, size_bytes, warnings = pipeline.render_final(config, entry, style)
-    report = vd.validate_sticker(final_path, config)
-    if not report.ok:
-        raise AdoptError(
-            "採用した画像がLINE仕様を満たしませんでした（採用状態は変更していません）:\n  "
-            + "\n  ".join(i.message for i in report.errors)
-        )
 
-    # すべて成功してから記録を更新します
-    record = ensure_record(config, state, entry.id)
-    for item in record.get("variants", []):
-        if isinstance(item, dict) and item.get("variant_id") == variant_id:
-            item["verdict"] = VERDICT_ADOPTED       # 採用した候補だけ変えます
-    record["adopted"] = variant_id                  # ほかの候補の verdict は触りません
-    record["adopted_at"] = datetime.now().isoformat(timespec="seconds")
-    save(config, state)
+    # legacy の候補（generated/<id>.png 自身）を採用する場合は、退避もコピーも不要です。
+    same_file = src.resolve() == dest.resolve()
+    try:
+        if not same_file:
+            archived = archive_existing(config, entry.id)      # 既存の退避処理を再利用
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, dest)
+
+        # ここから先は既存の正式な経路をそのまま使います（final を直接コピーしない）
+        final_path, size_bytes, warnings = pipeline.render_final(config, entry, style)
+        report = vd.validate_sticker(final_path, config)
+        if not report.ok:
+            raise AdoptError(
+                "採用した画像がLINE仕様を満たしませんでした（採用状態は変更していません）:\n  "
+                + "\n  ".join(i.message for i in report.errors)
+            )
+    except Exception:
+        # 失敗したら、触ったファイルを元に戻します（記録と画像が食い違わないように）
+        if not same_file:
+            _rollback_adoption(config, entry, style, dest, archived, final_path, had_final)
+        raise
+
+    stamp = file_stamp(dest)
+
+    def apply(state_now):
+        record = ensure_record(config, state_now, entry.id)
+        if not any(isinstance(v, dict) and v.get("variant_id") == variant_id
+                   for v in record.get("variants", [])):
+            raise AdoptError(f"候補が見つかりません: {entry.id}/{variant_id}")
+        for item in record.get("variants", []):
+            if isinstance(item, dict) and item.get("variant_id") == variant_id:
+                item["verdict"] = VERDICT_ADOPTED       # 採用した候補だけ変えます
+        record["adopted"] = variant_id                  # ほかの候補の verdict は触りません
+        record["adopted_at"] = datetime.now().isoformat(timespec="seconds")
+        record["adopted_file"] = stamp                  # 別処理での差し替えを検出するため
+
+    # 画像の処理が終わってから、最新の記録を読み直して採用状態だけを更新します
+    if data is not None:
+        apply(data)
+        save(config, data)
+    else:
+        update(config, apply)
 
     return {
         "sticker_id": entry.id,

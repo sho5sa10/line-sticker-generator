@@ -268,18 +268,25 @@ def test_corrupt_png_is_reported_without_changing_state(tmp_config):
     assert "derived_scores" not in _item(tmp_config)
 
 
-def test_broken_state_file_falls_back_to_legacy(tmp_config):
+def test_broken_state_file_is_not_overwritten_by_scoring(tmp_config):
+    """Phase 5b(C2) で変更: 壊れた記録の上にスコアを書くと、それまでの記録を失うため断ります。"""
     ip.save_png(make_character((512, 512)), tmp_config.dir_generated / "001.png")
     tmp_config.variants_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_config.variants_path.write_text("{壊れている", encoding="utf-8")
+    broken = tmp_config.variants_path.read_text(encoding="utf-8")
 
-    results = scoring.score_all(tmp_config, ["001"])  # 落ちない
+    with pytest.raises(vr.StateCorruptError, match="壊れて"):
+        scoring.score_all(tmp_config, ["001"])
+
+    assert tmp_config.variants_path.read_text(encoding="utf-8") == broken
+
+    # 退避すれば、legacy の候補（generated/001.png）を評価できる
+    vr.quarantine_corrupt_state(tmp_config)
+    results = scoring.score_all(tmp_config, ["001"])
     assert [r["status"] for r in results] == ["scored"]
-    # legacy の候補（generated/001.png）を評価し、記録が作られる
     record = _state(tmp_config)["stickers"]["001"]
     assert record["variants"][0]["source"] == "legacy"
     assert record["variants"][0]["derived_scores"]["formula"] == "v1"
-    assert not (tmp_config.dir_variants / "001" / "v001.png").exists()   # コピーしない
 
 
 def test_sticker_without_candidates_is_skipped(tmp_config):

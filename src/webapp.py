@@ -17,6 +17,7 @@ import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from flask import Flask, jsonify, request, send_file, send_from_directory
 from PIL import Image
@@ -166,6 +167,41 @@ def create_app(config=None) -> Flask:
     def server_outdated() -> bool:
         return code_fingerprint() > started_code + 0.001
 
+    # ------------------------------------------------------------------
+    # ローカルGUI以外からの書き換えを拒否します（CSRF対策）
+    #
+    # 127.0.0.1 にしか公開していなくても、ブラウザで悪意あるページを開くと、
+    # そのページから同じPCの http://127.0.0.1:8765 へ POST を送れてしまいます。
+    # 採用・生成・退避などは取り消しが難しく、画像生成は課金も発生するため、
+    # 「別サイトから送られた書き換え」を入口で止めます。読み取り(GET)は制限しません。
+    # ------------------------------------------------------------------
+    LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+    def _local(hostname: str | None) -> bool:
+        return bool(hostname) and hostname.strip("[]") in LOCAL_HOSTS
+
+    @app.before_request
+    def block_cross_site_writes():
+        if request.method in ("GET", "HEAD", "OPTIONS"):
+            return None
+        if not _local((request.host or "").rsplit(":", 1)[0]):
+            return jsonify({"error": "このアドレスからは操作できません"}), 403
+        origin = request.headers.get("Origin")
+        if origin and not _local(urlsplit(origin).hostname):
+            return jsonify({"error": "別のサイトからの操作は受け付けません"}), 403
+        # ブラウザが付ける印。別サイトからの送信は cross-site になります
+        site = request.headers.get("Sec-Fetch-Site")
+        if site and site not in ("same-origin", "none"):
+            return jsonify({"error": "別のサイトからの操作は受け付けません"}), 403
+        # フォームや text/plain は、確認なしで別サイトから送れる形式なので、
+        # GUI が付ける印（X-Sticker-Client）が無ければ拒否します。
+        ctype = (request.content_type or "").split(";")[0].strip().lower()
+        if (ctype not in ("", "application/json")
+                and request.headers.get("X-Sticker-Client") != "1"
+                and (origin is not None or site is not None)):
+            return jsonify({"error": "別のサイトからの操作は受け付けません"}), 403
+        return None
+
     @app.after_request
     def no_stale_assets(response):
         """画面（HTML/CSS/JS）は毎回サーバーに確認させ、古いものが使われないようにします。"""
@@ -252,6 +288,8 @@ def create_app(config=None) -> Flask:
             row["adopted"] = sv.adopted if sv else None
             # flags は保存済みの値だけを見ます（ここでは計算しません）
             row["flags"] = sorted({f for v in (sv.variants if sv else []) for f in v.flags})
+            # 採用した画像が、採用以外の操作で差し替わっていないか
+            row["generated_mismatch"] = bool(sv and sv.generated_mismatch)
             out.append(row)
         return out
 
@@ -871,6 +909,11 @@ def create_app(config=None) -> Flask:
             return None, (jsonify({"error": f"IDが見つかりません: {sticker_id}"}), 404)
         return entry, None
 
+    def _variant_error(exc) -> tuple:
+        """候補の操作エラーをAPIの形にします（記録が壊れている場合は 409）。"""
+        status = 409 if isinstance(exc, variants_mod.StateCorruptError) else 400
+        return jsonify({"error": str(exc)}), status
+
     @app.post("/api/variants/<sticker_id>/<variant_id>/adopt")
     def api_variants_adopt(sticker_id: str, variant_id: str):
         """候補を採用します（退避・合成・検証は既存の variants.adopt に任せます）。"""
@@ -884,8 +927,8 @@ def create_app(config=None) -> Flask:
             return jsonify({"error": str(exc)}), 400
         try:
             result = variants_mod.adopt(cfg_, entry, variant_id, style=style)
-        except variants_mod.AdoptError as exc:
-            return jsonify({"error": str(exc)}), 400
+        except variants_mod.VariantError as exc:
+            return _variant_error(exc)
         sticker = variants_mod.get_sticker(cfg_, sticker_id)
         return jsonify({
             "sticker": sticker.to_dict() if sticker else None,
@@ -903,7 +946,7 @@ def create_app(config=None) -> Flask:
         try:
             variants_mod.set_verdict(cfg_, sticker_id, variant_id, str(body.get("verdict", "")))
         except variants_mod.VariantError as exc:
-            return jsonify({"error": str(exc)}), 400
+            return _variant_error(exc)
         return jsonify({"sticker": variants_mod.get_sticker(cfg_, sticker_id).to_dict()})
 
     @app.post("/api/variants/<sticker_id>/<variant_id>/score")
@@ -914,8 +957,8 @@ def create_app(config=None) -> Flask:
         cfg_ = current_config()
         try:
             scoring.score_variant(cfg_, sticker_id, variant_id)
-        except scoring.ScoringError as exc:
-            return jsonify({"error": str(exc)}), 400
+        except (scoring.ScoringError, variants_mod.VariantError) as exc:
+            return _variant_error(exc)
         return jsonify({"sticker": variants_mod.get_sticker(cfg_, sticker_id).to_dict(),
                         "formula": scoring.SCORING_FORMULA})
 
@@ -933,7 +976,7 @@ def create_app(config=None) -> Flask:
         try:
             variants_mod.set_rating(cfg_, sticker_id, variant_id, rating)
         except variants_mod.VariantError as exc:
-            return jsonify({"error": str(exc)}), 400
+            return _variant_error(exc)
         return jsonify({"sticker": variants_mod.get_sticker(cfg_, sticker_id).to_dict()})
 
     @app.post("/api/stickers")

@@ -35,9 +35,12 @@ function toast(message, bad = false) {
   el._timer = setTimeout(() => el.classList.remove('show'), 3200);
 }
 
+/** GUI からの操作であることを示す印。別サイトからの書き換えをサーバー側で弾くために付けます。 */
+const CLIENT_HEADER = { 'X-Sticker-Client': '1' };
+
 async function api(path, options = {}) {
   const res = await fetch(path, {
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'X-Sticker-Client': '1' },
     ...options,
     body: options.body ? JSON.stringify(options.body) : undefined,
   });
@@ -609,7 +612,8 @@ $('#btn-master-upload').addEventListener('click', async () => {
   const form = new FormData();
   form.append('file', file);
   try {
-    const res = await fetch('/api/master/upload', { method: 'POST', body: form });
+    const res = await fetch('/api/master/upload',
+                            { method: 'POST', body: form, headers: CLIENT_HEADER });
     const d = await res.json();
     if (!res.ok) throw new Error(d.error || 'アップロードに失敗しました');
     toast(d.backup
@@ -927,10 +931,15 @@ function cellHtml(s) {
   // flags は保存済みの値があるときだけ表示します（ここでは計算しません）
   const vflag = (s.flags || []).length
     ? `<span class="tag vflag" title="${escapeHtml(s.flags.join(' / '))}">⚠</span>` : '';
+  // 採用した候補と、いま使われている原画が食い違っている（作り直し・取り込みで差し替わった）
+  const mismatch = s.generated_mismatch
+    ? '<span class="tag mismatch" title="いまの原画は、採用した候補と違います。'
+      + '正しい候補をもう一度採用してください">⚠原画</span>' : '';
   return `
-    <div class="cell ${sel ? 'selected' : ''} ${s.sale ? `sale-${s.sale}` : ''}" data-id="${s.id}">
+    <div class="cell ${sel ? 'selected' : ''} ${s.sale ? `sale-${s.sale}` : ''}
+         ${s.generated_mismatch ? 'mismatch' : ''}" data-id="${s.id}">
       <input class="pick" type="checkbox" ${sel ? 'checked' : ''} aria-label="選択">
-      ${sale}${variants}${vflag}${tag}
+      ${sale}${variants}${vflag}${mismatch}${tag}
       <div class="thumb" data-zoom="${s.id}">${thumb}</div>
       <div class="cid">${s.id}${s.size_kb ? ` · ${s.size_kb}KB` : ''}</div>
       <div class="ctext">${escapeHtml(s.text)}</div>
@@ -1161,7 +1170,8 @@ $('#cell-file').addEventListener('change', async (e) => {
   const form = new FormData();
   form.append('file', file);
   try {
-    const res = await fetch(`/api/stickers/${encodeURIComponent(id)}/upload`, { method: 'POST', body: form });
+    const res = await fetch(`/api/stickers/${encodeURIComponent(id)}/upload`,
+                            { method: 'POST', body: form, headers: CLIENT_HEADER });
     const d = await res.json();
     if (!res.ok) throw new Error(d.error || d.message || '取り込みに失敗しました');
     const extra = d.issues && d.issues.length ? `（注意: ${d.issues[0]}）` : '';
@@ -1201,7 +1211,8 @@ $('#bulk-file').addEventListener('change', async (e) => {
     const form = new FormData();
     files.slice(i, i + CHUNK).forEach((f) => form.append('files', f));
     try {
-      const res = await fetch('/api/stickers/import', { method: 'POST', body: form });
+      const res = await fetch('/api/stickers/import',
+                              { method: 'POST', body: form, headers: CLIENT_HEADER });
       const d = await res.json();
       if (!res.ok) throw new Error(d.error || '取り込みに失敗しました');
       d.results.forEach((r) => {
@@ -1578,7 +1589,7 @@ async function refreshPreview() {
   try {
     const res = await fetch('/api/preview-text', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Sticker-Client': '1' },
       body: JSON.stringify(body),
     });
     if (!res.ok) {
@@ -2139,9 +2150,11 @@ refreshLlmStatus();
 /* 候補の比較・採用（Phase 2）                                          */
 /* ------------------------------------------------------------------ */
 /** いま比較している状態。スコアの計算はここでは一切しません。 */
-const vstate = { ids: [], index: 0, sticker: null, picked: 0, open: false, all: {} };
+const vstate = { ids: [], index: 0, sticker: null, picked: 0, open: false, all: {}, busy: false };
 
-const VERDICT_LABEL = { pending: '未評価', adopted: '採用中', rejected: '除外', regen: '再生成したい' };
+// verdict は「人がその候補に付けた判断」です。いま採用中かどうかは sticker.adopted が正なので、
+// 過去に採用したことがある候補は「過去に採用」と表示して、CURRENT と混同しないようにします。
+const VERDICT_LABEL = { pending: '未評価', adopted: '過去に採用', rejected: '除外', regen: '再生成したい' };
 
 function variantImageUrl(v, sticker_id) {
   // legacy の候補は generated/ を指しています（コピーしていないため）
@@ -2194,6 +2207,7 @@ async function loadVariantSticker() {
   vstate.picked = pickedIdx >= 0 ? pickedIdx : 0;
   renderVariantCards();
   renderVariantStats();
+  renderGeneratedMismatch();
 }
 
 /** 機械評価の説明（画面に出す短い日本語）。scoring.py の flags と1対1で対応します。 */
@@ -2242,6 +2256,7 @@ function variantScoreHtml(v) {
 function renderVariantCards() {
   const id = vstate.sticker.sticker_id;
   const adopted = vstate.sticker.adopted;
+  const mismatch = !!vstate.sticker.generated_mismatch;   // 原画が差し替わっている
   $('#v-cards').innerHTML = vstate.sticker.variants.map((v, i) => {
     const isCurrent = v.variant_id === adopted;
     const url = variantImageUrl(v, id);
@@ -2272,14 +2287,26 @@ function renderVariantCards() {
         </div>
         ${scoreBlock}
         <div class="vbtns">
-          <button class="btn primary" data-vact="adopt" ${isCurrent ? 'disabled' : ''}>
-            ${isCurrent ? '採用済' : '採用'}</button>
+          <button class="btn primary" data-vact="adopt"
+                  ${isCurrent && !mismatch ? 'disabled' : ''}>
+            ${isCurrent ? (mismatch ? '採用し直す' : '採用済') : '採用'}</button>
           <button class="btn" data-vact="rejected">除外</button>
           <button class="btn" data-vact="regen">再生成</button>
           <button class="btn ghost" data-vact="pending">保留</button>
         </div>
       </div>`;
   }).join('') || '<p class="hint">候補がありません。</p>';
+}
+
+/** 採用した画像が、採用以外の操作（作り直し・取り込み）で差し替わっていたら知らせます。 */
+function renderGeneratedMismatch() {
+  const warn = vstate.sticker && vstate.sticker.generated_mismatch;
+  const el = $('#v-mismatch');
+  el.hidden = !warn;
+  el.textContent = warn
+    ? '⚠ いま使われている原画は、この採用候補と違います（作り直しや取り込みで差し替わっています）。'
+      + '正しい候補をもう一度「採用」してください。'
+    : '';
 }
 
 function renderVariantStats() {
@@ -2303,6 +2330,7 @@ function currentVariant() {
 }
 
 async function moveSticker(step) {
+  if (vstate.busy) return;
   const next = vstate.index + step;
   if (next < 0 || next >= vstate.ids.length) return;
   vstate.index = next;
@@ -2315,11 +2343,13 @@ async function adoptCurrent({ advance = false } = {}) {
   const v = currentVariant();
   if (!v) return false;
   const id = vstate.sticker.sticker_id;
-  if (vstate.sticker.adopted === v.variant_id) {
+  // 原画が別の操作で差し替わっているときは、同じ候補でも採用し直して直せるようにします
+  if (vstate.sticker.adopted === v.variant_id && !vstate.sticker.generated_mismatch) {
     vmsg(`${v.variant_id} はすでに採用中です`);
     if (advance) await moveSticker(1);
     return true;
   }
+  vstate.busy = true;                       // 採用中は他の操作を受け付けません
   vmsg(`${v.variant_id} を採用処理中…`, 'busy');
   $$('#v-cards [data-vact]').forEach((b) => { b.disabled = true; });
   try {
@@ -2331,6 +2361,7 @@ async function adoptCurrent({ advance = false } = {}) {
     if (state.info) { state.info.validation = d.validation; state.info.packages_status = d.packages_status; }
     renderVariantCards();
     renderVariantStats();
+    renderGeneratedMismatch();
     vmsg(`✓ ${v.variant_id} を採用しました`, 'ok');
     d.warnings.forEach((w) => toast(w, true));
     if (advance) await moveSticker(1);
@@ -2339,11 +2370,14 @@ async function adoptCurrent({ advance = false } = {}) {
     vmsg(`✕ 採用に失敗しました：${e.message}`, 'bad');
     renderVariantCards();          // 一覧は壊さず、そのまま比較を続けられます
     return false;
+  } finally {
+    vstate.busy = false;
   }
 }
 
 /** 候補1件の再評価。計算はサーバー側の scoring.py だけが行います。 */
 async function rescoreCurrent() {
+  if (vstate.busy) return;
   const v = currentVariant();
   if (!v) return;
   vmsg(`${v.variant_id} を評価中…`, 'busy');
@@ -2358,6 +2392,7 @@ async function rescoreCurrent() {
 }
 
 async function setVerdict(verdict) {
+  if (vstate.busy) return;
   const v = currentVariant();
   if (!v) return;
   try {
@@ -2372,6 +2407,7 @@ async function setVerdict(verdict) {
 }
 
 async function setRating(rating) {
+  if (vstate.busy) return;
   const v = currentVariant();
   if (!v) return;
   try {
@@ -2393,6 +2429,7 @@ $('#variant-modal').addEventListener('click', (e) => {
 });
 
 $('#v-cards').addEventListener('click', (e) => {
+  if (vstate.busy) return;                  // 採用処理中は操作を受け付けません
   const card = e.target.closest('.vcard');
   if (!card) return;
   const idx = Number(card.dataset.idx);
@@ -2413,6 +2450,7 @@ $('#v-cards').addEventListener('click', (e) => {
 
 document.addEventListener('keydown', (e) => {
   if (!vstate.open) return;
+  if (vstate.busy && e.key !== 'Escape') { e.preventDefault(); return; }
   const el = e.target;
   if (el instanceof Element && el.matches('input, textarea, select')) return;
   const key = e.key;

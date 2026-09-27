@@ -169,10 +169,12 @@ def test_adopt_from_legacy_only_environment(tmp_config):
 
     record = _state(tmp_config)["stickers"]["001"]
     assert record["adopted"] == "v002"
-    # 14) legacy の画像を variants/ へコピーしない
-    assert not (tmp_config.dir_variants / "001" / "v001.png").exists()
+    # Phase 5b(C1) で変更: 記録に残す時点で候補置き場へ実体をコピーします。
+    # generated/001.png は採用のたびに中身が変わるため、そこを指したままだと
+    # v001 が「いま採用中の画像」の別名になり、元の絵を失います。
     assert record["variants"][0]["source"] == "legacy"
-    assert record["variants"][0]["file"] == "output/generated/001.png"
+    assert record["variants"][0]["file"] == "output/variants/001/v001.png"
+    assert _sha1(tmp_config.dir_variants / "001" / "v001.png") == legacy_sha
     # 旧原画は退避されている（中身は legacy のもの）
     from src.importer import archive_dir
     assert _sha1(list(archive_dir(tmp_config).glob("001_*.png"))[0]) == legacy_sha
@@ -253,15 +255,24 @@ def test_validation_failure_does_not_mark_as_adopted(tmp_config, monkeypatch):
 
 
 def test_broken_state_file_does_not_crash_adopt(tmp_config):
-    """variants.json が壊れていても落ちない（legacy として扱い、候補が無ければエラー）。"""
+    """variants.json が壊れていても落ちないこと。
+
+    Phase 5b(C2) で変更: 壊れた記録の上に採用状態を書くと、それまでの候補・判断・評価を
+    失うため、採用そのものを断ります（読み取りは今までどおり legacy として続けられます）。
+    """
     ip.save_png(make_character((512, 512)), tmp_config.dir_generated / "001.png")
     tmp_config.variants_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_config.variants_path.write_text("{壊れている", encoding="utf-8")
+    broken = tmp_config.variants_path.read_text(encoding="utf-8")
 
-    with pytest.raises(vr.AdoptError, match="候補が見つかりません"):
-        vr.adopt(tmp_config, _entry(), "v002")
+    with pytest.raises(vr.StateCorruptError, match="壊れて"):
+        vr.adopt(tmp_config, _entry(), "v001")
 
-    # legacy の v001 なら採用できる
+    assert tmp_config.variants_path.read_text(encoding="utf-8") == broken   # 壊れた記録は残す
+    assert vr.get_sticker(tmp_config, "001").adopted == "v001"              # 読み取りは動く
+
+    # 退避すれば、これまでどおり採用できる
+    vr.quarantine_corrupt_state(tmp_config)
     assert vr.adopt(tmp_config, _entry(), "v001")["validation_ok"] is True
 
 

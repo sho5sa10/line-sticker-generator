@@ -197,9 +197,11 @@ def test_legacy_image_and_new_variants_coexist(tmp_config):
     assert [(v.variant_id, v.source) for v in sticker.variants] == [
         ("v001", "legacy"), ("v002", "api"), ("v003", "api")]
     assert sticker.adopted == "v001"                     # 採用状態は変わらない
-    assert sticker.variants[0].file == "output/generated/001.png"
-    assert not (tmp_config.dir_variants / "001" / "v001.png").exists()   # コピーしない
-    assert _sha1(raw) == before
+    # Phase 5b(C1) で変更: 記録に残す時点で候補置き場へ実体をコピーし、そちらを指します。
+    # （generated/001.png は採用のたびに中身が変わるため、元の絵を残せなくなるのを防ぐ）
+    assert sticker.variants[0].file == "output/variants/001/v001.png"
+    assert _sha1(tmp_config.dir_variants / "001" / "v001.png") == before
+    assert _sha1(raw) == before                          # 採用中の原画は動かさない
 
 
 def test_adopted_is_not_changed_by_generating(tmp_config):

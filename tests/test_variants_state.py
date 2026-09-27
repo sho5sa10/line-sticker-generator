@@ -226,16 +226,22 @@ def test_state_file_stays_valid_json_after_updates(tmp_config):
 
 
 # --- legacy 候補への操作 ---------------------------------------------------
-def test_verdict_on_legacy_variant_materializes_record_without_copying(tmp_config):
+def test_verdict_on_legacy_variant_materializes_record(tmp_config):
+    """Phase 5b(C1) で変更: 記録に残す時点で、候補置き場へ実体をコピーします。"""
+    import hashlib
+
     ip.save_png(make_character((512, 512)), tmp_config.dir_generated / "001.png")
+    original = hashlib.sha1((tmp_config.dir_generated / "001.png").read_bytes()).hexdigest()
     vr.set_rating(tmp_config, "001", "v001", 5)
 
     record = _state(tmp_config)["stickers"]["001"]
     assert record["adopted"] == "v001"
     assert record["variants"][0]["source"] == "legacy"
-    assert record["variants"][0]["file"] == "output/generated/001.png"
+    assert record["variants"][0]["file"] == "output/variants/001/v001.png"
     assert record["variants"][0]["human_rating"] == 5
-    assert not (tmp_config.dir_variants / "001" / "v001.png").exists()   # コピーしない
+    copied = tmp_config.dir_variants / "001" / "v001.png"
+    assert hashlib.sha1(copied.read_bytes()).hexdigest() == original      # 中身は同じ
+    assert (tmp_config.dir_generated / "001.png").exists()                # 元は動かさない
 
 
 class _Args:

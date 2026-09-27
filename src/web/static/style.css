@@ -814,3 +814,12 @@ main { padding: 16px; max-width: 1500px; margin: 0 auto; }
 .vok { color: var(--ok); }
 .vnone { display: flex; align-items: center; gap: 8px; color: var(--muted); }
 .vcard.has-gate { border-color: color-mix(in srgb, var(--danger) 55%, var(--line)); }
+
+/* 採用した画像が別の操作で差し替わっているときの警告 */
+.vmismatch {
+  margin: 0 16px; padding: 8px 12px; border-radius: 8px; font-size: 13px; font-weight: 700;
+  color: var(--fg); background: color-mix(in srgb, var(--warn) 16%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--warn) 50%, var(--line));
+}
+.cell.mismatch { border-color: color-mix(in srgb, var(--warn) 60%, var(--line)); }
+.tag.mismatch { left: 34px; right: auto; color: var(--warn); }
