@@ -1142,10 +1142,35 @@ def _regen_owner() -> dict:
             "token": uuid.uuid4().hex}
 
 
+# このプロセスで終わった実行（再生成・初回生成）の token。締めの保存に失敗すると、記録には
+# このプロセスの owner が残ります。プロセスは動き続けるので、pid だけで判断すると「実行中」の
+# ままになり、再起動するまで続きから再開できません。ここにある token の owner は止まったとみなします。
+# 実行ごとに別の token（uuid4）なので、同じプロセスで実行中の別の実行には影響しません。
+_ENDED_RUN_TOKENS: set[str] = set()
+_ENDED_RUN_LOCK = threading.Lock()
+
+
+def _mark_run_ended(token: str) -> None:
+    """実行が候補を作り終えた（成功・失敗・中止のどれでも）。締めの前に呼びます。"""
+    with _ENDED_RUN_LOCK:
+        _ENDED_RUN_TOKENS.add(token)
+
+
+def _forget_ended_run(token: str) -> None:
+    """締めを保存できた（owner は消えたか外れた）ので、もう覚えておく必要はありません。"""
+    with _ENDED_RUN_LOCK:
+        _ENDED_RUN_TOKENS.discard(token)
+
+
 def _regen_owner_alive(owner) -> bool:
     """再生成を実行中の処理が、まだ動いているか（落ちていれば、途中で止まった実行として続きから）。"""
     if not isinstance(owner, dict) or not isinstance(owner.get("pid"), int):
         return False
+    token = owner.get("token")
+    if isinstance(token, str):
+        with _ENDED_RUN_LOCK:
+            if token in _ENDED_RUN_TOKENS:
+                return False               # このプロセスで終わった実行（締めを保存できなかった）
     if owner.get("host") not in (None, _this_host()):
         return True                        # 別のPCの処理は確かめられないので、動いているとみなす
     alive, started = _process_start(owner["pid"])
@@ -1368,7 +1393,10 @@ def run_regen(config, entry, count: int, generator, *, on_start=None, on_event=N
             on_registered=regen_register_hook(entry.id, claim["token"]),
             should_stop=should_stop)
     finally:
+        # 締めの保存に失敗しても、この実行を「実行中」のまま残さないため、先に終わったことを覚えます
+        _mark_run_ended(claim["token"])
         complete = finish_regen(config, entry.id, claim["token"])
+        _forget_ended_run(claim["token"])
     return {"claimed": True, "remaining": claim["remaining"], "complete": complete}
 
 
@@ -1558,7 +1586,10 @@ def run_initial(config, entry, count: int, generator, *, on_start=None, on_event
             on_registered=initial_register_hook(entry.id, claim["token"]),
             should_stop=should_stop)
     finally:
+        # 締めの保存に失敗しても、この実行を「実行中」のまま残さないため、先に終わったことを覚えます
+        _mark_run_ended(claim["token"])
         complete = finish_initial(config, entry.id, claim["token"])
+        _forget_ended_run(claim["token"])
     return {"claimed": True, "closed": False, "recovered": begun["recovered"],
             "remaining": claim["remaining"], "complete": complete}
 
@@ -1991,7 +2022,10 @@ def repair_state(config) -> dict:
                     continue
                 if not files:
                     continue
-                record = _rebuild_record(config, sid, files)
+                rebuilt = _rebuild_record(config, sid, files)
+                # 候補0件の既存の記録（途中で止まった初回生成など）は、置き換えずに候補と採用の
+                # 項目だけを作り直します（実行の記録・予約・知らない項目を失わないため）
+                record = _merge_rebuilt_record(record, rebuilt) if isinstance(record, dict) else rebuilt
                 stickers[sid] = record
                 report["stickers"][sid] = {
                     "added": [v["variant_id"] for v in record["variants"]],
@@ -2045,6 +2079,39 @@ def _rebuild_record(config, sticker_id: str, files: list[Path]) -> dict:
         record["adopted_file"] = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns, "sha1": gen_sha}
     record["next_seq"] = max(int(v["variant_id"][1:]) for v in items) + 1
     return record
+
+
+_REBUILT_KEYS = ("adopted", "adopted_at", "adopted_file", "variants")   # repair が候補フォルダから作り直す項目
+_RUN_KEYS = ("initial_run", "regen_run")                                  # 番号を予約する実行の記録
+
+
+def _merge_rebuilt_record(existing: dict, rebuilt: dict) -> dict:
+    """候補0件の既存の記録に、作り直した候補と採用の項目だけを反映します。
+
+    実行の記録（initial_run / regen_run）・知らない項目はそのまま残します。
+    next_seq は後退させません（既存の値・作り直した値・実行の記録で予約した番号の次、の最大）。
+    予約済みの番号を空きに戻すと、別の処理が同じ番号をもう一度使ってしまうためです。
+    """
+    merged = dict(existing)
+    for key in _REBUILT_KEYS:
+        if key in rebuilt:
+            merged[key] = rebuilt[key]
+        else:
+            merged.pop(key, None)            # 作り直した採用状態と食い違う古い目印は残しません
+    seqs = [rebuilt["next_seq"]]
+    kept = existing.get("next_seq")
+    if isinstance(kept, int) and not isinstance(kept, bool):
+        seqs.append(kept)
+    for key in _RUN_KEYS:
+        run = existing.get(key)
+        if not isinstance(run, dict):
+            continue
+        numbers = [v for k in ("reserved", "done") if isinstance(run.get(k), list) for v in run[k]]
+        for variant_id in numbers:
+            if isinstance(variant_id, str) and variant_id[1:].isdigit():
+                seqs.append(int(variant_id[1:]) + 1)
+    merged["next_seq"] = max(seqs)
+    return merged
 
 
 def _main(argv: list[str] | None = None) -> int:
