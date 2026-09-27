@@ -313,35 +313,43 @@ def cmd_generate(config, args) -> int:
     failed: list[str] = []
 
     for entry in entries:
-        result = generator.generate_one(entry, force=args.force)
-        if result.status == "error":
-            counts["error"] += 1
-            failed.append(entry.id)
-            continue
-        counts[result.status] = counts.get(result.status, 0) + 1
-
-        if args.no_render:
-            continue
+        # GUI の採用・取り込み・生成と同じスタンプの鍵の中で行います（generated/final を
+        # 書き換えるため。鍵の順序は「スタンプ → 記録」で、ここでは記録の鍵は取りません）
         try:
-            path, size_bytes, warnings = render_final(config, entry, style)
-            logger.event(entry.id, "TEXT RENDERED", f"{size_bytes / 1024:.0f}KB")
-            for w in warnings:
-                logger.warn(f"{entry.id} {w}")
+            with vr.adopt_lock(config, entry.id):
+                result = generator.generate_one(entry, force=args.force)
+                if result.status == "error":
+                    counts["error"] += 1
+                    failed.append(entry.id)
+                    continue
+                counts[result.status] = counts.get(result.status, 0) + 1
 
-            report = vd.validate_sticker(path, config)
-            for issue in report.issues:
-                logger.warn(f"{entry.id} {issue.message}")
-            if report.ok:
-                logger.event(entry.id, "VALIDATION PASS")
-                logger.event(entry.id, "COMPLETE")
-                state.set(entry.id, "complete")
-            else:
-                logger.event(entry.id, "VALIDATION FAIL", report.errors[0].message)
-                state.set(entry.id, "validation_failed", report.errors[0].message)
-                failed.append(entry.id)
-        except Exception as exc:  # noqa: BLE001 - 1件の失敗で全体を止めない
-            logger.error(entry.id, f"{type(exc).__name__}: {exc}")
-            state.set(entry.id, "error", str(exc))
+                if args.no_render:
+                    continue
+                try:
+                    path, size_bytes, warnings = render_final(config, entry, style)
+                    logger.event(entry.id, "TEXT RENDERED", f"{size_bytes / 1024:.0f}KB")
+                    for w in warnings:
+                        logger.warn(f"{entry.id} {w}")
+
+                    report = vd.validate_sticker(path, config)
+                    for issue in report.issues:
+                        logger.warn(f"{entry.id} {issue.message}")
+                    if report.ok:
+                        logger.event(entry.id, "VALIDATION PASS")
+                        logger.event(entry.id, "COMPLETE")
+                        state.set(entry.id, "complete")
+                    else:
+                        logger.event(entry.id, "VALIDATION FAIL", report.errors[0].message)
+                        state.set(entry.id, "validation_failed", report.errors[0].message)
+                        failed.append(entry.id)
+                except Exception as exc:  # noqa: BLE001 - 1件の失敗で全体を止めない
+                    logger.error(entry.id, f"{type(exc).__name__}: {exc}")
+                    state.set(entry.id, "error", str(exc))
+                    counts["error"] += 1
+                    failed.append(entry.id)
+        except vr.LockBusyError as exc:
+            logger.error(entry.id, str(exc))
             counts["error"] += 1
             failed.append(entry.id)
 
@@ -590,16 +598,18 @@ def cmd_render(config, args) -> int:
 
     done = skipped = failed = 0
     for entry in entries:
-        if not (config.dir_generated / f"{entry.id}.png").exists():
-            skipped += 1
-            continue
         try:
-            path, size_bytes, warnings = render_final(config, entry, style)
+            # final を書き換えるので、GUI の採用と同じスタンプの鍵の中で行います
+            with vr.adopt_lock(config, entry.id):
+                if not (config.dir_generated / f"{entry.id}.png").exists():
+                    skipped += 1
+                    continue
+                path, size_bytes, warnings = render_final(config, entry, style)
             for w in warnings:
                 logger.warn(f"{entry.id} {w}")
             logger.event(entry.id, "TEXT RENDERED", f"{path.name} {size_bytes / 1024:.0f}KB")
             done += 1
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001（鍵を取れなかった場合も含む）
             logger.error(entry.id, f"{type(exc).__name__}: {exc}")
             failed += 1
 
