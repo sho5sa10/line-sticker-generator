@@ -745,6 +745,8 @@ main { padding: 16px; max-width: 1500px; margin: 0 auto; }
 .vhead strong { font-size: 15px; }
 .vcount { font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .vstats { font-size: 12px; color: var(--muted); margin-left: auto; }
+.vregen { display: inline-flex; gap: 4px; align-items: center; }
+.vregen select { font-size: 12px; }
 .vcards {
   display: flex; gap: 12px; overflow-x: auto; padding: 14px 16px; align-items: flex-start;
 }

@@ -1014,7 +1014,8 @@ def _prompt_file(config, sticker_id: str) -> str | None:
     return relative_file(config, path) if path.exists() else None
 
 
-def generate_variants(config, entries, count: int, generator, *, on_event=None) -> list[dict]:
+def generate_variants(config, entries, count: int, generator, *, on_event=None,
+                      on_registered=None, should_stop=None) -> list[dict]:
     """各スタンプについて count 枚の候補を生成します（generated/ には触れません）。
 
     Args:
@@ -1027,12 +1028,13 @@ def generate_variants(config, entries, count: int, generator, *, on_event=None) 
     """
     results: list[dict] = []
     for entry in entries:
-        _generate_for_entry(config, entry, count, generator, results, on_event)
+        _generate_for_entry(config, entry, count, generator, results, on_event,
+                            on_registered, should_stop)
     return results
 
 
 def _generate_for_entry(config, entry, count: int, generator, results: list[dict],
-                        on_event) -> None:
+                        on_event, on_registered=None, should_stop=None) -> None:
     """1スタンプ分。番号の確保と記録は、そのつど最新の状態に対して行います。
 
     生成には時間がかかるため、その間ずっと古い状態を持たないようにしています
@@ -1040,6 +1042,8 @@ def _generate_for_entry(config, entry, count: int, generator, results: list[dict
     """
     prompt = generator.prompt_for(entry)
     for _ in range(max(int(count), 1)):
+        if should_stop is not None and should_stop():
+            return                  # 中止: 候補1件ごとに確かめます（API の呼び出し中は止めません）
         if getattr(generator, "dry_run", False):
             results.append({"id": entry.id, "variant_id": None, "status": "dry-run",
                             "path": None, "detail": ""})
@@ -1060,6 +1064,9 @@ def _generate_for_entry(config, entry, count: int, generator, results: list[dict
             def register(state):    # noqa: B023 - 直後に実行します
                 record = ensure_record(config, state, entry.id)
                 register_variant(config, record, variant_id, path, meta=meta)
+                if on_registered is not None:
+                    # 登録と同じ保存で、呼び出し側の記録（再生成の進み具合など）も更新します
+                    on_registered(state, record, variant_id)
 
             # PNG が出来てから記録します（記録だけ残る状態を作らない）
             update_sticker(config, entry.id, register)
@@ -1071,6 +1078,169 @@ def _generate_for_entry(config, entry, count: int, generator, results: list[dict
                             "path": None, "detail": result.detail or "生成に失敗しました"})
         if on_event:
             on_event(entry.id, variant_id, results[-1]["status"], results[-1]["detail"])
+
+
+# ---------------------------------------------------------------------------
+# 再生成（Phase 6）: regen の印が付いたスタンプだけに候補を作る
+# ---------------------------------------------------------------------------
+REGEN_DEFAULT_COUNT = 4        # 1スタンプあたりの既定の枚数
+REGEN_MAX_COUNT = 8            # 1スタンプあたりの上限
+REGEN_MAX_TOTAL = 100          # 1回の実行全体の上限（意図しない大量課金を防ぐ）
+
+
+def _regen_now() -> str:
+    """再生成の管理に使う時刻。印の付け直しと実行開始を取り違えないよう、マイクロ秒まで持ちます。"""
+    return datetime.now().isoformat(timespec="microseconds")
+
+
+def _regen_requested(record: dict) -> bool:
+    """regen の印の中に、まだ生成していない指示があるか。
+
+    regen_generated_at は「その時刻までに付いた regen の指示には、候補を作り終えた」ことを表します
+    （実行を始めた時刻）。それより後に付けた・付け直した印（regen_marked_at が新しい）は未処理です。
+    日時の無い以前のデータは、regen_generated_at が無ければ未処理とみなします。
+    """
+    marks = [v for v in record.get("variants") or []
+             if isinstance(v, dict) and v.get("verdict") == VERDICT_REGEN]
+    if not marks:
+        return False
+    done_at = record.get("regen_generated_at")
+    if not done_at:
+        return True
+    return any(isinstance(v.get("regen_marked_at"), str) and v["regen_marked_at"] > done_at
+               for v in marks)
+
+
+def _regen_owner() -> dict:
+    return {"pid": os.getpid(), "host": _this_host(), "started": _process_start(os.getpid())[1],
+            "token": uuid.uuid4().hex}
+
+
+def _regen_owner_alive(owner) -> bool:
+    """再生成を実行中の処理が、まだ動いているか（落ちていれば、途中で止まった実行として続きから）。"""
+    if not isinstance(owner, dict) or not isinstance(owner.get("pid"), int):
+        return False
+    if owner.get("host") not in (None, _this_host()):
+        return True                        # 別のPCの処理は確かめられないので、動いているとみなす
+    alive, started = _process_start(owner["pid"])
+    return alive and (owner.get("started") is None or started is None or owner["started"] == started)
+
+
+def _regen_pending_run(record: dict) -> dict | None:
+    """途中で止まった（失敗・中止・異常終了した）実行。続きから作ります。"""
+    run = record.get("regen_run")
+    if not isinstance(run, dict) or not isinstance(run.get("count"), int):
+        return None
+    if _regen_owner_alive(run.get("owner")):
+        return None
+    return run
+
+
+def regen_plan(config, sticker_ids, count: int) -> dict:
+    """再生成の対象と枚数を計算します（読み取りだけ。何も書かず、プロバイダも作りません）。
+
+    Returns:
+        {"targets": [{"id", "count": 作る枚数, "resume": 途中からか}], "total": 合計枚数,
+         "busy": [別の処理が実行中のスタンプ]}
+    """
+    state = load(config)
+    stickers = state.get("stickers") or {}
+    targets, busy = [], []
+    for sid in sticker_ids:
+        record = stickers.get(sid)
+        if not isinstance(record, dict):
+            continue
+        run = record.get("regen_run")
+        if isinstance(run, dict) and _regen_owner_alive(run.get("owner")):
+            busy.append(sid)
+            continue
+        pending = _regen_pending_run(record)
+        if pending is not None:
+            left = max(pending["count"] - len(pending.get("done") or []), 0)
+            if left:
+                targets.append({"id": sid, "count": left, "resume": True})
+                continue
+        if _regen_requested(record):
+            targets.append({"id": sid, "count": count, "resume": False})
+    return {"targets": targets, "total": sum(t["count"] for t in targets), "busy": busy}
+
+
+def begin_regen(config, sticker_id: str, count: int) -> dict | None:
+    """1スタンプの再生成を始めます（記録の鍵の中で、対象かどうかを確かめ直してから）。
+
+    途中で止まった実行があればその続き（残りの枚数だけ）、無ければ新しい実行を始めます。
+    実行中の目印（owner）を書くので、同じスタンプを2つの処理が同時に生成することはありません。
+
+    Returns:
+        {"token", "since": 基準の時刻, "remaining": 作る枚数}。対象でない・実行中なら None。
+    """
+    def mutate(state):
+        record = (state.get("stickers") or {}).get(sticker_id)
+        if not isinstance(record, dict):
+            return UNCHANGED
+        run = record.get("regen_run")
+        if isinstance(run, dict) and _regen_owner_alive(run.get("owner")):
+            return UNCHANGED                                   # 別の処理が実行中
+        pending = _regen_pending_run(record)
+        if pending is not None and pending["count"] > len(pending.get("done") or []):
+            run = pending                                      # 続きから（作れた分は作り直さない）
+        elif _regen_requested(record):
+            run = {"since": _regen_now(), "count": int(count), "done": []}
+        else:
+            return UNCHANGED
+        run["owner"] = _regen_owner()
+        record["regen_run"] = run
+        return {"token": run["owner"]["token"], "since": run["since"],
+                "remaining": run["count"] - len(run.get("done") or [])}
+
+    result = update_sticker(config, sticker_id, mutate)
+    return None if result is UNCHANGED else result
+
+
+def _regen_run_of(state: dict, sticker_id: str, token: str) -> tuple[dict, dict] | tuple[None, None]:
+    record = (state.get("stickers") or {}).get(sticker_id)
+    run = record.get("regen_run") if isinstance(record, dict) else None
+    owner = run.get("owner") if isinstance(run, dict) else None
+    if not isinstance(owner, dict) or owner.get("token") != token:
+        return None, None
+    return record, run
+
+
+def regen_register_hook(sticker_id: str, token: str):
+    """generate_variants の on_registered に渡す関数。
+
+    候補の登録と「この実行で作れた」記録を、同じ鍵の中の同じ保存で行います
+    （別々に保存すると、その間で落ちたときに、作れた候補をもう一度作って課金してしまうため）。
+    """
+    def hook(state, record_for_sticker, variant_id):
+        _record, run = _regen_run_of(state, sticker_id, token)
+        if run is not None:
+            run.setdefault("done", []).append(variant_id)
+    return hook
+
+
+def finish_regen(config, sticker_id: str, token: str) -> bool:
+    """1スタンプの再生成を終えます。全部作れたときだけ regen_generated_at を記録します。
+
+    途中で失敗・中止した場合は、作れた分（done）を残して実行中の目印だけ外します
+    （次回は残りの枚数だけを作ります）。regen の判断（verdict）そのものは変えません。
+
+    Returns:
+        全部作れたなら True。
+    """
+    def mutate(state):
+        record, run = _regen_run_of(state, sticker_id, token)
+        if run is None:
+            return UNCHANGED
+        if len(run.get("done") or []) >= run["count"]:
+            record["regen_generated_at"] = run["since"]        # 開始時刻（それ以降の印は次回の対象）
+            record.pop("regen_run", None)
+            return True
+        run["owner"] = None
+        return False
+
+    result = update_sticker(config, sticker_id, mutate)
+    return result is True
 
 
 # ---------------------------------------------------------------------------
@@ -1136,6 +1306,9 @@ def set_verdict(config, sticker_id: str, variant_id: str, verdict: str) -> dict:
     def mutate(state):
         _record, item = _find_item(config, state, sticker_id, variant_id)
         item["verdict"] = verdict
+        if verdict == VERDICT_REGEN:
+            # 付けた・付け直した時刻。再生成が済んだかどうかの判定に使います（Phase 6）
+            item["regen_marked_at"] = _regen_now()
         return item
 
     return update_sticker(config, sticker_id, mutate)

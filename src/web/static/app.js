@@ -1365,6 +1365,7 @@ async function pollJob() {
           job.status === 'failed');
     if (job.kind === 'master') await afterMasterChanged();
     else await refreshStickers();
+    if (job.kind === 'variants' && vstate.open) await reloadVariantModal();
   }
 }
 
@@ -2500,6 +2501,54 @@ async function setRating(rating) {
     vmsg(`${id}/${v.variant_id} の評価を ${rating === null ? 'なし' : rating} にしました`, 'ok');
   } catch (e) { vmsg(`✕ ${id}/${v.variant_id}: ${e.message}`, 'bad'); }
 }
+
+/* --- 再生成の候補を作る（Phase 6） --- */
+const REGEN_MAX_COUNT = 8;
+const REGEN_DEFAULT_COUNT = 4;
+for (let n = 1; n <= REGEN_MAX_COUNT; n++) {
+  $('#v-regen-count').insertAdjacentHTML('beforeend',
+    `<option value="${n}" ${n === REGEN_DEFAULT_COUNT ? 'selected' : ''}>${n}枚ずつ</option>`);
+}
+
+/** 候補の比較画面を最新の記録で表示し直します（再生成が終わったあとなど）。 */
+async function reloadVariantModal() {
+  try { vstate.all = (await api('/api/variants')).stickers || {}; } catch (e) { /* 一覧は前のまま */ }
+  if (vstate.open) await loadVariantSticker();
+}
+
+/**
+ * 「再生成」の印があるスタンプに候補を作ります。まず dry-run で対象・枚数・費用を出し（APIは
+ * 使いません）、確認してから実行します。実行時は確認した合計を送り、変わっていたらサーバーが断ります。
+ */
+$('#v-regen').addEventListener('click', async () => {
+  if (vstate.busy) return;
+  const count = Number($('#v-regen-count').value);
+  let plan;
+  try {
+    plan = await api('/api/variants/generate',
+                     { method: 'POST', body: { regen_only: true, count, dry_run: true } });
+  } catch (e) { vmsg(`✕ ${e.message}`, 'bad'); return; }
+  if (!plan.total) {
+    vmsg('再生成の対象はありません（「再生成」の印が無いか、すでに作り終えています）');
+    return;
+  }
+  const usd = plan.usd === null ? '不明' : `約 $${plan.usd.toFixed(2)} USD (${plan.model} / ${plan.quality})`;
+  const lines = plan.targets.map((t) => `  ${t.id}: ${t.count}枚${t.resume ? '（前回の続き）' : ''}`);
+  const busy = plan.busy.length ? `\n（別の処理が実行中のため除外: ${plan.busy.join(', ')}）` : '';
+  if (!confirm(`再生成の対象: ${plan.targets.length}件\n候補の生成: ${plan.total}枚\n推定費用: ${usd}\n\n`
+               + `${lines.join('\n')}${busy}\n\n生成を開始しますか？（画像生成APIを使います）`)) return;
+  try {
+    resetJobUi('再生成の候補を作っています');
+    await api('/api/variants/generate',
+              { method: 'POST', body: { regen_only: true, count, expected_total: plan.total } });
+    startPolling();
+    vmsg(`再生成の候補を作っています（${plan.total}枚）`, 'busy');
+  } catch (e) {
+    closeJobBar();
+    vmsg(`✕ ${e.message}`, 'bad');
+    toast(e.message, true);
+  }
+});
 
 /* --- 操作 --- */
 $('#v-close').addEventListener('click', closeVariantModal);

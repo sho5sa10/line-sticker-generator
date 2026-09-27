@@ -29,6 +29,7 @@ from . import fonts as fontlib
 from . import style_suggest
 from . import gallery as gallery_mod
 from . import image_processor as ip
+from . import image_generator as image_generator_mod
 from . import importer
 from . import sales as sales_mod
 from . import variants as variants_mod
@@ -42,6 +43,7 @@ from .csv_loader import CsvLoadError, StickerEntry, load_stickers, save_stickers
 from .image_generator import ImageGenerator, MasterImageMissingError, check_master_image
 from .logger import RunLogger, StateStore
 from .providers import estimate_cost_usd
+from .providers.base import ProviderError
 from .text_renderer import FontNotFoundError, TextStyle
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
@@ -979,6 +981,119 @@ def create_app(config=None) -> Flask:
         except variants_mod.VariantError as exc:
             return _variant_error(exc)
         return jsonify({"report": report, "variants_state": variants_state(cfg_)})
+
+    # ------------------------------------------------------------------
+    # 再生成（Phase 6）: regen の印が付いたスタンプだけに候補を作る
+    # ------------------------------------------------------------------
+    def _regen_count(body: dict) -> int:
+        count = body.get("count", variants_mod.REGEN_DEFAULT_COUNT)
+        if (isinstance(count, bool) or not isinstance(count, int)
+                or not 1 <= count <= variants_mod.REGEN_MAX_COUNT):
+            raise ValueError(
+                f"1スタンプあたりの枚数は 1〜{variants_mod.REGEN_MAX_COUNT} の整数で指定してください: {count}")
+        return count
+
+    def _run_regen(job: Job, ids: list[str], count: int) -> None:
+        """再生成の候補を作るジョブ。API を呼んでいる間は鍵を持ちません（記録の更新時だけ）。"""
+        cfg_ = current_config()
+        logger = RunLogger(cfg_.log_path, echo=False)
+        state = StateStore(cfg_.state_path)
+        generator = ImageGenerator(cfg_, logger, state, dry_run=False)
+        by_id = {e.id: e for e in entries_or_error()}
+
+        for sticker_id in ids:
+            if jobs.cancelled():
+                job.log("warn", "ユーザー操作により中止しました（作れた候補は残し、次回は残りだけ作ります）")
+                break
+            entry = by_id.get(sticker_id)
+            if entry is None:
+                job.log("error", "CSVに存在しません", sticker_id)
+                continue
+            # 記録の鍵の中で対象かどうかを確かめ直し、実行中の目印を付けてから作ります
+            claim = variants_mod.begin_regen(cfg_, sticker_id, count)
+            if claim is None:
+                job.log("skip", "対象ではなくなったか、別の処理が実行中のため作りませんでした", sticker_id)
+                continue
+            job.log("info", f"候補を {claim['remaining']} 枚作ります", sticker_id)
+
+            def on_event(sid, variant_id, status, detail):
+                job.api_calls += 1
+                job.done += 1
+                if status == "generated":
+                    job.log("ok", f"{variant_id} を作りました", sid)
+                else:
+                    job.log("error", f"{variant_id}: {detail}", sid)
+
+            try:
+                variants_mod.generate_variants(
+                    cfg_, [entry], claim["remaining"], generator, on_event=on_event,
+                    on_registered=variants_mod.regen_register_hook(sticker_id, claim["token"]),
+                    should_stop=jobs.cancelled)
+            finally:
+                complete = variants_mod.finish_regen(cfg_, sticker_id, claim["token"])
+            if complete:
+                job.log("ok", "再生成の候補を作り終えました", sticker_id)
+            else:
+                job.log("warn", "途中で止まりました（作れた候補は残し、次回は残りだけ作ります）", sticker_id)
+        job.result["api_calls"] = job.api_calls
+
+    @app.post("/api/variants/generate")
+    def api_variants_generate():
+        """regen の印が付いたスタンプに、新しい候補を作ります。
+
+        dry_run=true なら対象・枚数・費用だけを返します（プロバイダを作らず、APIキーも使いません）。
+        実行するときは、確認画面で見た合計枚数（expected_total）を添えてください。
+        いまの合計と違えば、確認し直してもらうため生成を始めません。
+        """
+        cfg_ = current_config()
+        body = request.get_json(silent=True) or {}
+        if body.get("regen_only") is not True:
+            return jsonify({"error": "いまは regen_only=true（再生成の印が付いたスタンプだけ）に対応しています"}), 400
+        try:
+            count = _regen_count(body)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        try:
+            entries = entries_or_error()
+        except CsvLoadError as exc:
+            return jsonify({"error": str(exc)}), 400
+        if variants_state(cfg_) == "corrupt":
+            return _variant_error(variants_mod.StateCorruptError(variants_mod.corrupt_message(cfg_)))
+
+        plan = variants_mod.regen_plan(cfg_, [e.id for e in entries], count)
+        total = plan["total"]
+        summary = {
+            "count": count, "targets": plan["targets"], "busy": plan["busy"], "total": total,
+            "usd": estimate_cost_usd(cfg_.model, cfg_.quality, total),
+            "model": cfg_.model, "quality": cfg_.quality,
+            "max_count": variants_mod.REGEN_MAX_COUNT, "max_total": variants_mod.REGEN_MAX_TOTAL,
+        }
+        if total > variants_mod.REGEN_MAX_TOTAL:
+            return jsonify({**summary, "error": (
+                f"1回に作れる候補は {variants_mod.REGEN_MAX_TOTAL} 枚までです（今回 {total} 枚）。"
+                "1スタンプあたりの枚数を減らしてください")}), 400
+        if body.get("dry_run"):
+            return jsonify(summary)
+
+        expected = body.get("expected_total")
+        if isinstance(expected, bool) or not isinstance(expected, int):
+            return jsonify({"error": "確認画面の合計枚数（expected_total）を指定してください"}), 400
+        if total == 0:
+            return jsonify({**summary, "error": "再生成の対象がありません（印が無いか、作り終えています）"}), 400
+        if expected != total:
+            return jsonify({**summary, "error": "対象が変わりました。もう一度確認してから実行してください"}), 409
+        if not cfg_.api_key:
+            return jsonify({"error": "OPENAI_API_KEY が未設定です。.env に記入してください。"}), 400
+        try:
+            image_generator_mod.create_provider(cfg_)      # 設定の誤りをここで知らせる（通信はしません）
+            check_master_image(cfg_)
+        except (ProviderError, ValueError, MasterImageMissingError) as exc:
+            return jsonify({"error": str(exc)}), 400
+        try:
+            job = jobs.start("variants", total, _run_regen, [t["id"] for t in plan["targets"]], count)
+        except RuntimeError as exc:                         # ほかの処理が実行中（同時のリクエストを含む）
+            return jsonify({"error": str(exc)}), 409
+        return jsonify({**summary, "job": job.to_dict()})
 
     @app.post("/api/variants/<sticker_id>/<variant_id>/adopt")
     def api_variants_adopt(sticker_id: str, variant_id: str):
