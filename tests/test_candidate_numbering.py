@@ -170,9 +170,10 @@ def test_empty_record_with_a_legacy_image_keeps_its_fields(tmp_config):
     vr.generate_variants(tmp_config, [_entry()], 1, _generator(tmp_config, FakeProvider()))
 
     record = _record(tmp_config)
-    assert _ids(tmp_config) == ["v001", "v004"]          # 原画の v001 と、予約の続きの v004
-    assert record["adopted"] == "v001" and record["future_field"] == "kept"
-    assert record["next_seq"] == 5
+    # 予約済みの v001〜v003 は原画にも使わない（STEP 3-A）: 原画は v004、新しい候補は v005
+    assert _ids(tmp_config) == ["v004", "v005"]
+    assert record["adopted"] == "v004" and record["future_field"] == "kept"
+    assert record["next_seq"] == 6
 
 
 # --- Test 3 / 4（スレッド）--------------------------------------------------

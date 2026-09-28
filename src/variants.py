@@ -755,17 +755,18 @@ def _sticker_lock_for_copy(config, sticker_id: str):
 # ---------------------------------------------------------------------------
 # 取得
 # ---------------------------------------------------------------------------
-def ensure_legacy_variant(config, sticker_id: str) -> StickerVariants | None:
+def ensure_legacy_variant(config, sticker_id: str, record=None) -> StickerVariants | None:
     """記録が無いスタンプを、generated/<id>.png を指す仮想の v001 として扱います。
 
     **ファイルのコピー・移動はしません。variants.json も作りません。**
     generated/<id>.png が無ければ None を返します。
+    候補0件の記録（record）があれば、その予約済みの番号は避けます（_legacy_slot を参照）。
     """
     src = config.dir_generated / f"{sticker_id}.png"
     if not src.exists():
         return None
     # 実体化したときと同じ番号で見せます（置き場に別の画像の v001 があれば、その次）
-    slot, _reuse = _legacy_slot(config, sticker_id, src)
+    slot, _reuse = _legacy_slot(config, sticker_id, src, record=record)
     vid = slot.stem
     v = Variant(
         variant_id=vid,
@@ -778,16 +779,23 @@ def ensure_legacy_variant(config, sticker_id: str) -> StickerVariants | None:
                            variants=[v], legacy=True)
 
 
-def _legacy_slot(config, sticker_id: str, src: Path, src_sha: str | None = None) -> tuple[Path, bool]:
+def _legacy_slot(config, sticker_id: str, src: Path, src_sha: str | None = None, *,
+                 record=None) -> tuple[Path, bool]:
     """legacy の画像を置く場所と、その場所の既存ファイルをそのまま使えるか。
 
     置き場に v001.png が無ければ v001（普段はここで終わり、ハッシュも計算しません）。
     ある場合は: 中身が同じ → そのまま使う / 読めない → 作り直す / 別の画像 → 次の番号。
+    予約済みの番号は使いません: 記録の next_seq より前の番号、記録にある候補・実行の記録
+    （initial_run / regen_run）の予約と完了の番号、書き込み途中の .png.part がある番号は飛ばします
+    （ファイルが無いだけで空いているとは限らないため。課金済みの画像を原画で隠さないように）。
     """
     folder = variant_dir(config, sticker_id)
-    seq = 1
+    seq, used = _legacy_consumed(record)
     while True:
         dest = folder / f"v{seq:03d}.png"
+        if dest.stem in used or dest.with_suffix(".png.part").exists():
+            seq += 1
+            continue
         if not dest.exists():
             return dest, False
         src_sha = src_sha or sha1_file(src)
@@ -796,6 +804,27 @@ def _legacy_slot(config, sticker_id: str, src: Path, src_sha: str | None = None)
         if not _is_readable_png(dest):
             return dest, False          # 半端なコピーなど。作り直します
         seq += 1                        # 別の候補の画像。消さずに次の番号へ
+
+
+def _legacy_consumed(record) -> tuple[int, set[str]]:
+    """legacy の番号を探し始める番号（記録の next_seq）と、使えない番号（候補・実行の予約と完了）。"""
+    if not isinstance(record, dict):
+        return 1, set()
+    used = {str(v.get("variant_id")) for v in record.get("variants") or [] if isinstance(v, dict)}
+    for key in ("initial_run", "regen_run"):
+        run = record.get(key)
+        if isinstance(run, dict):
+            for field in ("reserved", "done"):
+                if isinstance(run.get(field), list):
+                    used.update(v for v in run[field] if isinstance(v, str))
+    seq = record.get("next_seq")
+    start = seq if isinstance(seq, int) and not isinstance(seq, bool) and seq >= 1 else 1
+    return start, used
+
+
+def _initial_run_open(record) -> bool:
+    """止まった（または実行中の）初回生成の記録があるか。完了すると initial_run は消えます。"""
+    return isinstance(record, dict) and isinstance(record.get("initial_run"), dict)
 
 
 def get_sticker(config, sticker_id: str, data: dict | None = None) -> StickerVariants | None:
@@ -811,8 +840,11 @@ def get_sticker(config, sticker_id: str, data: dict | None = None) -> StickerVar
         if v is not None:
             variants.append(v)
     if not variants:
+        if _initial_run_open(record):
+            # 初回生成の途中（止まった実行の続きが先）。原画は候補として見せません
+            return None
         # 記録はあるが候補が1件も読めない場合も、既存画像で動けるようにします。
-        return ensure_legacy_variant(config, sticker_id)
+        return ensure_legacy_variant(config, sticker_id, record)
 
     adopted = record.get("adopted")
     if adopted is not None and not any(v.variant_id == adopted for v in variants):
@@ -917,6 +949,10 @@ def ensure_record(config, data: dict, sticker_id: str) -> dict:
     記録はあるが候補が0件（variants=[]）の場合は、その記録をそのまま使います。
     番号の予約（next_seq）・実行中の状態・知らない項目を消さないためです
     （作り直すと、予約済みの番号を別の処理がもう一度使ってしまいます）。
+    原画を取り込むときは、予約済みの番号を避けた番号に置きます（_legacy_slot を参照）。
+
+    初回生成の途中（initial_run がある）の記録には、原画を取り込みません。止まった初回生成の
+    続き（予約した番号・前回できていた画像）が先で、原画でその枠を埋めないためです。
     """
     stickers = data.setdefault("stickers", {})
     record = stickers.get(sticker_id)
@@ -924,13 +960,13 @@ def ensure_record(config, data: dict, sticker_id: str) -> dict:
         record.setdefault("next_seq", len(record["variants"]) + 1)
         return record
 
-    legacy = ensure_legacy_variant(config, sticker_id)
+    legacy = None if _initial_run_open(record) else ensure_legacy_variant(config, sticker_id, record)
     if legacy is not None:
         # 記録に残す時点で、候補置き場へ実体をコピーします。
         # generated/<id>.png は採用のたびに中身が変わるため、そこを指したままだと
         # v001 が「いま採用中の画像」の別名になり、元の絵が追えなくなります。
         with _sticker_lock_for_copy(config, sticker_id):
-            kept, stamp = _materialize_legacy(config, sticker_id, legacy.variants[0])
+            kept, stamp = _materialize_legacy(config, sticker_id, legacy.variants[0], record)
         seq = int(kept.variant_id[1:])
         fresh = {
             "adopted": kept.variant_id,
@@ -983,11 +1019,11 @@ def _is_readable_png(path: Path) -> bool:
         return False
 
 
-def _materialize_legacy(config, sticker_id: str, variant: Variant) -> tuple[Variant, dict]:
+def _materialize_legacy(config, sticker_id: str, variant: Variant, record=None) -> tuple[Variant, dict]:
     """legacy の候補（generated/<id>.png）を候補置き場へコピーして、そちらを指させます。
 
     コピーは「一時ファイル → SHA1確認 → 置き換え」で行い、途中で失敗しても半端な
-    vNNN.png を残しません。置き場所の決め方は _legacy_slot() を参照。
+    vNNN.png を残しません。置き場所の決め方は _legacy_slot() を参照（record の予約を避けます）。
     Returns:
         (候補, generated の目印 {size, mtime_ns, sha1})
     """
@@ -997,7 +1033,7 @@ def _materialize_legacy(config, sticker_id: str, variant: Variant) -> tuple[Vari
     stat = src.stat()
     src_sha = sha1_file(src)
     stamp = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns, "sha1": src_sha}
-    dest, reuse = _legacy_slot(config, sticker_id, src, src_sha)
+    dest, reuse = _legacy_slot(config, sticker_id, src, src_sha, record=record)
     if not reuse:
         _copy_verified(src, dest, src_sha)
     return _with_id_and_file(config, variant, dest), stamp
@@ -2119,7 +2155,7 @@ def repair_state(config) -> dict:
                     continue
                 if not files:
                     continue
-                rebuilt = _rebuild_record(config, sid, files)
+                rebuilt = _rebuild_record(config, sid, files, record if isinstance(record, dict) else None)
                 # 候補0件の既存の記録（途中で止まった初回生成など）は、置き換えずに候補と採用の
                 # 項目だけを作り直します（実行の記録・予約・知らない項目を失わないため）
                 record = _merge_rebuilt_record(record, rebuilt) if isinstance(record, dict) else rebuilt
@@ -2156,17 +2192,22 @@ def _add_missing_variants(config, record: dict, files: list[Path]) -> list[str]:
     return added
 
 
-def _rebuild_record(config, sticker_id: str, files: list[Path]) -> dict:
+def _rebuild_record(config, sticker_id: str, files: list[Path], existing=None) -> dict:
+    """候補フォルダの画像から記録を作り直します。existing は候補0件の既存の記録（無ければ None）。
+
+    原画は、通常の取り込みと同じ規則で扱います: 初回生成の途中（existing に initial_run がある）なら
+    取り込まず、取り込むときは existing の予約済みの番号を避けます（ensure_record と同じ）。
+    """
     items = [_recovered_item(config, path) for path in files]
     record = {"adopted": None, "adopted_at": None, "variants": items}
     generated = config.dir_generated / f"{sticker_id}.png"
-    if generated.exists():
+    if generated.exists() and not _initial_run_open(existing):
         gen_sha = sha1_file(generated)
         match = next((item for item, path in zip(items, files) if sha1_file(path) == gen_sha), None)
         if match is None:
-            legacy = ensure_legacy_variant(config, sticker_id)
+            legacy = ensure_legacy_variant(config, sticker_id, existing)
             with _sticker_lock_for_copy(config, sticker_id):     # repair_state が持っています
-                kept, _stamp = _materialize_legacy(config, sticker_id, legacy.variants[0])
+                kept, _stamp = _materialize_legacy(config, sticker_id, legacy.variants[0], existing)
             match = kept.to_dict()
             items.append(match)
             items.sort(key=lambda v: v["variant_id"])
