@@ -253,8 +253,13 @@ def test_12_regen_run_survives_repair_during_regen(client, tmp_config, box, monk
 # ===========================================================================
 # initial × regen × repair（同じスタンプ）
 # ===========================================================================
-def test_initial_regen_and_repair_together(client, tmp_config, box, monkeypatch):
-    """途中の初回生成と再生成を同じスタンプで重ね、登録前に何度も repair を走らせても壊れない。"""
+@pytest.mark.parametrize("first", ["regen", "initial"])
+def test_initial_regen_and_repair_together(client, tmp_config, box, monkeypatch, first):
+    """同じスタンプの初回生成と再生成は同時に生成へ入れない（STEP 2e: 生成の実行権）。登録前に repair を挟んでも壊れない。
+
+    先に実行権を取った側だけが生成し、後から始めた側は「始めなかった」（claimed=False）で、画像を作らない。
+    先の処理が終わって実行権が外れたら、後の処理を改めて始められる。
+    """
     folder = vr.variant_dir(tmp_config, "001")
     folder.mkdir(parents=True, exist_ok=True)
     (folder / "v001.png").write_bytes(_png())
@@ -268,27 +273,48 @@ def test_initial_regen_and_repair_together(client, tmp_config, box, monkeypatch)
     vr.update(tmp_config, put)
     vr.set_verdict(tmp_config, "001", "v001", "regen")
     watch = _Watch(monkeypatch)
-    _repair_before_registration(monkeypatch, tmp_config, times=10)
-    gate = threading.Barrier(2, timeout=WAIT)
+    repairs = _repair_before_registration(monkeypatch, tmp_config, times=20)
+    runs = {"initial": lambda: vr.run_initial(tmp_config, _entry(), 4, _generator(tmp_config)),
+            "regen": lambda: vr.run_regen(tmp_config, _entry(), 2, _generator(tmp_config))}
+    second = "initial" if first == "regen" else "regen"
+    run_key = {"initial": "initial_run", "regen": "regen_run"}
+    lock_path = tmp_config.variants_path.with_name("variants.run-001.lock")
+    in_call, release = threading.Event(), threading.Event()
 
-    def both(path):
-        try:
-            gate.wait()
-        except threading.BrokenBarrierError:
-            pass
-    box["before"] = both
+    def hold_first_call(path):
+        if not in_call.is_set():
+            in_call.set()
+            assert release.wait(WAIT)
+    box["before"] = hold_first_call
     out = {}
-    threads = [threading.Thread(target=lambda: out.__setitem__(
-                   "initial", vr.run_initial(tmp_config, _entry(), 4, _generator(tmp_config)))),
-               threading.Thread(target=lambda: out.__setitem__(
-                   "regen", vr.run_regen(tmp_config, _entry(), 2, _generator(tmp_config))))]
-    [t.start() for t in threads]
-    [t.join(WAIT) for t in threads]
-    assert out["initial"]["complete"] and out["regen"]["complete"]
+    leader = threading.Thread(target=lambda: out.__setitem__(first, runs[first]()))
+    leader.start()
+    assert in_call.wait(WAIT)                                    # 先の処理が実行権を持って API を呼んでいる
+    before = _record(tmp_config)
+    files_before = sorted(p.name for p in folder.iterdir())
+    refused = runs[second]()                                     # 後から始めようとした処理
+    assert refused["claimed"] is False and refused["complete"] is False
+    assert box["calls"] == 1                                     # 後の処理は API を呼ばない
+    assert sorted(p.name for p in folder.iterdir()) == files_before    # 画像も作らない
+    after = _record(tmp_config)
+    assert after.get(run_key[second]) == before.get(run_key[second])   # 後の処理の記録にも触れない
+    assert lock_path.exists()
+    release.set()
+    leader.join(WAIT)
+    assert out[first]["claimed"] is True and out[first]["complete"] is True
+    assert not lock_path.exists()                                # 実行権は外れた
+    record = _record(tmp_config)
+    assert run_key[first] not in record                          # 先の処理の記録は片付いた
+    _assert_consistent(tmp_config)
+
+    box["before"] = None
+    later = runs[second]()                                       # 実行権が外れた後は、改めて始められる
+    assert later["claimed"] is True and later["complete"] is True
     ids = _assert_consistent(tmp_config)
     assert sorted(ids) == ["v001", "v002", "v003", "v004", "v005"] and box["calls"] == 4
     record = _record(tmp_config)
-    assert "initial_run" not in record and "regen_run" not in record and watch.problems == []
+    assert "initial_run" not in record and "regen_run" not in record and not lock_path.exists()
+    assert repairs["n"] == 4 and watch.problems == []           # 登録の前に毎回 repair を挟んだ
 
 
 def test_many_generations_with_repeated_repair(client, tmp_config, box):

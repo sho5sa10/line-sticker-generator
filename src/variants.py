@@ -644,6 +644,50 @@ def adopt_lock(config, sticker_id: str, timeout: float = LOCK_TIMEOUT_SEC):
     return file_lock(_adopt_lock_path(config, sticker_id), timeout)
 
 
+# --- 生成の実行権（Phase 7 STEP 2e） ----------------------------------------
+# 同じスタンプの候補生成（GUI の初回生成・再生成、CLI の generate --variants）を、
+# プロセスをまたいで同時に走らせないための鍵です。生成を始めるときに待たずに1回だけ取り、
+# 生成が終わるまで持ちます（API の呼び出し中も）。記録の鍵・スタンプの鍵とは別物で、
+# 採用・repair・候補の登録はこの鍵を取りません（止めません）。取れる・取れないの判定と開始を、
+# ロックファイルの作成1回で行うので、「確認してから始める」間の隙間はありません。
+# 異常終了で残った鍵は、ほかの鍵と同じく持ち主（pid・ホスト・起動時刻）で古さを判定して外します。
+GENERATION_BUSY_MESSAGE = "このスタンプは別の処理で生成中です（GUI または CLI）。完了を待ってから実行してください"
+
+
+def _generation_lock_path(config, sticker_id: str) -> Path:
+    return config.variants_path.with_name(f"variants.run-{sticker_id}.lock")
+
+
+@contextmanager
+def generation_lock(config, sticker_id: str):
+    """1スタンプの生成の実行権。取れなければ GenerationBusyError（待ちません）。"""
+    locks = ExitStack()
+    try:
+        locks.enter_context(file_lock(_generation_lock_path(config, sticker_id), wait=False))
+    except LockBusyError as exc:
+        raise GenerationBusyError(f"{sticker_id}: {GENERATION_BUSY_MESSAGE}") from exc
+    with locks:
+        yield
+
+
+def _claim_generation(config, sticker_id: str) -> ExitStack:
+    """実行権を取って返します（with で使うと、抜けるときに返します）。取れなければ GenerationBusyError。"""
+    locks = ExitStack()
+    locks.enter_context(generation_lock(config, sticker_id))
+    return locks
+
+
+def generation_running_elsewhere(config, sticker_id: str) -> bool:
+    """ほかの処理（別のスレッド・プロセス）が、このスタンプの実行権を持っているか（計画・表示用）。
+
+    実際に始めるかどうかは generation_lock の取得で決まります（ここは確認だけで、排他はしません）。
+    """
+    path = _generation_lock_path(config, sticker_id)
+    if str(path) in _held_keys() or not path.exists():
+        return False
+    return not _lock_is_stale(path)
+
+
 UNCHANGED = object()    # update() の mutate がこれを返したら、保存しません（変更なし）
 
 
@@ -1314,6 +1358,9 @@ def regen_plan(config, sticker_ids, count: int) -> dict:
         if decision.get("busy"):
             busy.append(sid)
         elif decision["remaining"] > 0:
+            if generation_running_elsewhere(config, sid):     # 別の処理（GUI / CLI）がこのスタンプを生成中
+                busy.append(sid)
+                continue
             targets.append({"id": sid, "count": decision["remaining"],
                             "resume": bool(decision.get("resume"))})
     return {"targets": targets, "total": sum(t["count"] for t in targets), "busy": busy}
@@ -1391,12 +1438,23 @@ def run_regen(config, entry, count: int, generator, *, on_start=None, on_event=N
               should_stop=None) -> dict:
     """1スタンプの再生成を最後まで行います（GUI のジョブが1スタンプずつ呼びます）。
 
-    始める → 候補を作る（番号の予約と登録は、それぞれ記録の鍵の中の1回の保存）→ 締める。
-    API を呼んでいる間は鍵を持ちません。
+    生成の実行権を取る → 始める → 候補を作る（番号の予約と登録は、それぞれ記録の鍵の中の1回の保存）
+    → 締める → 実行権を返す。API を呼んでいる間は記録の鍵を持ちません（実行権だけを持ちます）。
+    同じスタンプを別の処理（GUI / CLI）が生成中なら、始めません。
 
     Returns:
         {"claimed": 始めたか, "remaining": 作ろうとした枚数, "complete": 全部作れたか}
     """
+    try:
+        run_lock = _claim_generation(config, entry.id)
+    except GenerationBusyError:
+        return {"claimed": False, "remaining": 0, "complete": False}
+    with run_lock:
+        return _run_regen_locked(config, entry, count, generator, on_start=on_start, on_event=on_event,
+                                 should_stop=should_stop)
+
+
+def _run_regen_locked(config, entry, count: int, generator, *, on_start, on_event, should_stop) -> dict:
     claim = begin_regen(config, entry.id, count)
     if claim is None:
         return {"claimed": False, "remaining": 0, "complete": False}
@@ -1503,6 +1561,8 @@ def initial_plan(config, sticker_ids, count: int) -> dict:
     targets, skipped, busy = [], [], []
     for sid in sticker_ids:
         decision = _initial_decide(config, sid, stickers.get(sid), count, apply=False)
+        if "skip" not in decision and generation_running_elsewhere(config, sid):
+            decision = {"skip": INITIAL_SKIP_RUNNING}      # 別の処理（GUI / CLI）がこのスタンプを生成中
         if "skip" in decision:
             skipped.append({"id": sid, "reason": decision["skip"]})
             if decision["skip"] == INITIAL_SKIP_RUNNING:
@@ -1580,13 +1640,24 @@ def run_initial(config, entry, count: int, generator, *, on_start=None, on_event
                 should_stop=None) -> dict:
     """1スタンプの初回生成を最後まで行います（GUI のジョブが1スタンプずつ呼びます）。
 
-    始める → 候補を作る（番号の予約と登録は、それぞれ記録の鍵の中の1回の保存）→ 締める。
-    API を呼んでいる間は鍵を持ちません。
+    生成の実行権を取る → 始める → 候補を作る（番号の予約と登録は、それぞれ記録の鍵の中の1回の保存）
+    → 締める → 実行権を返す。API を呼んでいる間は記録の鍵を持ちません（実行権だけを持ちます）。
+    同じスタンプを別の処理（GUI / CLI）が生成中なら、始めません。
 
     Returns:
         {"claimed": 候補を作り始めたか, "closed": 作らずに締めたか, "recovered": 作らずに登録した枚数,
          "remaining": 作ろうとした枚数, "complete": 全部そろったか}
     """
+    try:
+        run_lock = _claim_generation(config, entry.id)
+    except GenerationBusyError:
+        return {"claimed": False, "closed": False, "recovered": 0, "remaining": 0, "complete": False}
+    with run_lock:
+        return _run_initial_locked(config, entry, count, generator, on_start=on_start, on_event=on_event,
+                                   should_stop=should_stop)
+
+
+def _run_initial_locked(config, entry, count: int, generator, *, on_start, on_event, should_stop) -> dict:
     begun = begin_initial(config, entry.id, count)
     if begun is None:
         return {"claimed": False, "closed": False, "recovered": 0, "remaining": 0, "complete": False}
@@ -1651,6 +1722,10 @@ class LockBusyError(VariantError):
 
 class StickerLockNeeded(LockBusyError):
     """記録の無いスタンプの原画をコピーするのに、スタンプの鍵が必要（update_sticker がやり直す）。"""
+
+
+class GenerationBusyError(LockBusyError):
+    """同じスタンプを、別の処理（GUI または CLI）が生成中（生成の実行権を取れない）。"""
 
 
 class StateBusyError(VariantError):

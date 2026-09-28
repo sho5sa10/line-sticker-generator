@@ -868,7 +868,11 @@ runpy.run_module("src.main", run_name="__main__")
 
 
 def test_cli_and_initial_api_at_the_same_time(client, tmp_config, box):
-    """API の初回生成がプロバイダを呼んでいる間に、CLI の --variants を実プロセスで実行する。"""
+    """API の初回生成がプロバイダを呼んでいる間に、CLI の --variants を実プロセスで実行する。
+
+    同じスタンプを GUI が生成中なので、CLI は始めない（STEP 2e: 生成の実行権）。
+    候補は GUI が要求した枚数だけで、合算されない。
+    """
     in_call, release = threading.Event(), threading.Event()
 
     def hold(path):
@@ -878,6 +882,7 @@ def test_cli_and_initial_api_at_the_same_time(client, tmp_config, box):
     box["before"] = hold
     r = client.post("/api/variants/initial", json={"ids": ["001"], "count": 3, "expected_total": 3}, headers=GUI)
     assert r.status_code == 200 and in_call.wait(WAIT)
+    seq_during = _record(tmp_config)["next_seq"]                 # GUI が v001 を予約した後
     env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONPATH": str(PROJECT),
            "OPENAI_API_KEY": "test-dummy-not-used", "OPENAI_BASE_URL": "http://127.0.0.1:9"}
     p = subprocess.run([sys.executable, "-c", _CLI, str(PROJECT), str(tmp_config.path), "2"],
@@ -885,13 +890,17 @@ def test_cli_and_initial_api_at_the_same_time(client, tmp_config, box):
                        cwd=tmp_config.root)
     release.set()
     _join_jobs()
-    assert p.returncode == 0, (p.stdout, p.stderr)
+    assert p.returncode == 1, (p.stdout, p.stderr)                # 拒否（EXIT_ERROR）
+    assert "別の処理で生成中" in p.stderr
+    assert not (tmp_config.root / "cli_calls.txt").exists()      # CLI は API を呼ばない
     record = _record(tmp_config)                                 # JSON として読める
     ids = _ids(tmp_config)
-    assert sorted(ids) == ["v001", "v002", "v003", "v004", "v005"] and len(set(ids)) == 5
-    assert record["next_seq"] == 6 and "initial_run" not in record
-    cli_calls = (tmp_config.root / "cli_calls.txt").read_text(encoding="utf-8").split()
-    assert box["calls"] == 3 and sorted(cli_calls) == ["v002.png.part", "v003.png.part"]   # CLI は予約の間の番号
+    assert ids == ["v001", "v002", "v003"] and len(set(ids)) == 3          # GUI の3枚だけ
+    assert record["next_seq"] == 4 and record["next_seq"] >= seq_during   # 後退しない
+    assert "initial_run" not in record
+    assert box["calls"] == 3
+    job = client.get("/api/job").get_json()["job"]
+    assert job["status"] == "finished" and job["api_calls"] == 3
     for vid in ids:
         assert vr._is_complete_png(vr.variant_dir(tmp_config, "001") / f"{vid}.png")
     assert not list(tmp_config.root.glob("network-*.txt"))

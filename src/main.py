@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from contextlib import ExitStack
 from pathlib import Path
 
 from . import gallery as gallery_mod
@@ -411,7 +412,18 @@ def _generate_variants(config, args, entries) -> int:
         mark = {"generated": "OK", "error": "NG"}.get(status, status)
         print(f"  {sticker_id} {variant_id or '-'} {mark} {detail}".rstrip())
 
-    results = vr.generate_variants(config, entries, count, generator, on_event=show)
+    # 同じスタンプを GUI や別の CLI が生成中なら始めません（生成の実行権。待たずに取り、終わるまで持ちます）。
+    # 対象のスタンプをすべて取れたときだけ始めるので、一部だけ作って止まることはありません
+    run_locks = ExitStack()
+    try:
+        for sticker_id in sorted({e.id for e in entries}):
+            run_locks.enter_context(vr.generation_lock(config, sticker_id))
+    except vr.GenerationBusyError as exc:
+        run_locks.close()
+        print(str(exc), file=sys.stderr)
+        return EXIT_ERROR
+    with run_locks:
+        results = vr.generate_variants(config, entries, count, generator, on_event=show)
     ok = sum(1 for r in results if r["status"] == "generated")
     ng = [r for r in results if r["status"] == "error"]
     print("-" * 72)
