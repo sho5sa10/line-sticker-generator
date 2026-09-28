@@ -1205,6 +1205,39 @@ $('#btn-render').addEventListener('click', () => runRender([...state.selected].s
 const INITIAL_SKIP_LABEL = { has_candidates: '候補あり', has_original: '原画あり', running: '実行中' };
 
 /**
+ * 確認画面の文（dry-run の結果から）。表示する枚数は、画面で選んだ枚数ではなく
+ * 「今回 API を呼んで作る枚数」（targets[].count）です。途中で止まった実行の続きは、
+ * 最初に選んだ枚数の残りだけを作るため、選んだ枚数と一致しないことがあります。
+ * expected_total は実行時の確認用の値なので、ここには出しません（送信には使います）。
+ */
+function initialConfirmLines(plan) {
+  const usd = plan.usd === null || plan.usd === undefined
+    ? '不明' : `約 $${plan.usd.toFixed(2)} USD（${plan.model} / ${plan.quality}）`;
+  const lines = ['最初の候補を作ります。', '', '今回 API を呼んで作る枚数:'];
+  plan.targets.forEach((t) => {
+    let what;
+    if (!t.resume) {
+      what = `${t.count}枚`;
+    } else if (t.count > 0) {
+      what = `続き 残り${t.count}枚`
+        + (t.recovered ? `（前回できていた${t.recovered}枚はAPIを呼ばずに登録）` : '');
+    } else {
+      what = t.recovered
+        ? `続き 作る枚数なし（前回できていた${t.recovered}枚を登録して完了します）`
+        : '続き 作る枚数なし（記録を完了にします）';
+    }
+    lines.push(`  ${t.id}: ${what}`);
+  });
+  lines.push('', `合計: ${plan.total}枚`, `推定費用: ${usd}`);
+  if (plan.skipped.length) {
+    lines.push('', '対象外:');
+    plan.skipped.forEach((s) => lines.push(`  ${s.id}: ${INITIAL_SKIP_LABEL[s.reason] || s.reason}`));
+  }
+  lines.push('', '生成しただけでは採用しません。候補比較の画面で選んで採用してください。', '', '実行しますか？');
+  return lines;
+}
+
+/**
  * まず dry-run で対象・枚数・費用を出し（APIは呼ばず、何も書きません）、確認できたら、
  * 確認画面で見た合計枚数（expected_total）を添えて実行します。キャンセルなら何もしません。
  */
@@ -1218,25 +1251,7 @@ async function startInitial(ids) {
     toast('最初の候補を作れるスタンプがありません（候補・原画があるか、実行中です）', true);
     return;
   }
-  const usd = plan.usd === null ? '不明' : `約 $${plan.usd.toFixed(2)} USD（${plan.model} / ${plan.quality}）`;
-  const resumed = plan.targets.filter((t) => t.resume);
-  const recovered = plan.targets.reduce((a, t) => a + (t.recovered || 0), 0);
-  const lines = [
-    '最初の候補を作ります。',
-    `対象スタンプ: ${plan.target_count}件（${plan.target_ids.join(', ')}）`,
-    `1スタンプあたり: ${plan.count}枚`,
-    `合計: ${plan.total}枚（expected_total: ${plan.expected_total}）`,
-    `推定費用: ${usd}`,
-  ];
-  if (resumed.length) {
-    lines.push(`うち途中からの続き: ${resumed.length}件（残りの枚数だけ作ります`
-      + `${recovered ? `。前回できていた ${recovered}枚はAPIを呼ばずに登録` : ''}）`);
-  }
-  if (plan.skipped.length) {
-    lines.push(`対象外: ${plan.skipped.map((s) => `${s.id}（${INITIAL_SKIP_LABEL[s.reason] || s.reason}）`).join(', ')}`);
-  }
-  lines.push('', '生成しただけでは採用しません。候補比較の画面で選んで採用してください。', '実行しますか？');
-  if (!confirm(lines.join('\n'))) return;
+  if (!confirm(initialConfirmLines(plan).join('\n'))) return;
   try {
     resetJobUi('最初の候補を作っています');
     await api('/api/variants/initial', {

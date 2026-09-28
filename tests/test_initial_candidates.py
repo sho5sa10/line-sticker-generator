@@ -962,3 +962,100 @@ def test_gui_has_the_initial_controls_and_uses_the_initial_api():
     assert "AIで作り直す" in js                    # 既存のボタンは残す（別の操作）
     # 一覧の画像・バッジから比較画面を開く条件は canCompare
     assert "canCompare(sticker)" in js and "canCompare(s)" in js
+
+
+# ===========================================================================
+# 確認画面の文（L-2・I-1）: 実際の dry-run の応答を app.js の initialConfirmLines に渡して確かめる
+# ===========================================================================
+def _confirm_lines(plan: dict) -> list[str]:
+    src = APP_JS.read_text(encoding="utf-8")
+    label = re.search(r"^const INITIAL_SKIP_LABEL = .*?;$", src, re.M)
+    assert label, "app.js に INITIAL_SKIP_LABEL がありません"
+    code = (f"{label.group(0)}\n{_js_function('initialConfirmLines')}\n"
+            f"console.log(JSON.stringify(initialConfirmLines({json.dumps(plan, ensure_ascii=False)})))")
+    return _node(code)
+
+
+def _assert_no_old_or_internal_wording(lines):
+    text = "\n".join(lines)
+    assert "1スタンプあたり" not in text                     # 旧表示（選んだ枚数）は出さない
+    assert "expected_total" not in text                      # I-1: 内部の項目名は出さない
+    return text
+
+
+def _stop_after(client, box, requested, fail_on):
+    """001 を requested 枚で始め、fail_on 枚目の API 呼び出しを失敗させて、途中で止まった実行を作る。"""
+    def fail(path):
+        if box["calls"] == fail_on:
+            raise ProviderError("偽の失敗")
+    box["before"] = fail
+    _run(client, ["001"], requested)
+    box["before"] = None
+
+
+def test_confirm_lists_the_count_for_new_stickers(client, tmp_config):
+    plan = _plan(client, ["001", "002"], 4).get_json()
+    lines = _confirm_lines(plan)
+    _assert_no_old_or_internal_wording(lines)
+    assert lines[:5] == ["最初の候補を作ります。", "", "今回 API を呼んで作る枚数:", "  001: 4枚", "  002: 4枚"]
+    assert "合計: 8枚" in lines and lines[-1] == "実行しますか？"
+    assert any(line.startswith("推定費用: ") and "USD" in line for line in lines)
+
+
+def test_confirm_shows_only_the_rest_of_a_stopped_run(client, tmp_config, box):
+    """8枚を要求して7枚できた実行を、画面の 4枚のまま再開: 表示も実際の生成も「残り1枚」。"""
+    _stop_after(client, box, requested=8, fail_on=8)
+    run = _record(tmp_config)["initial_run"]
+    assert (run["count"], len(run["done"]), run["owner"]) == (8, 7, None)
+    plan = _plan(client, ["001"], 4).get_json()
+    lines = _confirm_lines(plan)
+    text = _assert_no_old_or_internal_wording(lines)
+    assert "  001: 続き 残り1枚" in lines and "  001: 4枚" not in lines
+    assert "合計: 1枚" in lines and "4枚" not in text
+    calls = box["calls"]
+    _run(client, ["001"], 4)
+    assert box["calls"] - calls == 1 and len(_ids(tmp_config)) == 8     # 実際にも残りの1枚だけ
+    assert "initial_run" not in _record(tmp_config)
+
+
+def test_confirm_for_resumed_and_new_stickers_together(client, tmp_config, box):
+    _stop_after(client, box, requested=8, fail_on=8)
+    plan = _plan(client, ["001", "002"], 4).get_json()
+    lines = _confirm_lines(plan)
+    _assert_no_old_or_internal_wording(lines)
+    assert lines[2:5] == ["今回 API を呼んで作る枚数:", "  001: 続き 残り1枚", "  002: 4枚"]
+    assert "合計: 5枚" in lines
+    calls = box["calls"]
+    _run(client, ["001", "002"], 4)
+    assert box["calls"] - calls == 5                                      # 001 は残り1枚、002 は新規4枚
+    assert len(_ids(tmp_config, "001")) == 8 and len(_ids(tmp_config, "002")) == 4
+
+
+def test_confirm_for_a_resume_with_nothing_to_generate(client, tmp_config, box):
+    """API を呼ばずに登録して締めるだけの続き（前回できていた画像がある）。"""
+    folder = vr.variant_dir(tmp_config, "001")
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "v001.png").write_bytes(_png())
+    _put_run(tmp_config, count=1, owner=None, reserved=["v001"])
+    plan = _plan(client, ["001"], 4).get_json()
+    assert [(t["count"], t["resume"], t["recovered"]) for t in plan["targets"]] == [(0, True, 1)]
+    lines = _confirm_lines(plan)
+    _assert_no_old_or_internal_wording(lines)
+    assert "  001: 続き 作る枚数なし（前回できていた1枚を登録して完了します）" in lines
+    assert "合計: 0枚" in lines
+
+
+def test_confirm_lists_skipped_stickers_with_their_reason(client, tmp_config):
+    plan = _plan(client, ["001", "003", "004"], 2).get_json()
+    lines = _confirm_lines(plan)
+    _assert_no_old_or_internal_wording(lines)
+    i = lines.index("対象外:")
+    assert lines[i + 1:i + 3] == ["  003: 候補あり", "  004: 原画あり"]
+    assert "  001: 2枚" in lines and "合計: 2枚" in lines
+
+
+def test_confirm_hides_expected_total_but_the_request_still_sends_it():
+    """I-1: 画面には出さない。実行時の確認用の値として、送信には必ず使う。"""
+    assert "expected_total" not in _js_function("initialConfirmLines")   # 確認画面の文では使わない
+    start = re.search(r"^async function startInitial\(.*?^}", APP_JS.read_text(encoding="utf-8"), re.S | re.M)
+    assert start and "expected_total: plan.expected_total" in start.group(0)
