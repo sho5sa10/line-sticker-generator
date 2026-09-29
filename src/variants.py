@@ -293,7 +293,7 @@ def _read_state_file(config) -> tuple[str, dict | None]:
             f"  少し待ってからやり直してください（{type(exc).__name__}: {exc}）") from exc
     try:
         data = json.loads(text)
-    except ValueError:
+    except (ValueError, RecursionError):    # 入れ子が深すぎる JSON は RecursionError になります
         return STATE_CORRUPT, None
     if not isinstance(data, dict) or not isinstance(data.get("stickers"), dict):
         return STATE_CORRUPT, None
@@ -474,6 +474,22 @@ def _this_host() -> str:
     return socket.gethostname()
 
 
+# 記録（ロックファイル・variants.json の owner）から読んだ PID として受け付ける上限。
+# Windows は OpenProcess の引数（DWORD）、それ以外は os.kill の引数（pid_t。主要な OS では符号付き 32 ビット）です。
+# 超える値は、Windows では下位 32 ビットに切り詰められて別のプロセス（自分自身のことも）を指し、
+# それ以外では OverflowError になるため、OS には渡しません。
+_PID_MAX = 0xFFFFFFFF if os.name == "nt" else 0x7FFFFFFF
+
+
+def _valid_pid(pid) -> bool:
+    """記録から読んだ PID を、OS に問い合わせてよい値か（正の整数で、OS の PID の範囲内）。
+
+    真偽値（bool は int の一種）・0・負の数・小数・文字列・範囲外の整数は無効です。無効な PID は、
+    呼び出し元がこれまでの「pid が整数でない」場合と同じに扱います（鍵は時間で判断・実行は止まったもの）。
+    """
+    return isinstance(pid, int) and not isinstance(pid, bool) and 0 < pid <= _PID_MAX
+
+
 def _process_start(pid: int) -> tuple[bool, int | None]:
     """(生きているか, 起動時刻の目印)。起動時刻は PID の再利用を見分けるために使います。
 
@@ -552,10 +568,12 @@ def _lock_is_stale(lock_path: Path) -> bool:
         info = json.loads(text)
         if not isinstance(info, dict):
             raise ValueError
-    except ValueError:
-        info = {"pid": int(text)} if text.isdigit() else {}   # 以前の形式（PID だけ）
+    except (ValueError, RecursionError):  # 入れ子が深すぎる JSON は RecursionError になります
+        # 以前の形式（PID だけ）。"²" や桁数の多すぎる数字でも例外にせず、読めない鍵として扱います
+        legacy_pid = _decimal_int(text)
+        info = {"pid": legacy_pid} if legacy_pid is not None else {}
     pid = info.get("pid")
-    if not isinstance(pid, int):
+    if not _valid_pid(pid):               # 読めない・範囲外の PID は、持ち主の分からない鍵と同じ
         return age > LOCK_STALE_SEC
     if info.get("host") not in (None, _this_host()):
         return age > LOCK_STALE_SEC       # 別のPCのプロセスは確かめられない
@@ -810,16 +828,112 @@ def _legacy_consumed(record) -> tuple[int, set[str]]:
     """legacy の番号を探し始める番号（記録の next_seq）と、使えない番号（候補・実行の予約と完了）。"""
     if not isinstance(record, dict):
         return 1, set()
-    used = {str(v.get("variant_id")) for v in record.get("variants") or [] if isinstance(v, dict)}
+    return _next_seq_of(record), _recorded_numbers(record)
+
+
+def _variant_items(record) -> list:
+    """記録の候補の一覧（variants）。list でなければ空として扱います（例外にしません）。
+
+    variants が list でない記録（手で編集した・壊れた記録）は、候補0件の記録と同じに扱います
+    （ensure_record が [] に直し、repair は候補フォルダの画像から作り直します）。
+    """
+    variants = record.get("variants") if isinstance(record, dict) else None
+    return variants if isinstance(variants, list) else []
+
+
+def _recorded_numbers(record) -> set[str]:
+    """記録にある候補の番号と、実行の記録（initial_run / regen_run）の予約・完了の番号。"""
+    if not isinstance(record, dict):
+        return set()
+    used = {str(v.get("variant_id")) for v in _variant_items(record) if isinstance(v, dict)}
     for key in ("initial_run", "regen_run"):
         run = record.get(key)
         if isinstance(run, dict):
             for field in ("reserved", "done"):
                 if isinstance(run.get(field), list):
                     used.update(v for v in run[field] if isinstance(v, str))
-    seq = record.get("next_seq")
-    start = seq if isinstance(seq, int) and not isinstance(seq, bool) and seq >= 1 else 1
-    return start, used
+    return used
+
+
+def _stored_next_seq(record) -> int | None:
+    """記録の next_seq を、正の整数として読みます（next_seq を読むときは必ずここを通します）。
+
+    アプリは整数で保存しますが、古い・手で編集した記録も考えて、整数・小数点以下が 0 の数（5.0）・
+    数字だけの文字列（"5"）は受け付けます。null・0・負の数・真偽値・それ以外の値は読めない（None）とします。
+    """
+    value = record.get("next_seq") if isinstance(record, dict) else None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, float) and value.is_integer():
+        number = int(value)
+    elif isinstance(value, str) and _decimal_int(value.strip()) is not None:
+        number = _decimal_int(value.strip())
+    else:
+        return None
+    return number if number >= 1 else None
+
+
+def _decimal_int(text) -> int | None:
+    """10 進の数字だけの文字列を整数にします。読めない場合は None（例外にしません）。
+
+    isdigit() は "²" のように int() が変換できない文字も真にするため、isdecimal() で確かめたうえで、
+    変換そのものの失敗（桁数が多すぎる等）も None にします。
+    """
+    if not isinstance(text, str) or not text.isdecimal():
+        return None
+    try:
+        return int(text)
+    except (ValueError, OverflowError):
+        return None
+
+
+def _variant_number(variant_id) -> int | None:
+    """候補の番号（"v001" → 1）。形が崩れている番号・0 以下（v000）は None（例外にしません）。
+
+    保存されている候補・予約・完了の番号を読むときは、必ずここを通します。
+    """
+    if not isinstance(variant_id, str) or variant_id[:1] != "v":
+        return None
+    number = _decimal_int(variant_id[1:])
+    return number if number is not None and number >= 1 else None
+
+
+# 採番・保存に使う番号の上限（実装上の安全限界。枚数の仕様上の上限ではありません）。
+# 番号はファイル名（書き込み途中は v<番号>.png.part）になるため、一般的なファイルシステムの
+# ファイル名の長さの上限（255 文字）に収まる桁数（245 桁）までです。読むこと（_stored_next_seq・
+# _variant_number）とは別で、これを超える値は読めても採番には使いません。そのまま使うと、API を
+# 呼んだ後で画像を書き込めない・+1 した値が整数の文字列変換の上限（4300 桁）を超えて保存できないためです。
+_FILENAME_MAX = 255
+VARIANT_NUMBER_MAX = 10 ** (_FILENAME_MAX - len("v.png.part")) - 1
+
+
+def _allocatable_number(variant_id) -> int | None:
+    """採番・保存に使える候補の番号（_variant_number で読めて、VARIANT_NUMBER_MAX 以下）。"""
+    number = _variant_number(variant_id)
+    return number if number is not None and number <= VARIANT_NUMBER_MAX else None
+
+
+def _allocatable_next_seq(record) -> int | None:
+    """採番に使える next_seq（_stored_next_seq で読めて、最後の番号の次 VARIANT_NUMBER_MAX + 1 以下）。"""
+    stored = _stored_next_seq(record)
+    return stored if stored is not None and stored <= VARIANT_NUMBER_MAX + 1 else None
+
+
+def _next_seq_of(record) -> int:
+    """次に払い出す番号。記録の next_seq が読めなければ、安全な既定値を使います。
+
+    既定値は「記録にある候補と、実行の記録の予約・完了の番号の次」（最低でも候補の数 + 1）です。
+    読めない値のときに 1 などへ戻すと、予約済み・使用済みの番号をもう一度使ってしまうためです。
+    読めても採番に使えない大きさ（VARIANT_NUMBER_MAX を参照）の値も、読めない値と同じに扱います。
+    """
+    stored = _allocatable_next_seq(record)
+    if stored is not None:
+        return stored
+    numbers = [n for n in map(_allocatable_number, _recorded_numbers(record)) if n is not None]
+    count = len(_variant_items(record))
+    return max(max(numbers, default=0) + 1, count + 1)
 
 
 def _initial_run_open(record) -> bool:
@@ -835,7 +949,7 @@ def get_sticker(config, sticker_id: str, data: dict | None = None) -> StickerVar
         return ensure_legacy_variant(config, sticker_id)
 
     variants: list[Variant] = []
-    for item in record.get("variants") or []:
+    for item in _variant_items(record):
         v = _variant_from_dict(item)
         if v is not None:
             variants.append(v)
@@ -849,8 +963,8 @@ def get_sticker(config, sticker_id: str, data: dict | None = None) -> StickerVar
     adopted = record.get("adopted")
     if adopted is not None and not any(v.variant_id == adopted for v in variants):
         adopted = None      # 実在しない候補を指していたら「未採用」として扱います
-    next_seq = record.get("next_seq")
-    if not isinstance(next_seq, int) or next_seq < len(variants) + 1:
+    next_seq = _stored_next_seq(record)
+    if next_seq is None or next_seq < len(variants) + 1:
         next_seq = len(variants) + 1
     return StickerVariants(
         sticker_id=sticker_id,
@@ -956,8 +1070,8 @@ def ensure_record(config, data: dict, sticker_id: str) -> dict:
     """
     stickers = data.setdefault("stickers", {})
     record = stickers.get(sticker_id)
-    if isinstance(record, dict) and record.get("variants"):
-        record.setdefault("next_seq", len(record["variants"]) + 1)
+    if isinstance(record, dict) and _variant_items(record):   # list でない variants は候補0件と同じ
+        record["next_seq"] = _next_seq_of(record)       # 無い・読めない値は安全な既定値に
         return record
 
     legacy = None if _initial_run_open(record) else ensure_legacy_variant(config, sticker_id, record)
@@ -983,16 +1097,16 @@ def ensure_record(config, data: dict, sticker_id: str) -> dict:
         return fresh
 
     # 候補0件の既存の記録: 候補と採用の項目だけを整え、それ以外はそのまま残します
-    reserved = record.get("next_seq")
     if legacy is not None:
         record.update({k: v for k, v in fresh.items() if k != "next_seq"})
     else:
         for key, value in fresh.items():
-            record.setdefault(key, value)
+            if key != "next_seq":
+                record.setdefault(key, value)
         if not isinstance(record.get("variants"), list):
             record["variants"] = []
-    valid = isinstance(reserved, int) and not isinstance(reserved, bool) and reserved >= 1
-    record["next_seq"] = max(reserved, fresh["next_seq"]) if valid else fresh["next_seq"]
+    # 予約（next_seq）は後退させません。読めない値なら、予約・使用済みの番号の次を既定値にします
+    record["next_seq"] = max(_next_seq_of(record), fresh["next_seq"])
     return record
 
 
@@ -1058,17 +1172,43 @@ def allocate_variant(config, record: dict, sticker_id: str) -> tuple[str, Path]:
     欠番は再利用しません。生成に失敗しても番号は消費したままにします
     （APIが課金されている可能性があるため、同じ番号を使い回さないほうが安全です）。
     """
-    seq = int(record.get("next_seq", len(record.get("variants", [])) + 1))
-    used = {str(v.get("variant_id")) for v in record.get("variants", []) if isinstance(v, dict)}
+    seq = _next_seq_of(record)                  # 無い・読めない値は安全な既定値（0・負の番号にしない）
+    used = {str(v.get("variant_id")) for v in _variant_items(record) if isinstance(v, dict)}
     folder = variant_dir(config, sticker_id)
     # 記録に無くてもファイルがあれば飛ばします（中断後の再実行で上書きしないため）。
     # 書き込み途中の一時ファイル（.png.part）も同じです（課金済みの画像の可能性があるため）
     while (f"v{seq:03d}" in used or (folder / f"v{seq:03d}.png").exists()
            or (folder / f"v{seq:03d}.png.part").exists()):
         seq += 1
+    if seq > VARIANT_NUMBER_MAX:
+        # API を呼ぶ前（番号の確保）で止めます。記録は変えません
+        raise VariantError(f"{sticker_id}: 候補の番号が上限（ファイル名に使える桁数）に達したため、"
+                           "これ以上候補を作れません")
     variant_id = f"v{seq:03d}"
+    path = folder / f"{variant_id}.png"
+    _ensure_part_writable(path, sticker_id)     # API を呼ぶ前に、書き込み先を実際に作れるか確かめます
     record["next_seq"] = seq + 1
-    return variant_id, folder / f"{variant_id}.png"
+    return variant_id, path
+
+
+def _ensure_part_writable(path: Path, sticker_id: str) -> None:
+    """画像の書き込み先（generate_one が使う <番号>.png.part）を、API を呼ぶ前に実際に作って確かめます。
+
+    作れない場所（Windows で長いパスが無効なときの 260 文字以上のパスなど）へ、API を呼んだ後に
+    書き込もうとして失敗する（課金済みの画像を失う）ことを防ぎます。長さを計算せず実際に作るのは、
+    上限が OS・設定・パスの書き方で変わるためです。Path.exists() は長すぎるパスでも例外にせず False を
+    返すため、判定には使えません。確かめた空のファイルはすぐ消します（記録の鍵の中で呼ぶため、
+    ほかの採番と重なりません）。作れなければ記録を変えずに VariantError にします。
+    """
+    part = path.with_suffix(".png.part")        # generate_one と同じ組み立て方
+    try:
+        part.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(part, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except OSError as exc:
+        raise VariantError(f"{sticker_id}: 候補の画像の書き込み先を作れないため、生成しません"
+                           f"（API は呼んでいません。{type(exc).__name__}: {part}）") from exc
+    os.close(fd)
+    _retry_io(lambda: part.unlink(missing_ok=True))
 
 
 def register_variant(config, record: dict, variant_id: str, path: Path, *, meta: dict) -> dict:
@@ -1079,7 +1219,7 @@ def register_variant(config, record: dict, variant_id: str, path: Path, *, meta:
     （間に付いた判断・評価は上書きしません）。別のファイルを指していれば、矛盾なので例外にします。
     """
     file = relative_file(config, path)
-    existing = next((v for v in record.get("variants") or []
+    existing = next((v for v in _variant_items(record)
                      if isinstance(v, dict) and v.get("variant_id") == variant_id), None)
     if existing is not None:
         if existing.get("file") != file:
@@ -1098,7 +1238,10 @@ def register_variant(config, record: dict, variant_id: str, path: Path, *, meta:
         "note": "",
     }
     item.update(meta)
-    record.setdefault("variants", []).append(item)
+    # 続きの取り込み（_recover_reserved）は ensure_record を通らないため、ここでも同じく直します
+    if not isinstance(record.get("variants"), list):
+        record["variants"] = []
+    record["variants"].append(item)
     return item
 
 
@@ -1221,7 +1364,7 @@ def _regen_requested(record: dict, done_at: str | None = None) -> bool:
     （実行を始めた時刻）。それより後に付けた・付け直した印（regen_marked_at が新しい）は未処理です。
     日時の無い以前のデータは、regen_generated_at が無ければ未処理とみなします。
     """
-    marks = [v for v in record.get("variants") or []
+    marks = [v for v in _variant_items(record)
              if isinstance(v, dict) and v.get("verdict") == VERDICT_REGEN]
     if not marks:
         return False
@@ -1259,7 +1402,7 @@ def _forget_ended_run(token: str) -> None:
 
 def _regen_owner_alive(owner) -> bool:
     """再生成を実行中の処理が、まだ動いているか（落ちていれば、途中で止まった実行として続きから）。"""
-    if not isinstance(owner, dict) or not isinstance(owner.get("pid"), int):
+    if not isinstance(owner, dict) or not _valid_pid(owner.get("pid")):
         return False
     token = owner.get("token")
     if isinstance(token, str):
@@ -1290,7 +1433,7 @@ def _regen_resumable(record: dict, run: dict) -> bool:
     根拠に作ることはしません（付け直した新しい印は、新しい実行の対象になります）。
     """
     since = run.get("since")
-    for item in record.get("variants") or []:
+    for item in _variant_items(record):
         if not isinstance(item, dict) or item.get("verdict") != VERDICT_REGEN:
             continue
         marked = item.get("regen_marked_at")
@@ -1317,7 +1460,7 @@ def _recover_reserved(config, sticker_id: str, record: dict, run: dict, *, apply
     apply=True なら .part を正式な名前に置き換え、未登録なら meta を付けて登録し、done に加えます。
     """
     done = run.get("done") or []
-    known = {v.get("variant_id") for v in record.get("variants") or [] if isinstance(v, dict)}
+    known = {v.get("variant_id") for v in _variant_items(record) if isinstance(v, dict)}
     recovered = 0
     for variant_id in run.get("reserved") or []:
         if variant_id in done:
@@ -1579,7 +1722,7 @@ def _initial_decide(config, sticker_id: str, record, count: int, *, apply: bool)
         if not isinstance(planned, int) or isinstance(planned, bool):
             planned = made                      # 枚数の分からない記録は、作れた分で締めます
         return {"resume": True, "run": work, "remaining": max(planned - made, 0), "recovered": recovered}
-    if isinstance(record, dict) and record.get("variants"):
+    if _variant_items(record):
         return {"skip": INITIAL_SKIP_CANDIDATES}
     if (config.dir_generated / f"{sticker_id}.png").exists():
         return {"skip": INITIAL_SKIP_ORIGINAL}
@@ -2082,6 +2225,20 @@ def list_all(config, sticker_ids, data: dict | None = None) -> dict[str, Sticker
 _VARIANT_FILE = "v[0-9][0-9][0-9].png"
 
 
+def _variant_files(folder: Path) -> list[Path]:
+    """repair が候補として取り込む画像。3桁の名前（従来どおり）と、v1000.png 以降の名前です。
+
+    番号は 999 の次に v1000 と4桁以上になる（f"v{seq:03d}"）ため、3桁の名前だけでは
+    1000番以降の候補を取り込めません。4桁以上は、アプリが付ける形（先頭が 0 でない・上限以内）だけです。
+    """
+    files = set(folder.glob(_VARIANT_FILE))
+    for path in folder.glob("v[0-9][0-9][0-9][0-9]*.png"):
+        number = _allocatable_number(path.stem)
+        if number is not None and path.stem == f"v{number:03d}":
+            files.add(path)
+    return sorted(files)
+
+
 REPAIR_OK = "ok"                    # 記録は正常
 REPAIR_CORRUPT = "corrupt"          # 壊れていたので退避して作り直した
 REPAIR_MISSING = "missing"          # 記録ファイルが無い
@@ -2140,14 +2297,14 @@ def repair_state(config) -> dict:
                 # 画像ができてから登録するまでの間に取り込むと、同じ番号が二重に登録されるため加えません
                 active = _live_run_reservations(record)
                 files = []
-                for path in sorted((root / sid).glob(_VARIANT_FILE)):
+                for path in _variant_files(root / sid):
                     if path.stem in active:
                         continue
                     if _is_readable_png(path):
                         files.append(path)
                     else:
                         report["unreadable"].append(relative_file(config, path))
-                if isinstance(record, dict) and record.get("variants"):
+                if _variant_items(record):      # list でない variants は、候補0件として作り直します
                     added = _add_missing_variants(config, record, files)
                     if added:
                         report["stickers"][sid] = {"added": added, "adopted": record.get("adopted"),
@@ -2186,9 +2343,9 @@ def _add_missing_variants(config, record: dict, files: list[Path]) -> list[str]:
             added.append(path.stem)
     if added:
         record["variants"].sort(key=lambda v: str(v.get("variant_id", "")) if isinstance(v, dict) else "")
-        highest = max(int(v["variant_id"][1:]) for v in record["variants"]
-                      if isinstance(v, dict) and str(v.get("variant_id", ""))[1:].isdigit())
-        record["next_seq"] = max(int(record.get("next_seq") or 1), highest + 1)
+        numbers = (_allocatable_number(v.get("variant_id")) for v in record["variants"] if isinstance(v, dict))
+        highest = max((n for n in numbers if n is not None), default=0)
+        record["next_seq"] = max(_next_seq_of(record), highest + 1)
     return added
 
 
@@ -2215,7 +2372,9 @@ def _rebuild_record(config, sticker_id: str, files: list[Path], existing=None) -
         record["adopted"] = match["variant_id"]
         stat = generated.stat()
         record["adopted_file"] = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns, "sha1": gen_sha}
-    record["next_seq"] = max(int(v["variant_id"][1:]) for v in items) + 1
+    # 番号はファイル名から読むため、_add_missing_variants と同じ読み方にします（v000・崩れた番号は数えません）
+    numbers = (_allocatable_number(v["variant_id"]) for v in items)
+    record["next_seq"] = max((n for n in numbers if n is not None), default=0) + 1
     return record
 
 
@@ -2256,8 +2415,8 @@ def _merge_rebuilt_record(existing: dict, rebuilt: dict) -> dict:
         else:
             merged.pop(key, None)            # 作り直した採用状態と食い違う古い目印は残しません
     seqs = [rebuilt["next_seq"]]
-    kept = existing.get("next_seq")
-    if isinstance(kept, int) and not isinstance(kept, bool):
+    kept = _allocatable_next_seq(existing)
+    if kept is not None:
         seqs.append(kept)
     for key in _RUN_KEYS:
         run = existing.get(key)
@@ -2265,8 +2424,9 @@ def _merge_rebuilt_record(existing: dict, rebuilt: dict) -> dict:
             continue
         numbers = [v for k in ("reserved", "done") if isinstance(run.get(k), list) for v in run[k]]
         for variant_id in numbers:
-            if isinstance(variant_id, str) and variant_id[1:].isdigit():
-                seqs.append(int(variant_id[1:]) + 1)
+            number = _allocatable_number(variant_id)
+            if number is not None:
+                seqs.append(number + 1)
     merged["next_seq"] = max(seqs)
     return merged
 
