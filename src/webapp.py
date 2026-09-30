@@ -1374,12 +1374,12 @@ def create_app(config=None) -> Flask:
                         issue.message, sticker_id)
             if report.ok:
                 job.log("ok", f"完了 ({size_bytes / 1024:.0f}KB)", sticker_id)
-                state.set(sticker_id, "complete")
+                state.record(sticker_id, "complete")
             else:
-                state.set(sticker_id, "validation_failed", report.errors[0].message)
+                state.record(sticker_id, "validation_failed", report.errors[0].message)
         except Exception as exc:  # noqa: BLE001 - 1件の失敗で全体を止めない
             job.log("error", f"{type(exc).__name__}: {exc}", sticker_id)
-            state.set(sticker_id, "error", str(exc))
+            state.record(sticker_id, "error", str(exc))
 
     @app.post("/api/generate")
     def api_generate():

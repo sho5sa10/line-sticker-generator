@@ -139,6 +139,20 @@ class StateStore:
         }
         self.save()
 
+    def record(self, sticker_id: str, status: str, detail: str = "") -> bool:
+        """進捗を記録します（set と同じ記録）。保存できなくても例外にせず、警告して False を返します。
+
+        state.json は進捗の記録で、生成済みかどうかは画像ファイルで判断しています。そのため、生成・仕上げ・
+        取り込みの本体は、記録の保存の失敗（ディスクの I/O）で止めません。捕まえるのは保存先の I/O の
+        失敗（OSError）だけで、それ以外の例外は呼び出し元へ届きます。メモリの記録は保存の前に更新済みです。
+        """
+        try:
+            self.set(sticker_id, status, detail)
+        except OSError as exc:
+            self._warn(f"進捗（{sticker_id} {status}）を保存できませんでした（{type(exc).__name__}: {exc}）")
+            return False
+        return True
+
     def status(self, sticker_id: str) -> str | None:
         entry = self.data["stickers"].get(sticker_id)
         return entry.get("status") if isinstance(entry, dict) else None   # 形の違う項目は「記録なし」

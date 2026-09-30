@@ -139,8 +139,8 @@ def _import_image_locked(config, entry: StickerEntry, data: bytes, style, logger
         logger.event(entry.id, "TEXT RENDERED", f"{size_bytes / 1024:.0f}KB")
         logger.event(entry.id, "VALIDATION PASS" if report.ok else "VALIDATION FAIL")
     if state:
-        state.set(entry.id, "imported" if report.ok else "validation_failed",
-                  "" if report.ok else report.errors[0].message)
+        state.record(entry.id, "imported" if report.ok else "validation_failed",
+                     "" if report.ok else report.errors[0].message)
 
     return ImportResult(
         entry.id,

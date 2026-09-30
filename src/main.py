@@ -339,14 +339,14 @@ def cmd_generate(config, args) -> int:
                     if report.ok:
                         logger.event(entry.id, "VALIDATION PASS")
                         logger.event(entry.id, "COMPLETE")
-                        state.set(entry.id, "complete")
+                        state.record(entry.id, "complete")
                     else:
                         logger.event(entry.id, "VALIDATION FAIL", report.errors[0].message)
-                        state.set(entry.id, "validation_failed", report.errors[0].message)
+                        state.record(entry.id, "validation_failed", report.errors[0].message)
                         failed.append(entry.id)
                 except Exception as exc:  # noqa: BLE001 - 1件の失敗で全体を止めない
                     logger.error(entry.id, f"{type(exc).__name__}: {exc}")
-                    state.set(entry.id, "error", str(exc))
+                    state.record(entry.id, "error", str(exc))
                     counts["error"] += 1
                     failed.append(entry.id)
         except vr.LockBusyError as exc:

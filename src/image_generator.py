@@ -145,7 +145,7 @@ class ImageGenerator:
                 tmp.replace(out)
                 self.logger.event(entry.id, "IMAGE GENERATED", str(out.name))
                 if not variant_mode:
-                    self.state.set(entry.id, "generated")
+                    self.state.record(entry.id, "generated")
                 return GenerationResult(entry.id, "generated", out, prompt)
 
             except RetryableProviderError as exc:
@@ -162,7 +162,7 @@ class ImageGenerator:
 
         self.logger.error(entry.id, last_error or "unknown error")
         if not variant_mode:
-            self.state.set(entry.id, "error", last_error)
+            self.state.record(entry.id, "error", last_error)
         return GenerationResult(entry.id, "error", None, prompt, last_error)
 
     # ------------------------------------------------------------------
