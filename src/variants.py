@@ -1148,6 +1148,12 @@ def _materialize_legacy(config, sticker_id: str, variant: Variant, record=None) 
     src_sha = sha1_file(src)
     stamp = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns, "sha1": src_sha}
     dest, reuse = _legacy_slot(config, sticker_id, src, src_sha, record=record)
+    if _allocatable_number(dest.stem) is None:
+        # 番号の上限（VARIANT_NUMBER_MAX）を超える番号には置きません（書き込む前・記録を変える前に止めます）。
+        # _legacy_slot は表示（get_sticker）でも使うため、上限の確認は書き込むここだけで行います
+        raise VariantError(f"{sticker_id}: 原画を候補として置く番号（{len(dest.stem) - 1} 桁）が上限"
+                           f"（{len(str(VARIANT_NUMBER_MAX))} 桁）を超えるため、保存できません。"
+                           "variants.json の next_seq を確認してください")
     if not reuse:
         _copy_verified(src, dest, src_sha)
     return _with_id_and_file(config, variant, dest), stamp
