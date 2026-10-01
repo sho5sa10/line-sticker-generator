@@ -35,9 +35,12 @@ function toast(message, bad = false) {
   el._timer = setTimeout(() => el.classList.remove('show'), 3200);
 }
 
+/** GUI からの操作であることを示す印。別サイトからの書き換えをサーバー側で弾くために付けます。 */
+const CLIENT_HEADER = { 'X-Sticker-Client': '1' };
+
 async function api(path, options = {}) {
   const res = await fetch(path, {
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'X-Sticker-Client': '1' },
     ...options,
     body: options.body ? JSON.stringify(options.body) : undefined,
   });
@@ -609,7 +612,8 @@ $('#btn-master-upload').addEventListener('click', async () => {
   const form = new FormData();
   form.append('file', file);
   try {
-    const res = await fetch('/api/master/upload', { method: 'POST', body: form });
+    const res = await fetch('/api/master/upload',
+                            { method: 'POST', body: form, headers: CLIENT_HEADER });
     const d = await res.json();
     if (!res.ok) throw new Error(d.error || 'アップロードに失敗しました');
     toast(d.backup
@@ -908,9 +912,30 @@ function gridFilter() {
     || (v === 'unsold' ? !s.sale : s.sale === v));
 }
 
+/**
+ * 「最初の候補を作る」を出すスタンプか。候補が1件も無く、原画も無いもの（原画の仮想の v001 と
+ * 混ぜないため）、または途中で止まった初回生成があるもの（続きから）。実行中のものには出しません。
+ * 最終的な対象はサーバーが確かめ直します。
+ */
+function canStartInitial(s) {
+  if (s.initial_run === 'running') return false;
+  if (s.initial_run === 'pending') return true;
+  return (s.variant_count || 0) === 0 && !s.has_raw;
+}
+
+/**
+ * 候補の比較画面を開けるスタンプか。候補が2件以上、または未採用の候補が1件
+ * （初回生成で作った候補を選んで採用するため）。原画の v001 だけ（採用中の1件）は従来どおり拡大表示。
+ */
+function canCompare(s) {
+  const n = s.variant_count || 0;
+  return n >= 2 || (n >= 1 && !s.adopted);
+}
+
 function cellHtml(s) {
   const sel = state.selected.has(s.id);
-  let thumb = '<span class="empty">未生成</span>';
+  let thumb = (s.variant_count || 0) >= 1 && !s.adopted
+    ? `<span class="empty">候補${s.variant_count}案・未採用</span>` : '<span class="empty">未生成</span>';
   let tag = '';
   if (s.has_final) {
     thumb = `<img loading="lazy" src="/img/final/${s.id}.png?t=${s.final_mtime}" alt="${escapeHtml(s.text)}">`;
@@ -920,14 +945,37 @@ function cellHtml(s) {
     tag = '<span class="tag raw">原画のみ</span>';
   }
   const sale = s.sale ? `<span class="sale-badge ${s.sale}">${SALE_LABELS[s.sale]}</span>` : '';
+  // 比較できる候補があるときだけ小さなバッジを出します（候補が無いセルは今までどおりの見た目）
+  const variants = canCompare(s)
+    ? `<span class="tag variants" data-variants="${s.id}" title="候補を見比べる">${s.variant_count}案</span>`
+    : '';
+  // 候補がまだ無いスタンプ（途中で止まった初回生成の続きを含む）にだけ出します
+  const initial = canStartInitial(s)
+    ? `<div class="rowbtns"><button class="btn initial" data-act="initial"
+         data-tip="候補がまだ無いスタンプに、最初の候補を作ります（課金されます。枚数は上の「最初の候補を作る」の横で選べます。生成しただけでは採用しません）">${
+        s.initial_run === 'pending' ? '最初の候補の続きを作る' : '最初の候補を作る'}</button></div>`
+    : '';
+  // flags は保存済みの値があるときだけ表示します（ここでは計算しません）
+  const vflag = (s.flags || []).length
+    ? `<span class="tag vflag" title="${escapeHtml(s.flags.join(' / '))}">⚠</span>` : '';
+  // 採用した候補と、いま使われている原画が食い違っている（作り直し・取り込みで差し替わった）
+  // 巻き戻しの失敗のほうが重大なので、同じ場所に優先して出します（表示が重ならないように）
+  const mismatch = s.rollback_failed
+    ? '<span class="tag mismatch" title="採用に失敗し、元の画像へ戻す処理も完了できませんでした。'
+      + '候補比較の画面を開いて確認し、候補をもう一度採用してください">⚠巻き戻し失敗</span>'
+    : s.generated_mismatch
+      ? '<span class="tag mismatch" title="いまの原画は、採用した候補と違います。'
+        + '正しい候補をもう一度採用してください">⚠原画</span>' : '';
   return `
-    <div class="cell ${sel ? 'selected' : ''} ${s.sale ? `sale-${s.sale}` : ''}" data-id="${s.id}">
+    <div class="cell ${sel ? 'selected' : ''} ${s.sale ? `sale-${s.sale}` : ''}
+         ${s.generated_mismatch || s.rollback_failed ? 'mismatch' : ''}" data-id="${s.id}">
       <input class="pick" type="checkbox" ${sel ? 'checked' : ''} aria-label="選択">
-      ${sale}${tag}
+      ${sale}${variants}${vflag}${mismatch}${tag}
       <div class="thumb" data-zoom="${s.id}">${thumb}</div>
       <div class="cid">${s.id}${s.size_kb ? ` · ${s.size_kb}KB` : ''}</div>
       <div class="ctext">${escapeHtml(s.text)}</div>
       <div class="meta">${escapeHtml(s.action || '')}</div>
+      ${initial}
       <div class="rowbtns">
         <button class="btn" data-act="upload"
                 data-tip="この番号に手持ちの画像を入れます。文字入れ・検証まで自動で行います（無料）">画像を入れる</button>
@@ -941,7 +989,26 @@ function cellHtml(s) {
     </div>`;
 }
 
+/** 候補の記録ファイルが壊れていたら、一覧の上に警告と修復ボタンを出します。 */
+function renderVariantsState() {
+  const corrupt = !!(state.info && state.info.variants_state === 'corrupt');
+  $('#variants-corrupt').hidden = !corrupt;
+}
+
+$('#btn-variants-repair').addEventListener('click', async () => {
+  if (!confirm('壊れた記録ファイルを別名で残し、候補フォルダの画像から記録を作り直します。\n'
+               + '判断・評価は失われます（画像は消えません）。修復しますか？')) return;
+  try {
+    const d = await api('/api/variants/repair', { method: 'POST', body: {} });
+    const n = Object.keys(d.report.stickers || {}).length;
+    toast(`記録を修復しました（候補を戻したスタンプ: ${n}件）`
+      + (d.report.quarantined ? '。壊れたファイルは別名で残しています' : ''));
+    await loadState();
+  } catch (e) { toast(`✕ 修復できませんでした：${e.message}`, true); }
+});
+
 function renderGrid() {
+  renderVariantsState();
   const shown = gridFilter();
   let html;
   if ($('#grid-by-genre').checked) {
@@ -1014,6 +1081,12 @@ $('#grid').addEventListener('click', async (e) => {
     updateSelectionUi();
     return;
   }
+  // 候補バッジ、または比較できる候補があるスタンプの画像 → 候補の比較画面
+  if (e.target.closest('[data-variants]')
+      || (e.target.closest('[data-zoom]') && canCompare(sticker))) {
+    openVariantModal(id);
+    return;
+  }
   const zoom = e.target.closest('[data-zoom]');
   if (zoom) {
     if (!sticker.has_final && !sticker.has_raw) return;
@@ -1029,6 +1102,10 @@ $('#grid').addEventListener('click', async (e) => {
     input.dataset.target = id;
     input.value = '';
     input.click();
+    return;
+  }
+  if (act === 'initial') {
+    startInitial([id]);
     return;
   }
   if (act === 'regen') {
@@ -1091,6 +1168,7 @@ async function updateSelectionUi() {
   if (packageMode() === 'selected') updatePlan();
   $('#btn-generate').disabled = n === 0;
   $('#btn-render').disabled = n === 0;
+  $('#btn-initial').disabled = n === 0;
 
   const force = $('#opt-force').checked;
   const willCall = force
@@ -1123,6 +1201,67 @@ $('#btn-generate').addEventListener('click', async () => {
 
 $('#btn-render').addEventListener('click', () => runRender([...state.selected].sort()));
 
+/* --- 最初の候補を作る（Phase 7）: 候補がまだ無いスタンプだけ。既存の「AIで作り直す」とは別の操作 --- */
+const INITIAL_SKIP_LABEL = { has_candidates: '候補あり', has_original: '原画あり', running: '実行中' };
+
+/**
+ * 確認画面の文（dry-run の結果から）。表示する枚数は、画面で選んだ枚数ではなく
+ * 「今回 API を呼んで作る枚数」（targets[].count）です。途中で止まった実行の続きは、
+ * 最初に選んだ枚数の残りだけを作るため、選んだ枚数と一致しないことがあります。
+ * expected_total は実行時の確認用の値なので、ここには出しません（送信には使います）。
+ */
+function initialConfirmLines(plan) {
+  const usd = plan.usd === null || plan.usd === undefined
+    ? '不明' : `約 $${plan.usd.toFixed(2)} USD（${plan.model} / ${plan.quality}）`;
+  const lines = ['最初の候補を作ります。', '', '今回 API を呼んで作る枚数:'];
+  plan.targets.forEach((t) => {
+    let what;
+    if (!t.resume) {
+      what = `${t.count}枚`;
+    } else if (t.count > 0) {
+      what = `続き 残り${t.count}枚`
+        + (t.recovered ? `（前回できていた${t.recovered}枚はAPIを呼ばずに登録）` : '');
+    } else {
+      what = t.recovered
+        ? `続き 作る枚数なし（前回できていた${t.recovered}枚を登録して完了します）`
+        : '続き 作る枚数なし（記録を完了にします）';
+    }
+    lines.push(`  ${t.id}: ${what}`);
+  });
+  lines.push('', `合計: ${plan.total}枚`, `推定費用: ${usd}`);
+  if (plan.skipped.length) {
+    lines.push('', '対象外:');
+    plan.skipped.forEach((s) => lines.push(`  ${s.id}: ${INITIAL_SKIP_LABEL[s.reason] || s.reason}`));
+  }
+  lines.push('', '生成しただけでは採用しません。候補比較の画面で選んで採用してください。', '', '実行しますか？');
+  return lines;
+}
+
+/**
+ * まず dry-run で対象・枚数・費用を出し（APIは呼ばず、何も書きません）、確認できたら、
+ * 確認画面で見た合計枚数（expected_total）を添えて実行します。キャンセルなら何もしません。
+ */
+async function startInitial(ids) {
+  const count = Number($('#initial-count').value);
+  let plan;
+  try {
+    plan = await api('/api/variants/initial', { method: 'POST', body: { ids, count, dry_run: true } });
+  } catch (e) { toast(e.message, true); return; }
+  if (!plan.target_count) {
+    toast('最初の候補を作れるスタンプがありません（候補・原画があるか、実行中です）', true);
+    return;
+  }
+  if (!confirm(initialConfirmLines(plan).join('\n'))) return;
+  try {
+    resetJobUi('最初の候補を作っています');
+    await api('/api/variants/initial', {
+      method: 'POST', body: { ids: plan.target_ids, count, expected_total: plan.expected_total },
+    });
+    startPolling();
+  } catch (e) { toast(e.message, true); closeJobBar(); }
+}
+$('#btn-initial').addEventListener('click', () => startInitial([...state.selected].sort()));
+
 /* ------------------------------------------------------------------ */
 /* 手持ち画像の取り込み（APIを呼ばない＝無料）                          */
 /* ------------------------------------------------------------------ */
@@ -1148,7 +1287,8 @@ $('#cell-file').addEventListener('change', async (e) => {
   const form = new FormData();
   form.append('file', file);
   try {
-    const res = await fetch(`/api/stickers/${encodeURIComponent(id)}/upload`, { method: 'POST', body: form });
+    const res = await fetch(`/api/stickers/${encodeURIComponent(id)}/upload`,
+                            { method: 'POST', body: form, headers: CLIENT_HEADER });
     const d = await res.json();
     if (!res.ok) throw new Error(d.error || d.message || '取り込みに失敗しました');
     const extra = d.issues && d.issues.length ? `（注意: ${d.issues[0]}）` : '';
@@ -1188,7 +1328,8 @@ $('#bulk-file').addEventListener('change', async (e) => {
     const form = new FormData();
     files.slice(i, i + CHUNK).forEach((f) => form.append('files', f));
     try {
-      const res = await fetch('/api/stickers/import', { method: 'POST', body: form });
+      const res = await fetch('/api/stickers/import',
+                              { method: 'POST', body: form, headers: CLIENT_HEADER });
       const d = await res.json();
       if (!res.ok) throw new Error(d.error || '取り込みに失敗しました');
       d.results.forEach((r) => {
@@ -1318,6 +1459,7 @@ async function pollJob() {
           job.status === 'failed');
     if (job.kind === 'master') await afterMasterChanged();
     else await refreshStickers();
+    if ((job.kind === 'variants' || job.kind === 'initial') && vstate.open) await reloadVariantModal();
   }
 }
 
@@ -1565,7 +1707,7 @@ async function refreshPreview() {
   try {
     const res = await fetch('/api/preview-text', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Sticker-Client': '1' },
       body: JSON.stringify(body),
     });
     if (!res.ok) {
@@ -2121,3 +2263,435 @@ $('#btn-llm-listing').addEventListener('click', (e) => withLlm(e.currentTarget, 
 }));
 
 refreshLlmStatus();
+
+/* ------------------------------------------------------------------ */
+/* 候補の比較・採用（Phase 2）                                          */
+/* ------------------------------------------------------------------ */
+/** いま比較している状態。スコアの計算はここでは一切しません。 */
+const vstate = { ids: [], index: 0, sticker: null, picked: 0, open: false, all: {}, busy: false };
+
+// verdict は「人がその候補に付けた判断」です。いま採用中かどうかは sticker.adopted が正なので、
+// 過去に採用したことがある候補は「過去に採用」と表示して、CURRENT と混同しないようにします。
+const VERDICT_LABEL = { pending: '未評価', adopted: '過去に採用', rejected: '除外', regen: '再生成したい' };
+
+/**
+ * カードに出す判断の表示。いま採用中の候補は「採用中」（★CURRENT と同じ意味）、
+ * 「過去に採用」は、いま採用中ではない候補にだけ付けます。
+ * 採用中の候補に人が「除外」などを付けている場合は、それも併記します。
+ */
+function verdictLabel(v, isCurrent) {
+  if (!isCurrent) return VERDICT_LABEL[v.verdict] || v.verdict;
+  if (v.verdict === 'adopted' || v.verdict === 'pending') return '採用中';
+  return `採用中（判断: ${VERDICT_LABEL[v.verdict] || v.verdict}）`;
+}
+
+function variantImageUrl(v, sticker_id) {
+  // legacy の候補は generated/ を指しています（コピーしていないため）
+  return v.source === 'legacy'
+    ? `/img/generated/${sticker_id}.png?t=${Date.now()}`
+    : `/img/variants/${sticker_id}/${v.variant_id}.png`;
+}
+
+function vmsg(text, kind = '') {
+  const el = $('#v-msg');
+  el.textContent = text;
+  el.className = `vmsg ${kind}`;
+}
+
+/**
+ * 候補が1件以上あるスタンプを順に見られます。開くのは canCompare のスタンプから
+ * （採用中の1件だけのものは、一覧では従来どおり拡大表示）。
+ */
+async function openVariantModal(stickerId) {
+  vstate.ids = gridFilter().filter((s) => (s.variant_count || 0) >= 1).map((s) => s.id);
+  vstate.index = Math.max(vstate.ids.indexOf(stickerId), 0);
+  vstate.open = true;
+  $('#variant-modal').hidden = false;
+  try {
+    // 選抜状況の集計用。一覧画面の表示では呼ばないので、既存画面は遅くなりません。
+    vstate.all = (await api('/api/variants')).stickers || {};
+  } catch (e) { vstate.all = {}; }
+  await loadVariantSticker();
+}
+
+function closeVariantModal() {
+  vstate.open = false;
+  $('#variant-modal').hidden = true;
+  vmsg('');
+  renderGrid();                    // 採用し直した結果（⚠原画の解消など）を一覧にも反映します
+}
+
+/** いま画面に出しているスタンプのID（閉じているときは null）。 */
+function shownStickerId() {
+  return vstate.open ? vstate.ids[vstate.index] : null;
+}
+
+/**
+ * 操作の応答を反映します。応答が届いた時点で、そのスタンプがまだ表示中のときだけ画面を
+ * 書き換えます（遅れて届いた応答で、別のスタンプの画面を上書きしないため）。
+ * 集計（vstate.all）と一覧の行は、表示中かどうかに関係なく最新にします。
+ */
+function applyStickerResponse(requestedId, sticker) {
+  if (!sticker || sticker.sticker_id !== requestedId) return false;
+  vstate.all[requestedId] = sticker;
+  const row = state.stickers.find((s) => s.id === requestedId);
+  if (row) {
+    row.adopted = sticker.adopted;
+    row.generated_mismatch = !!sticker.generated_mismatch;
+    row.rollback_failed = !!sticker.rollback_failed;
+  }
+  if (shownStickerId() !== requestedId) return false;
+  vstate.sticker = sticker;
+  return true;
+}
+
+async function loadVariantSticker() {
+  const id = vstate.ids[vstate.index];
+  const sticker = state.stickers.find((s) => s.id === id);
+  $('#v-title').textContent = `${id}「${sticker ? sticker.text : ''}」`;
+  $('#v-position').textContent = `[${vstate.index + 1} / ${vstate.ids.length}]`;
+  $('#v-cards').innerHTML = '<p class="hint">読み込み中…</p>';
+  // 読み込みが終わるまでは、前のスタンプのデータで操作できないようにします
+  vstate.sticker = null;
+  renderGeneratedMismatch();
+  let loaded;
+  try {
+    loaded = await api(`/api/variants/${id}`);
+  } catch (e) {
+    if (shownStickerId() === id) $('#v-cards').innerHTML = `<p class="hint">${escapeHtml(e.message)}</p>`;
+    return;
+  }
+  if (!applyStickerResponse(id, loaded)) return;     // その間に別のスタンプへ移動した
+  // 現在の採用は必ず sticker.adopted を使います（verdict では判定しません）
+  const adopted = vstate.sticker.adopted;
+  const pickedIdx = vstate.sticker.variants.findIndex((v) => v.variant_id === adopted);
+  vstate.picked = pickedIdx >= 0 ? pickedIdx : 0;
+  renderVariantCards();
+  renderVariantStats();
+  renderGeneratedMismatch();
+}
+
+/** 機械評価の説明（画面に出す短い日本語）。scoring.py の flags と1対1で対応します。 */
+const FLAG_LABEL = {
+  'gate:empty': '画像が空',
+  'gate:too_small': '描画が極端に小さい',
+  'gate:cropped': '体が画像の端で切れている',
+  'gate:low_contrast': '小さくすると見分けにくい',
+  'warn:low_coverage': '描画が小さめ',
+  'warn:fringe': '半透明のふちが多い',
+  'warn:many_colors': '色数が多い（グラデ/ノイズ）',
+  'warn:thin': '細い線が多く、小さいと潰れやすい',
+  'warn:small_margin': '余白が少なめ',
+};
+
+function flagText(flag) {
+  return `${FLAG_LABEL[flag] || flag}（${flag}）`;
+}
+
+/** 候補カードに出す機械評価。スコアから採用の可否を自動判断はしません。 */
+function variantScoreHtml(v) {
+  const s = v.derived_scores;
+  if (!s) {
+    return '<div class="vscore"><span class="vnone">機械評価: 未評価'
+      + '<button type="button" class="btn small ghost" data-vact="score">評価する</button></span></div>';
+  }
+  const gate = (v.flags || []).filter((f) => f.startsWith('gate:'));
+  const warn = (v.flags || []).filter((f) => f.startsWith('warn:'));
+  const num = (x) => (typeof x === 'number' ? x : '—');
+  return `
+    <div class="vscore">
+      <div class="vscore-row">
+        <span>品質 <b>${num(s.quality)}</b></span>
+        <span>視認性 <b>${num(s.visibility)}</b></span>
+        <button type="button" class="btn small ghost" data-vact="score"
+                title="この候補だけ再評価します（画像や採用状態は変わりません）">再評価</button>
+      </div>
+      <div class="vscore-na">一貫性 ${num(s.consistency)} ・ 重複 ${num(s.duplication)}
+        ・ セリフ適合 ${num(s.semantic)}（未評価）</div>
+      ${gate.map((f) => `<div class="vgate">⛔ 要確認: ${escapeHtml(flagText(f))}</div>`).join('')}
+      ${warn.map((f) => `<div class="vwarn">⚠ 注意: ${escapeHtml(flagText(f))}</div>`).join('')}
+      ${!gate.length && !warn.length ? '<div class="vok">✓ 機械チェックで問題なし</div>' : ''}
+    </div>`;
+}
+
+function renderVariantCards() {
+  const id = vstate.sticker.sticker_id;
+  const adopted = vstate.sticker.adopted;
+  const mismatch = !!vstate.sticker.generated_mismatch;   // 原画が差し替わっている
+  $('#v-cards').innerHTML = vstate.sticker.variants.map((v, i) => {
+    const isCurrent = v.variant_id === adopted;
+    const url = variantImageUrl(v, id);
+    const stars = [1, 2, 3, 4, 5].map((n) =>
+      `<button type="button" data-rate="${n}" class="${(v.human_rating || 0) >= n ? 'on' : ''}"
+         title="評価 ${n}（Shift+${n}）">★</button>`).join('');
+    const scoreBlock = variantScoreHtml(v);
+    return `
+      <div class="vcard ${i === vstate.picked ? 'picked' : ''} ${isCurrent ? 'current' : ''}
+           ${(v.flags || []).some((f) => f.startsWith('gate:')) ? 'has-gate' : ''}"
+           data-idx="${i}">
+        <div class="vcard-head">
+          <span class="vkey">${i + 1}</span>
+          <span>${escapeHtml(v.variant_id)}</span>
+          <small>${escapeHtml(v.source)}</small>
+          ${isCurrent ? '<span class="vcurrent">★ CURRENT</span>' : ''}
+        </div>
+        <div class="vpreview">
+          <img class="big" src="${url}" alt="${escapeHtml(v.variant_id)}">
+          <div class="vsmall">
+            <figure><img src="${url}" width="96" alt=""><figcaption>96px</figcaption></figure>
+            <figure><img src="${url}" width="74" alt=""><figcaption>74px</figcaption></figure>
+          </div>
+        </div>
+        <div class="vmeta">
+          <span class="vverdict ${isCurrent ? 'current' : v.verdict}">${verdictLabel(v, isCurrent)}</span>
+          <span class="vstars">${stars}</span>
+        </div>
+        ${scoreBlock}
+        <div class="vbtns">
+          <button class="btn primary" data-vact="adopt"
+                  ${isCurrent && !mismatch ? 'disabled' : ''}>
+            ${isCurrent ? (mismatch ? '採用し直す' : '採用済') : '採用'}</button>
+          <button class="btn" data-vact="rejected">除外</button>
+          <button class="btn" data-vact="regen">再生成</button>
+          <button class="btn ghost" data-vact="pending">保留</button>
+        </div>
+      </div>`;
+  }).join('') || '<p class="hint">候補がありません。</p>';
+}
+
+/** 採用した画像が、採用以外の操作（作り直し・取り込み）で差し替わっていたら知らせます。 */
+function renderGeneratedMismatch() {
+  const s = vstate.sticker;
+  const lines = [];
+  if (s && s.rollback_failed) {
+    lines.push('⚠ 前回の採用に失敗し、元の画像へ戻す処理も完了できませんでした。'
+      + `採用前の画像の控え: ${s.rollback_failed.backup}。候補をもう一度「採用」してください。`);
+  }
+  if (s && s.generated_mismatch) {
+    lines.push('⚠ いま使われている原画は、この採用候補と違います（作り直しや取り込みで差し替わっています）。'
+      + '正しい候補をもう一度「採用」してください。');
+  }
+  const el = $('#v-mismatch');
+  el.hidden = !lines.length;
+  el.textContent = lines.join('\n');
+}
+
+function renderVariantStats() {
+  // 「採用済み」は sticker.adopted があるかどうかで数えます（verdict=adopted の数ではありません）
+  const rows = vstate.ids.map((id) => vstate.all[id]).filter(Boolean);
+  const adopted = rows.filter((s) => s.adopted).length;
+  const regen = rows.filter((s) => (s.variants || []).some((v) => v.verdict === 'regen')).length;
+  $('#v-stats').innerHTML =
+    `採用済み <b>${adopted}</b> / ${vstate.ids.length}　`
+    + `未採用 <b>${vstate.ids.length - adopted}</b>　再生成 <b>${regen}</b>`;
+}
+
+function pickVariant(i) {
+  if (!vstate.sticker || i < 0 || i >= vstate.sticker.variants.length) return;
+  vstate.picked = i;
+  renderVariantCards();
+}
+
+function currentVariant() {
+  return vstate.sticker && vstate.sticker.variants[vstate.picked];
+}
+
+async function moveSticker(step) {
+  if (vstate.busy) return;
+  const next = vstate.index + step;
+  if (next < 0 || next >= vstate.ids.length) return;
+  vstate.index = next;
+  vmsg('');
+  await loadVariantSticker();
+}
+
+/**
+ * 操作の対象（表示中のスタンプと、選んでいる候補）。読み込み中や、表示とデータが
+ * 食い違っているときは null を返し、操作させません。
+ */
+function operationTarget() {
+  const id = shownStickerId();
+  const v = currentVariant();
+  if (!id || !v || !vstate.sticker || vstate.sticker.sticker_id !== id) return null;
+  return { id, v };
+}
+
+/** 採用（generated→final→検証は既存の variants.adopt に任せます）。 */
+async function adoptCurrent({ advance = false } = {}) {
+  if (vstate.busy) return false;
+  const target = operationTarget();
+  if (!target) return false;
+  const { id, v } = target;
+  // 原画が別の操作で差し替わっているときは、同じ候補でも採用し直して直せるようにします
+  if (vstate.sticker.adopted === v.variant_id && !vstate.sticker.generated_mismatch) {
+    vmsg(`${id}/${v.variant_id} はすでに採用中です`);
+    if (advance) await moveSticker(1);
+    return true;
+  }
+  vstate.busy = true;                       // 採用中は他の操作を受け付けません
+  vmsg(`${id}/${v.variant_id} を採用処理中…`, 'busy');
+  $$('#v-cards [data-vact]').forEach((b) => { b.disabled = true; });
+  let ok = false;
+  try {
+    const d = await api(`/api/variants/${id}/${v.variant_id}/adopt`, { method: 'POST', body: {} });
+    const shown = applyStickerResponse(id, d.sticker);
+    const row = state.stickers.find((s) => s.id === id);
+    if (row) { row.has_final = true; row.final_mtime = Date.now() / 1000; }
+    if (state.info) { state.info.validation = d.validation; state.info.packages_status = d.packages_status; }
+    if (shown) {
+      renderVariantCards();
+      renderGeneratedMismatch();
+    }
+    renderVariantStats();
+    vmsg(`✓ ${id}/${v.variant_id} を採用しました`, 'ok');
+    d.warnings.forEach((w) => toast(w, true));
+    ok = true;
+  } catch (e) {
+    vmsg(`✕ ${id}/${v.variant_id} の採用に失敗しました：${e.message}`, 'bad');
+    if (shownStickerId() === id && vstate.sticker) renderVariantCards();   // 比較はそのまま続けられます
+  } finally {
+    vstate.busy = false;
+  }
+  // 「採用して次へ」: 採用が終わって操作を受け付ける状態に戻ってから、同じスタンプを
+  // 表示したままのときだけ次へ進みます
+  if (ok && advance && shownStickerId() === id) await moveSticker(1);
+  return ok;
+}
+
+/** 候補1件の再評価。計算はサーバー側の scoring.py だけが行います。 */
+async function rescoreCurrent() {
+  if (vstate.busy) return;
+  const target = operationTarget();
+  if (!target) return;
+  const { id, v } = target;
+  vmsg(`${id}/${v.variant_id} を評価中…`, 'busy');
+  try {
+    const d = await api(`/api/variants/${id}/${v.variant_id}/score`, { method: 'POST', body: {} });
+    if (applyStickerResponse(id, d.sticker)) renderVariantCards();
+    vmsg(`${id}/${v.variant_id} を評価しました（式 ${d.formula}）`, 'ok');
+  } catch (e) { vmsg(`✕ ${id}/${v.variant_id}: ${e.message}`, 'bad'); }
+}
+
+async function setVerdict(verdict) {
+  if (vstate.busy) return;
+  const target = operationTarget();
+  if (!target) return;
+  const { id, v } = target;
+  try {
+    const d = await api(`/api/variants/${id}/${v.variant_id}/verdict`,
+                        { method: 'POST', body: { verdict } });
+    if (applyStickerResponse(id, d.sticker)) renderVariantCards();
+    renderVariantStats();
+    vmsg(`${id}/${v.variant_id} を「${VERDICT_LABEL[verdict]}」にしました`, 'ok');
+  } catch (e) { vmsg(`✕ ${id}/${v.variant_id}: ${e.message}`, 'bad'); }
+}
+
+async function setRating(rating) {
+  if (vstate.busy) return;
+  const target = operationTarget();
+  if (!target) return;
+  const { id, v } = target;
+  try {
+    const d = await api(`/api/variants/${id}/${v.variant_id}/rating`,
+                        { method: 'POST', body: { rating } });
+    if (applyStickerResponse(id, d.sticker)) renderVariantCards();
+    vmsg(`${id}/${v.variant_id} の評価を ${rating === null ? 'なし' : rating} にしました`, 'ok');
+  } catch (e) { vmsg(`✕ ${id}/${v.variant_id}: ${e.message}`, 'bad'); }
+}
+
+/* --- 再生成の候補を作る（Phase 6） --- */
+const REGEN_MAX_COUNT = 8;
+const REGEN_DEFAULT_COUNT = 4;
+for (let n = 1; n <= REGEN_MAX_COUNT; n++) {
+  $('#v-regen-count').insertAdjacentHTML('beforeend',
+    `<option value="${n}" ${n === REGEN_DEFAULT_COUNT ? 'selected' : ''}>${n}枚ずつ</option>`);
+  // 最初の候補の枚数も、再生成と同じ制限です
+  $('#initial-count').insertAdjacentHTML('beforeend',
+    `<option value="${n}" ${n === REGEN_DEFAULT_COUNT ? 'selected' : ''}>${n}枚ずつ</option>`);
+}
+
+/** 候補の比較画面を最新の記録で表示し直します（再生成が終わったあとなど）。 */
+async function reloadVariantModal() {
+  try { vstate.all = (await api('/api/variants')).stickers || {}; } catch (e) { /* 一覧は前のまま */ }
+  if (vstate.open) await loadVariantSticker();
+}
+
+/**
+ * 「再生成」の印があるスタンプに候補を作ります。まず dry-run で対象・枚数・費用を出し（APIは
+ * 使いません）、確認してから実行します。実行時は確認した合計を送り、変わっていたらサーバーが断ります。
+ */
+$('#v-regen').addEventListener('click', async () => {
+  if (vstate.busy) return;
+  const count = Number($('#v-regen-count').value);
+  let plan;
+  try {
+    plan = await api('/api/variants/generate',
+                     { method: 'POST', body: { regen_only: true, count, dry_run: true } });
+  } catch (e) { vmsg(`✕ ${e.message}`, 'bad'); return; }
+  if (!plan.total) {
+    vmsg('再生成の対象はありません（「再生成」の印が無いか、すでに作り終えています）');
+    return;
+  }
+  const usd = plan.usd === null ? '不明' : `約 $${plan.usd.toFixed(2)} USD (${plan.model} / ${plan.quality})`;
+  const lines = plan.targets.map((t) => `  ${t.id}: ${t.count}枚${t.resume ? '（前回の続き）' : ''}`);
+  const busy = plan.busy.length ? `\n（別の処理が実行中のため除外: ${plan.busy.join(', ')}）` : '';
+  if (!confirm(`再生成の対象: ${plan.targets.length}件\n候補の生成: ${plan.total}枚\n推定費用: ${usd}\n\n`
+               + `${lines.join('\n')}${busy}\n\n生成を開始しますか？（画像生成APIを使います）`)) return;
+  try {
+    resetJobUi('再生成の候補を作っています');
+    await api('/api/variants/generate',
+              { method: 'POST', body: { regen_only: true, count, expected_total: plan.total } });
+    startPolling();
+    vmsg(`再生成の候補を作っています（${plan.total}枚）`, 'busy');
+  } catch (e) {
+    closeJobBar();
+    vmsg(`✕ ${e.message}`, 'bad');
+    toast(e.message, true);
+  }
+});
+
+/* --- 操作 --- */
+$('#v-close').addEventListener('click', closeVariantModal);
+$('#v-prev').addEventListener('click', () => moveSticker(-1));
+$('#v-next').addEventListener('click', () => moveSticker(1));
+$('#variant-modal').addEventListener('click', (e) => {
+  if (e.target.id === 'variant-modal') closeVariantModal();
+});
+
+$('#v-cards').addEventListener('click', (e) => {
+  if (vstate.busy) return;                  // 採用処理中は操作を受け付けません
+  const card = e.target.closest('.vcard');
+  if (!card) return;
+  const idx = Number(card.dataset.idx);
+  if (idx !== vstate.picked) pickVariant(idx);
+
+  const star = e.target.closest('[data-rate]');
+  if (star) {
+    const n = Number(star.dataset.rate);
+    const cur = currentVariant();
+    setRating(cur && cur.human_rating === n ? null : n);   // 同じ星をもう一度押すと消す
+    return;
+  }
+  const act = e.target.dataset.vact;
+  if (act === 'adopt') adoptCurrent();
+  else if (act === 'score') rescoreCurrent();
+  else if (act) setVerdict(act);
+});
+
+document.addEventListener('keydown', (e) => {
+  if (!vstate.open) return;
+  if (vstate.busy && e.key !== 'Escape') { e.preventDefault(); return; }
+  const el = e.target;
+  if (el instanceof Element && el.matches('input, textarea, select')) return;
+  const key = e.key;
+  if (key === 'Escape') { closeVariantModal(); return; }
+  if (key === 'ArrowLeft') { e.preventDefault(); moveSticker(-1); return; }
+  if (key === 'ArrowRight') { e.preventDefault(); moveSticker(1); return; }
+  if (key === 'Enter') { e.preventDefault(); adoptCurrent({ advance: true }); return; }
+  if (key === 'x' || key === 'X') { setVerdict('rejected'); return; }
+  if (key === 'r' || key === 'R') { setVerdict('regen'); return; }
+  // Shift+1〜5 は評価、1〜9 は候補の選択（衝突しないように分けています）
+  if (e.shiftKey && '!"#$%'.includes(key)) { setRating('!"#$%'.indexOf(key) + 1); return; }
+  if (e.shiftKey && /^[1-5]$/.test(key)) { setRating(Number(key)); return; }
+  if (!e.shiftKey && /^[1-9]$/.test(key)) { pickVariant(Number(key) - 1); }
+});

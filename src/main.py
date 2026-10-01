@@ -17,12 +17,14 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from contextlib import ExitStack
 from pathlib import Path
 
 from . import gallery as gallery_mod
 from . import package_builder as pkg
 from . import pipeline
 from . import validator as vd
+from . import variants as vr
 from .config import ConfigError, load_config
 from .csv_loader import CsvLoadError, StickerEntry, filter_entries, load_stickers
 from .image_generator import ImageGenerator, MasterImageMissingError, check_master_image
@@ -265,6 +267,11 @@ def cmd_generate(config, args) -> int:
         print("対象のスタンプがありません。")
         return EXIT_ERROR
 
+    # --variants を付けたときだけ、候補生成という別の処理に分岐します。
+    # 付けない場合は、以下の従来どおりの処理をそのまま通ります。
+    if getattr(args, "variants", None):
+        return _generate_variants(config, args, entries)
+
     config.ensure_output_dirs()
     logger = RunLogger(config.log_path)
     state = StateStore(config.state_path)
@@ -307,35 +314,43 @@ def cmd_generate(config, args) -> int:
     failed: list[str] = []
 
     for entry in entries:
-        result = generator.generate_one(entry, force=args.force)
-        if result.status == "error":
-            counts["error"] += 1
-            failed.append(entry.id)
-            continue
-        counts[result.status] = counts.get(result.status, 0) + 1
-
-        if args.no_render:
-            continue
+        # GUI の採用・取り込み・生成と同じスタンプの鍵の中で行います（generated/final を
+        # 書き換えるため。鍵の順序は「スタンプ → 記録」で、ここでは記録の鍵は取りません）
         try:
-            path, size_bytes, warnings = render_final(config, entry, style)
-            logger.event(entry.id, "TEXT RENDERED", f"{size_bytes / 1024:.0f}KB")
-            for w in warnings:
-                logger.warn(f"{entry.id} {w}")
+            with vr.adopt_lock(config, entry.id):
+                result = generator.generate_one(entry, force=args.force)
+                if result.status == "error":
+                    counts["error"] += 1
+                    failed.append(entry.id)
+                    continue
+                counts[result.status] = counts.get(result.status, 0) + 1
 
-            report = vd.validate_sticker(path, config)
-            for issue in report.issues:
-                logger.warn(f"{entry.id} {issue.message}")
-            if report.ok:
-                logger.event(entry.id, "VALIDATION PASS")
-                logger.event(entry.id, "COMPLETE")
-                state.set(entry.id, "complete")
-            else:
-                logger.event(entry.id, "VALIDATION FAIL", report.errors[0].message)
-                state.set(entry.id, "validation_failed", report.errors[0].message)
-                failed.append(entry.id)
-        except Exception as exc:  # noqa: BLE001 - 1件の失敗で全体を止めない
-            logger.error(entry.id, f"{type(exc).__name__}: {exc}")
-            state.set(entry.id, "error", str(exc))
+                if args.no_render:
+                    continue
+                try:
+                    path, size_bytes, warnings = render_final(config, entry, style)
+                    logger.event(entry.id, "TEXT RENDERED", f"{size_bytes / 1024:.0f}KB")
+                    for w in warnings:
+                        logger.warn(f"{entry.id} {w}")
+
+                    report = vd.validate_sticker(path, config)
+                    for issue in report.issues:
+                        logger.warn(f"{entry.id} {issue.message}")
+                    if report.ok:
+                        logger.event(entry.id, "VALIDATION PASS")
+                        logger.event(entry.id, "COMPLETE")
+                        state.record(entry.id, "complete")
+                    else:
+                        logger.event(entry.id, "VALIDATION FAIL", report.errors[0].message)
+                        state.record(entry.id, "validation_failed", report.errors[0].message)
+                        failed.append(entry.id)
+                except Exception as exc:  # noqa: BLE001 - 1件の失敗で全体を止めない
+                    logger.error(entry.id, f"{type(exc).__name__}: {exc}")
+                    state.record(entry.id, "error", str(exc))
+                    counts["error"] += 1
+                    failed.append(entry.id)
+        except vr.LockBusyError as exc:
+            logger.error(entry.id, str(exc))
             counts["error"] += 1
             failed.append(entry.id)
 
@@ -353,6 +368,234 @@ def cmd_generate(config, args) -> int:
     return EXIT_OK
 
 
+def _generate_variants(config, args, entries) -> int:
+    """1セリフにつき複数の候補を output/variants/<id>/ に作ります。
+
+    採用中の原画 output/generated/<id>.png と完成画像 output/final/<id>.png には
+    一切触れません。採用は別コマンド（未実装）で行います。
+    """
+    count = int(args.variants)
+    if count < 1:
+        print("--variants は1以上を指定してください。", file=sys.stderr)
+        return EXIT_ERROR
+
+    config.ensure_output_dirs()
+    logger = RunLogger(config.log_path)
+    state = StateStore(config.state_path)
+    generator = ImageGenerator(config, logger, state, dry_run=args.dry_run)
+    total = len(entries) * count
+
+    if args.dry_run:
+        print(f"[DRY-RUN] APIは呼び出しません。{len(entries)}件 × {count}案 = {total}枚の予定")
+        for entry in entries:
+            print("=" * 72)
+            print(f"{entry.id} {entry.text} / {entry.action} / {entry.expression}")
+            print(generator.prompt_for(entry))
+        print("=" * 72)
+        _print_cost(generator, total)
+        return EXIT_OK
+
+    try:
+        check_master_image(config)
+    except MasterImageMissingError as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_ERROR
+
+    print(f"候補を作ります: {len(entries)}件 × {count}案 = API呼び出し {total}件")
+    print("（採用中の原画・完成画像は変更しません）")
+    _print_cost(generator, total)
+    if not args.yes and not _confirm("候補の生成を開始しますか？"):
+        print("中止しました。")
+        return EXIT_OK
+
+    def show(sticker_id, variant_id, status, detail):
+        mark = {"generated": "OK", "error": "NG"}.get(status, status)
+        print(f"  {sticker_id} {variant_id or '-'} {mark} {detail}".rstrip())
+
+    # 同じスタンプを GUI や別の CLI が生成中なら始めません（生成の実行権。待たずに取り、終わるまで持ちます）。
+    # 対象のスタンプをすべて取れたときだけ始めるので、一部だけ作って止まることはありません
+    run_locks = ExitStack()
+    try:
+        for sticker_id in sorted({e.id for e in entries}):
+            run_locks.enter_context(vr.generation_lock(config, sticker_id))
+    except vr.GenerationBusyError as exc:
+        run_locks.close()
+        print(str(exc), file=sys.stderr)
+        return EXIT_ERROR
+    with run_locks:
+        results = vr.generate_variants(config, entries, count, generator, on_event=show)
+    ok = sum(1 for r in results if r["status"] == "generated")
+    ng = [r for r in results if r["status"] == "error"]
+    print("-" * 72)
+    print(f"完了: 成功 {ok} / 失敗 {len(ng)}（保存先: {config.dir_variants}）")
+    if ng:
+        print("失敗した候補:", ", ".join(f"{r['id']}/{r['variant_id']}" for r in ng))
+        print(f"ログ: {config.log_path}")
+        return EXIT_ERROR
+    return EXIT_OK
+
+
+def cmd_variants_list(config, args) -> int:
+    """候補の一覧を表示します（ファイルは作りません）。"""
+    try:
+        entries = load_stickers(config.csv_path)
+    except CsvLoadError as exc:
+        print(f"ERROR:\n  {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    if getattr(args, "id", None):
+        entries = [e for e in entries if e.id == args.id]
+        if not entries:
+            print(f"ERROR:\n  CSVにIDがありません: {args.id}", file=sys.stderr)
+            return EXIT_ERROR
+
+    data = vr.load(config)
+    found = vr.list_all(config, [e.id for e in entries], data)
+    if not found:
+        print("候補はまだありません。")
+        return EXIT_OK
+
+    for entry in entries:
+        sticker = found.get(entry.id)
+        if sticker is None:
+            continue
+        print(f"\n{entry.id}「{entry.text}」")
+        # いま採用中かどうかは sticker.adopted が正（verdict は人の判断の履歴）
+        print(f"\nCURRENT: {sticker.adopted or '-'}")
+        print("\nVARIANTS")
+        print("─" * 56)
+        for v in sticker.variants:
+            rating = v.human_rating if v.human_rating is not None else "-"
+            flags = ",".join(v.flags) if v.flags else "-"
+            verdict = "REGEN" if v.verdict == vr.VERDICT_REGEN else v.verdict
+            missing = "" if v.exists(config) else "  (画像なし)"
+            print(f"{v.variant_id:<6}{v.source:<8}{verdict:<9}rating:{rating:<4}"
+                  f"flags:{flags}{missing}")
+        print("─" * 56)
+    return EXIT_OK
+
+
+def cmd_variants_score(config, args) -> int:
+    """候補を機械評価します（APIは呼びません。人の判断は変えません）。"""
+    from . import scoring
+
+    try:
+        entries = load_stickers(config.csv_path)
+    except CsvLoadError as exc:
+        print(f"ERROR:\n  {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    if getattr(args, "id", None):
+        entries = [e for e in entries if e.id == args.id]
+        if not entries:
+            print(f"ERROR:\n  CSVにIDがありません: {args.id}", file=sys.stderr)
+            return EXIT_ERROR
+
+    results = scoring.score_all(config, [e.id for e in entries], force=args.force)
+    if not results:
+        print("評価する候補がありません。")
+        return EXIT_OK
+
+    shown = ""
+    errors = 0
+    for r in results:
+        if r["id"] != shown:
+            shown = r["id"]
+            print(f"\n{shown}")
+        if r["status"] == "error":
+            errors += 1
+            print(f"  {r['variant_id']}  ERROR {r['detail']}")
+            continue
+        s = r["scores"] or {}
+        flags = ",".join(r["flags"]) if r["flags"] else "-"
+        mark = "" if r["status"] == "scored" else "（計算済み）"
+        print(f"  {r['variant_id']}  quality={s.get('quality')} "
+              f"visibility={s.get('visibility')} flags={flags} {mark}".rstrip())
+    scored = sum(1 for r in results if r["status"] == "scored")
+    print("-" * 56)
+    print(f"評価: {scored}件 / 変更なし {len(results) - scored - errors}件 / 失敗 {errors}件"
+          f"（式 {scoring.SCORING_FORMULA}）")
+    print("※ Gate が付いても候補は削除されず、採用状態や人の判断も変わりません。")
+    return EXIT_ERROR if errors else EXIT_OK
+
+
+def cmd_variants_verdict(config, args) -> int:
+    """候補に人の判断（pending / rejected / regen）を付けます。"""
+    try:
+        item = vr.set_verdict(config, args.id, args.variant, args.set)
+    except vr.VariantError as exc:
+        print(f"ERROR:\n  {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    adopted = vr.get_sticker(config, args.id).adopted
+    print(f"{args.id}/{args.variant} の判断を {item['verdict']} にしました")
+    print(f"CURRENT（採用中）: {adopted or '-'}（変更していません）")
+    return EXIT_OK
+
+
+def cmd_variants_rate(config, args) -> int:
+    """候補に5段階の評価を付けます（--clear で消します）。"""
+    rating = None if args.clear else args.rating
+    try:
+        item = vr.set_rating(config, args.id, args.variant, rating)
+    except vr.VariantError as exc:
+        print(f"ERROR:\n  {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    value = item["human_rating"] if item["human_rating"] is not None else "なし"
+    print(f"{args.id}/{args.variant} の評価を {value} にしました")
+    return EXIT_OK
+
+
+def cmd_variants_adopt(config, args) -> int:
+    """候補を採用します（APIは呼びません）。
+
+    候補 → generated/<id>.png → 既存のセリフ合成 → 既存の検証 の順に通します。
+    候補ファイルは履歴として残り、前の原画は既存の仕組みで退避されます。
+    """
+    try:
+        entries = {e.id: e for e in load_stickers(config.csv_path)}
+    except CsvLoadError as exc:
+        print(f"ERROR:\n  {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    entry = entries.get(args.id)
+    if entry is None:
+        print(f"ERROR:\n  CSVにIDがありません: {args.id}", file=sys.stderr)
+        return EXIT_ERROR
+
+    config.ensure_output_dirs()
+    try:
+        style = TextStyle.from_config(config)
+    except FontNotFoundError as exc:
+        print(f"ERROR:\n  {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    try:
+        result = vr.adopt(config, entry, args.variant, style=style)
+    except vr.AdoptError as exc:
+        print(f"ERROR:\n  {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    except Exception as exc:  # noqa: BLE001 - 原因を必ず画面に出す
+        print(f"ERROR:\n  {type(exc).__name__}: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    print("Adopted:")
+    print(f"  sticker: {result['sticker_id']}")
+    print(f"  variant: {result['variant_id']}")
+    print()
+    print("generated:")
+    print(f"  {result['generated']}")
+    print("final:")
+    print(f"  {result['final']} ({result['size_bytes'] / 1024:.0f}KB)")
+    print("validation:")
+    print("  PASS")
+    if result["archived"]:
+        print("archived:")
+        print(f"  {result['archived']}")
+    for w in result["warnings"]:
+        print(f"WARNING: {w}")
+    return EXIT_OK
+
+
 def cmd_render(config, args) -> int:
     """APIを呼ばず、既存の原画からセリフ合成のみやり直します。"""
     entries = _select_entries(config, args)
@@ -367,16 +610,18 @@ def cmd_render(config, args) -> int:
 
     done = skipped = failed = 0
     for entry in entries:
-        if not (config.dir_generated / f"{entry.id}.png").exists():
-            skipped += 1
-            continue
         try:
-            path, size_bytes, warnings = render_final(config, entry, style)
+            # final を書き換えるので、GUI の採用と同じスタンプの鍵の中で行います
+            with vr.adopt_lock(config, entry.id):
+                if not (config.dir_generated / f"{entry.id}.png").exists():
+                    skipped += 1
+                    continue
+                path, size_bytes, warnings = render_final(config, entry, style)
             for w in warnings:
                 logger.warn(f"{entry.id} {w}")
             logger.event(entry.id, "TEXT RENDERED", f"{path.name} {size_bytes / 1024:.0f}KB")
             done += 1
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001（鍵を取れなかった場合も含む）
             logger.error(entry.id, f"{type(exc).__name__}: {exc}")
             failed += 1
 
@@ -543,12 +788,48 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true", help="既存画像があっても再生成する")
     p.add_argument("--yes", "-y", action="store_true", help="コスト確認をスキップする")
     p.add_argument("--no-render", action="store_true", help="原画生成のみでセリフ合成しない")
+    p.add_argument(
+        "--variants", type=int, metavar="N",
+        help="1セリフにつきN案を output/variants/<id>/ に作ります"
+             "（採用中の原画・完成画像は変更しません）",
+    )
     p.set_defaults(func=cmd_generate)
 
     p = sub.add_parser("import", help="手持ちの画像を原画として取り込む（APIを呼びません）")
     p.add_argument("path", help="画像ファイル、または画像を入れたフォルダ（ファイル名の数字=ID）")
     p.add_argument("--id", help="1ファイルだけ取り込むときに、IDを明示する (例: 001)")
     p.set_defaults(func=cmd_import)
+
+    p = sub.add_parser("variants", help="候補の操作（APIを呼びません）")
+    vsub = p.add_subparsers(dest="variants_command", required=True)
+    vp = vsub.add_parser("list", help="候補の一覧を表示する")
+    vp.add_argument("--id", help="1件だけ表示するときのID (例: 001)")
+    vp.set_defaults(func=cmd_variants_list)
+
+    vp = vsub.add_parser("adopt", help="候補を採用して、原画・完成画像を作り直す")
+    vp.add_argument("--id", required=True, help="スタンプのID (例: 001)")
+    vp.add_argument("--variant", required=True, help="採用する候補のID (例: v002)")
+    vp.set_defaults(func=cmd_variants_adopt)
+
+    vp = vsub.add_parser("score", help="候補を機械評価する（APIを呼びません）")
+    vp.add_argument("--id", help="1件だけ評価するときのID (例: 001)")
+    vp.add_argument("--force", action="store_true", help="計算済みでも評価をやり直す")
+    vp.set_defaults(func=cmd_variants_score)
+
+    vp = vsub.add_parser("verdict", help="候補に人の判断を付ける（採用は adopt を使います）")
+    vp.add_argument("--id", required=True, help="スタンプのID (例: 001)")
+    vp.add_argument("--variant", required=True, help="候補のID (例: v003)")
+    vp.add_argument("--set", required=True, choices=list(vr.SETTABLE_VERDICTS),
+                    help="pending（未評価）/ rejected（不採用）/ regen（作り直したい）")
+    vp.set_defaults(func=cmd_variants_verdict)
+
+    vp = vsub.add_parser("rate", help="候補に5段階の評価を付ける（将来の重み決め用に残すだけ）")
+    vp.add_argument("--id", required=True, help="スタンプのID (例: 001)")
+    vp.add_argument("--variant", required=True, help="候補のID (例: v003)")
+    g = vp.add_mutually_exclusive_group(required=True)
+    g.add_argument("--rating", type=int, choices=[1, 2, 3, 4, 5], help="1（ダメ）〜5（非常に良い）")
+    g.add_argument("--clear", action="store_true", help="評価を消す")
+    vp.set_defaults(func=cmd_variants_rate)
 
     p = sub.add_parser("render", help="既存の原画からセリフ合成のみ再実行（APIを呼びません）")
     _add_selection_args(p)

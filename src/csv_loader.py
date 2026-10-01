@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import csv
+import io
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
+
+from .atomic_write import atomic_write_text
 
 REQUIRED_COLUMNS = ("id", "text", "action", "expression", "category")
 
@@ -101,19 +104,21 @@ def save_stickers(path: str | Path, entries: Sequence[StickerEntry], *, backup: 
             raise CsvLoadError(f"text が空です (id={e.id})")
 
     p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(REQUIRED_COLUMNS))
-        writer.writeheader()
-        for e in entries:
-            writer.writerow(
-                {
-                    "id": e.id,
-                    "text": e.text,
-                    "action": e.action,
-                    "expression": e.expression,
-                    "category": e.category,
-                }
-            )
+    # 今までの open("w", newline="") と同じ中身をメモリに作り、改行を変換せずに（csv の \r\n のまま）保存します
+    buf = io.StringIO(newline="")
+    writer = csv.DictWriter(buf, fieldnames=list(REQUIRED_COLUMNS))
+    writer.writeheader()
+    for e in entries:
+        writer.writerow(
+            {
+                "id": e.id,
+                "text": e.text,
+                "action": e.action,
+                "expression": e.expression,
+                "category": e.category,
+            }
+        )
+    atomic_write_text(p, buf.getvalue(), newline="")
     return p
 
 

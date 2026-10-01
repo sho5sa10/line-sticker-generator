@@ -26,6 +26,8 @@ output/main/*
 output/tab/*
 output/packages/*
 output/archive/
+output/variants/
+output/variants.json
 output/*.log
 output/state.json
 output/gallery.html
@@ -47,3 +49,8 @@ data/sales.json
 output/validation.json
 # マスター画像の履歴（差し替え時の自動バックアップ）
 data/character/character_master_*.png
+
+# 候補の記録の一時ファイル・鍵・壊れた記録の退避（ユーザーデータのため管理しない）
+output/**/*.tmp
+output/**/*.lock
+output/**/*.corrupt-*

@@ -198,6 +198,13 @@
                data-tip="APIを一切呼ばずに、送信予定のプロンプトだけを確認します。料金はかかりません">
           <input type="checkbox" id="opt-dryrun"> dry-run（APIを呼ばない）</label>
       </div>
+      <div class="group">
+        <span class="vinitial"
+              data-tip="選んだスタンプのうち、候補がまだ1件も無いもの（原画も無いもの）に、最初の候補を作ります。画像生成APIを使います。実行前に対象・枚数・費用を確認します。生成しただけでは採用しません">
+          <select id="initial-count" aria-label="1スタンプあたりの最初の候補の枚数"></select>
+          <button class="btn" id="btn-initial" disabled>最初の候補を作る</button>
+        </span>
+      </div>
       <div class="group right">
         <span class="cost" id="cost-label"
               data-tip="実際にAPIを呼ぶ枚数と概算料金です。すでに画像があるものは数に入りません">—</span>
@@ -253,6 +260,13 @@
           <button class="btn" id="btn-try-one">001だけ試しに生成する</button>
         </div>
       </div>
+    </div>
+    <div class="vcorrupt" id="variants-corrupt" hidden>
+      <b>⚠ 候補の記録ファイル（variants.json）が壊れています。</b>
+      候補・採用状態が表示されず、採用・評価・判断・候補の生成も止めています（記録をこれ以上失わないため）。
+      <span>「記録を修復する」で、壊れたファイルを別名で残したまま、候補フォルダの画像から記録を作り直します
+        （判断・評価は失われます）。コマンドなら <code>python -m src.variants repair</code>。</span>
+      <button class="btn" id="btn-variants-repair">記録を修復する</button>
     </div>
     <div class="grid" id="grid"></div>
   </section>
@@ -622,6 +636,34 @@
 
 <!-- 拡大表示 -->
 <div id="lightbox"><img id="lb-img" alt=""><div id="lb-cap"></div></div>
+
+<!-- 候補の比較・採用 -->
+<div id="variant-modal" class="vmodal" hidden>
+  <div class="vbox" role="dialog" aria-label="候補の比較">
+    <div class="vhead">
+      <strong id="v-title"></strong>
+      <span class="vcount" id="v-position"></span>
+      <span class="vstats" id="v-stats"></span>
+      <span class="vregen" data-tip="「再生成」の印を付けた候補があるスタンプに、新しい候補を作ります（画像生成APIを使います。実行前に枚数と費用を確認します）">
+        <select id="v-regen-count" aria-label="1スタンプあたりの枚数"></select>
+        <button class="btn small" id="v-regen">再生成の候補を作る</button>
+      </span>
+      <button class="btn small ghost" id="v-prev" data-tip="前のスタンプ（←）">← 前</button>
+      <button class="btn small ghost" id="v-next" data-tip="次のスタンプ（→）">次 →</button>
+      <button class="btn small ghost" id="v-close" data-tip="閉じる（Esc）">閉じる</button>
+    </div>
+    <div class="vmismatch" id="v-mismatch" hidden></div>
+    <div class="vcards" id="v-cards"></div>
+    <div class="vfoot">
+      <span class="hint">
+        キー操作: <kbd>1</kbd>〜<kbd>9</kbd> 候補を選ぶ / <kbd>Enter</kbd> 採用して次へ /
+        <kbd>X</kbd> 除外 / <kbd>R</kbd> 再生成 / <kbd>Shift</kbd>+<kbd>1</kbd>〜<kbd>5</kbd> 評価 /
+        <kbd>←</kbd><kbd>→</kbd> 前後 / <kbd>Esc</kbd> 閉じる
+      </span>
+      <span class="vmsg" id="v-msg"></span>
+    </div>
+  </div>
+</div>
 
 <div id="toast" class="toast"></div>
 <div id="tip" class="tip"></div>

@@ -10,13 +10,16 @@ CLI と同じパイプライン（pipeline / image_generator / validator / packa
 from __future__ import annotations
 
 import io
+import ipaddress
 import os
 import threading
 import traceback
 import zipfile
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from flask import Flask, jsonify, request, send_file, send_from_directory
 from PIL import Image
@@ -26,18 +29,22 @@ from . import fonts as fontlib
 from . import style_suggest
 from . import gallery as gallery_mod
 from . import image_processor as ip
+from . import image_generator as image_generator_mod
 from . import importer
 from . import sales as sales_mod
+from . import variants as variants_mod
 from . import listing as listing_mod
 from . import llm as llm_mod
 from . import package_builder as pkg
 from . import pipeline
 from . import validator as vd
+from .atomic_write import atomic_write_text
 from .config import ConfigError, load_config
 from .csv_loader import CsvLoadError, StickerEntry, load_stickers, save_stickers
 from .image_generator import ImageGenerator, MasterImageMissingError, check_master_image
 from .logger import RunLogger, StateStore
 from .providers import estimate_cost_usd
+from .providers.base import ProviderError
 from .text_renderer import FontNotFoundError, TextStyle
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
@@ -96,6 +103,13 @@ class Job:
         }
 
 
+class JobBusyError(RuntimeError):
+    """ほかのジョブが実行中のため、新しいジョブを始められない（この競合だけを表します）。
+
+    RuntimeError のサブクラスなので、既存の except RuntimeError でも捕まえられます。
+    """
+
+
 class JobManager:
     """実行中ジョブを1件に制限し、進捗とキャンセルを管理します。"""
 
@@ -123,7 +137,7 @@ class JobManager:
     def start(self, kind: str, total: int, target, *args) -> Job:
         with self._lock:
             if self.is_running():
-                raise RuntimeError("すでに処理が実行中です。完了を待つか中止してください。")
+                raise JobBusyError("すでに処理が実行中です。完了を待つか中止してください。")
             self._cancel.clear()
             job = Job(id=datetime.now().strftime("%Y%m%d%H%M%S%f"), kind=kind, total=total)
             self._job = job
@@ -164,6 +178,71 @@ def create_app(config=None) -> Flask:
 
     def server_outdated() -> bool:
         return code_fingerprint() > started_code + 0.001
+
+    # ------------------------------------------------------------------
+    # ローカルGUI以外からの書き換えを拒否します（CSRF対策）
+    #
+    # 127.0.0.1 にしか公開していなくても、ブラウザで悪意あるページを開くと、
+    # そのページから同じPCの http://127.0.0.1:8765 へ POST を送れてしまいます。
+    # 採用・生成・退避などは取り消しが難しく、画像生成は課金も発生するため、
+    # 「別サイトから送られた書き換え」を入口で止めます。読み取り(GET)は制限しません。
+    # ------------------------------------------------------------------
+    LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+    def _local(hostname: str | None) -> bool:
+        return bool(hostname) and hostname.strip("[]") in LOCAL_HOSTS
+
+    def _host_name(value: str | None) -> str | None:
+        """Host ヘッダ（"127.0.0.1:8765" や "[::1]:8765"）からホスト名だけを取り出します。"""
+        try:
+            return urlsplit(f"//{value or ''}").hostname
+        except ValueError:
+            return None
+
+    def _readable_host(hostname: str | None) -> bool:
+        """読み取りを許すホスト名。このPCの名前か、IPアドレスそのもの（--host 0.0.0.0 で
+        スマホ等から IP で開く場合）。DNS rebinding は必ず「名前」で来るので、ここで止まります。"""
+        if _local(hostname):
+            return True
+        try:
+            ipaddress.ip_address((hostname or "").strip("[]"))
+            return True
+        except ValueError:
+            return False
+
+    @app.before_request
+    def block_cross_site_writes():
+        host = _host_name(request.host)
+        forwarded = request.headers.get("X-Forwarded-Host")
+        if forwarded and not _local(_host_name(forwarded.split(",")[0].strip())):
+            return jsonify({"error": "このアドレスからは操作できません"}), 403
+        if request.method in ("GET", "HEAD", "OPTIONS"):
+            # 別サイトの名前で届いた読み取り（DNS rebinding）で、記録や画像を読まれないように
+            if not _readable_host(host):
+                return jsonify({"error": "このアドレスからは開けません"}), 403
+            return None
+        if not _local(host):
+            return jsonify({"error": "このアドレスからは操作できません"}), 403
+        origin = request.headers.get("Origin")
+        if origin and not _local(urlsplit(origin).hostname):
+            return jsonify({"error": "別のサイトからの操作は受け付けません"}), 403
+        # ブラウザが付ける印。別サイトからの送信は cross-site になります
+        site = request.headers.get("Sec-Fetch-Site")
+        if site and site not in ("same-origin", "none"):
+            return jsonify({"error": "別のサイトからの操作は受け付けません"}), 403
+        # フォームや text/plain は、確認なしで別サイトから送れる形式なので、
+        # GUI が付ける印（X-Sticker-Client）が無ければ拒否します。
+        ctype = (request.content_type or "").split(";")[0].strip().lower()
+        if (ctype not in ("", "application/json")
+                and request.headers.get("X-Sticker-Client") != "1"
+                and (origin is not None or site is not None)):
+            return jsonify({"error": "別のサイトからの操作は受け付けません"}), 403
+        return None
+
+    @app.errorhandler(variants_mod.StateBusyError)
+    def variants_state_busy(exc):
+        """候補の記録を一時的に読み書きできない（他の処理が使用中）。壊れていないので 503。"""
+        return jsonify({"error": str(exc), "retry": True}), 503
 
     @app.after_request
     def no_stale_assets(response):
@@ -238,9 +317,34 @@ def create_app(config=None) -> Flask:
         stale = not finals or latest_final > latest_zip
         return {"count": len(zips), "latest": int(latest_zip), "stale": stale}
 
+    def variants_state(cfg_) -> str:
+        """"ok" / "missing" / "corrupt" / "busy"（一時的に読めない）。"""
+        try:
+            return variants_mod.state_status(cfg_)
+        except variants_mod.StateBusyError:
+            return "busy"
+
     def statuses(cfg_, entries) -> list[dict]:
         sales = sales_mod.load_sales(cfg_)
-        return [sticker_status(cfg_, e, sales) for e in entries]
+        # 候補の件数だけ一覧に載せます（variants.json の読み込みは1リクエストに1回）
+        vstate = variants_mod.load(cfg_)
+        found = variants_mod.list_all(cfg_, [e.id for e in entries], vstate)
+        out = []
+        for e in entries:
+            row = sticker_status(cfg_, e, sales)
+            sv = found.get(e.id)
+            row["variant_count"] = sv.variant_count if sv else 0
+            row["adopted"] = sv.adopted if sv else None
+            # flags は保存済みの値だけを見ます（ここでは計算しません）
+            row["flags"] = sorted({f for v in (sv.variants if sv else []) for f in v.flags})
+            # 採用した画像が、採用以外の操作で差し替わっていないか
+            row["generated_mismatch"] = bool(sv and sv.generated_mismatch)
+            # 採用に失敗し、元に戻す処理も完了できなかった（画像が採用前と違う可能性）
+            row["rollback_failed"] = bool(sv and sv.rollback_failed)
+            # 初回候補生成の実行中（running）・途中で止まった実行がある（pending）
+            row["initial_run"] = variants_mod.initial_status((vstate.get("stickers") or {}).get(e.id))
+            out.append(row)
+        return out
 
     # ------------------------------------------------------------------
     # 画面
@@ -291,6 +395,8 @@ def create_app(config=None) -> Flask:
                 "packages": packages,
                 "packages_status": packages_status(cfg_),
                 "validation": vd.load_result(cfg_),
+                # 候補の記録の状態（壊れていたら一覧に警告と修復ボタンを出します）
+                "variants_state": variants_state(cfg_),
                 "line_spec": {
                     "sticker": list(cfg_.sticker_size),
                     "main": list(cfg_.main_size),
@@ -358,6 +464,11 @@ def create_app(config=None) -> Flask:
     def img_tab():
         return _serve(current_config().dir_tab, "tab.png")
 
+    @app.get("/img/variants/<sticker_id>/<variant_id>.png")
+    def img_variant(sticker_id: str, variant_id: str):
+        cfg_ = current_config()
+        return _serve(variants_mod.variant_dir(cfg_, sticker_id), f"{variant_id}.png")
+
     @app.get("/img/master.png")
     def img_master():
         cfg_ = current_config()
@@ -424,7 +535,7 @@ def create_app(config=None) -> Flask:
             return jsonify({"error": "キャラクターの説明が空です"}), 400
         path = cfg_.master_prompt_ja_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text + "\n", encoding="utf-8")
+        atomic_write_text(path, text + "\n")
         if isinstance(body.get("profile"), dict):
             cprof.save_profile(cfg_.character_profile_path, body["profile"])
         body = {"saved_to": str(path)}
@@ -592,7 +703,10 @@ def create_app(config=None) -> Flask:
             return jsonify({"error": "OPENAI_API_KEY が未設定です。.env に記入してください。"}), 400
         if jobs.is_running():
             return jsonify({"error": "すでに処理が実行中です"}), 409
-        job = jobs.start("master", 1, _run_master)
+        try:
+            job = jobs.start("master", 1, _run_master)
+        except JobBusyError as exc:     # 入口の確認とほぼ同時に、別のジョブが始まった
+            return jsonify({"error": str(exc)}), 409
         return jsonify(job.to_dict())
 
     @app.post("/api/generated/archive")
@@ -605,15 +719,25 @@ def create_app(config=None) -> Flask:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         base = cfg_.root / "output" / "archive" / stamp
         moved = {"generated": 0, "final": 0}
-        for kind, src_dir in (("generated", cfg_.dir_generated), ("final", cfg_.dir_final)):
-            files = sorted(src_dir.glob("*.png"))
-            if not files:
-                continue
-            dest = base / kind
-            dest.mkdir(parents=True, exist_ok=True)
-            for f in files:
-                f.replace(dest / f.name)
-                moved[kind] += 1
+        sources = (("generated", cfg_.dir_generated), ("final", cfg_.dir_final))
+        sticker_ids = sorted({f.stem for _kind, d in sources for f in d.glob("*.png")})
+        try:
+            with ExitStack() as locks:
+                # 採用中のスタンプの画像を動かすと、採用の巻き戻しで元に戻されてしまうため、
+                # 対象スタンプの鍵を ID 順に取ってから動かします（修復と同じ順序）
+                for sticker_id in sticker_ids:
+                    locks.enter_context(variants_mod.adopt_lock(cfg_, sticker_id))
+                for kind, src_dir in sources:
+                    files = sorted(src_dir.glob("*.png"))
+                    if not files:
+                        continue
+                    dest = base / kind
+                    dest.mkdir(parents=True, exist_ok=True)
+                    for f in files:
+                        f.replace(dest / f.name)
+                        moved[kind] += 1
+        except variants_mod.LockBusyError as exc:
+            return jsonify({"error": f"{exc}（まだ何も退避していません）"}), 409
         if not any(moved.values()):
             return jsonify({"error": "退避する画像がありません"}), 400
         return jsonify({"archived_to": str(base), "moved": moved})
@@ -811,6 +935,355 @@ def create_app(config=None) -> Flask:
         return jsonify({"stickers": statuses(cfg_, entries), "validation": vd.load_result(cfg_),
                         "packages_status": packages_status(cfg_)})
 
+    # ---------- 候補（variant）の読み取り ----------
+    @app.get("/api/variants")
+    def api_variants_get():
+        """CSVにある全スタンプの候補状況を返します（読み取りのみ）。"""
+        try:
+            entries = entries_or_error()
+        except CsvLoadError as exc:
+            return jsonify({"error": str(exc)}), 400
+        cfg_ = current_config()
+        state = variants_mod.load(cfg_)
+        found = variants_mod.list_all(cfg_, [e.id for e in entries], state)
+        return jsonify({
+            "schema": state.get("schema", variants_mod.SCHEMA),
+            "state_exists": cfg_.variants_path.exists(),
+            "state_status": variants_state(cfg_),
+            "stickers": {sid: sv.to_dict() for sid, sv in found.items()},
+        })
+
+    @app.get("/api/variants/<sticker_id>")
+    def api_variants_one(sticker_id: str):
+        cfg_ = current_config()
+        try:
+            known = {e.id for e in entries_or_error()}
+        except CsvLoadError as exc:
+            return jsonify({"error": str(exc)}), 400
+        if sticker_id not in known:
+            return jsonify({"error": f"IDが見つかりません: {sticker_id}"}), 404
+        sticker = variants_mod.get_sticker(cfg_, sticker_id)
+        if sticker is None:
+            return jsonify({"sticker_id": sticker_id, "adopted": None, "legacy": False,
+                            "variant_count": 0, "variants": []})
+        return jsonify(sticker.to_dict())
+
+    def _variant_entry(sticker_id: str):
+        """CSVの行を取り出します。無ければ (None, エラーレスポンス)。"""
+        try:
+            entry = next((e for e in entries_or_error() if e.id == sticker_id), None)
+        except CsvLoadError as exc:
+            return None, (jsonify({"error": str(exc)}), 400)
+        if entry is None:
+            return None, (jsonify({"error": f"IDが見つかりません: {sticker_id}"}), 404)
+        return entry, None
+
+    def _variant_error(exc) -> tuple:
+        """候補の操作エラーをAPIの形にします（記録が壊れている場合は 409）。"""
+        if isinstance(exc, variants_mod.StateBusyError):
+            return jsonify({"error": str(exc), "retry": True}), 503
+        status = 409 if isinstance(exc, variants_mod.StateCorruptError) else 400
+        return jsonify({"error": str(exc)}), status
+
+    @app.post("/api/variants/repair")
+    def api_variants_repair():
+        """壊れた記録を退避し、候補フォルダの画像から記録を作り直します（画像は消しません）。"""
+        cfg_ = current_config()
+        try:
+            report = variants_mod.repair_state(cfg_)
+        except variants_mod.VariantError as exc:
+            return _variant_error(exc)
+        return jsonify({"report": report, "variants_state": variants_state(cfg_)})
+
+    # ------------------------------------------------------------------
+    # 再生成（Phase 6）: regen の印が付いたスタンプだけに候補を作る
+    # ------------------------------------------------------------------
+    def _regen_count(body: dict) -> int:
+        count = body.get("count", variants_mod.REGEN_DEFAULT_COUNT)
+        if (isinstance(count, bool) or not isinstance(count, int)
+                or not 1 <= count <= variants_mod.REGEN_MAX_COUNT):
+            raise ValueError(
+                f"1スタンプあたりの枚数は 1〜{variants_mod.REGEN_MAX_COUNT} の整数で指定してください: {count}")
+        return count
+
+    def _run_regen(job: Job, ids: list[str], count: int) -> None:
+        """再生成の候補を作るジョブ。API を呼んでいる間は鍵を持ちません（記録の更新時だけ）。"""
+        cfg_ = current_config()
+        logger = RunLogger(cfg_.log_path, echo=False)
+        state = StateStore(cfg_.state_path)
+        generator = ImageGenerator(cfg_, logger, state, dry_run=False)
+        by_id = {e.id: e for e in entries_or_error()}
+
+        for sticker_id in ids:
+            if jobs.cancelled():
+                job.log("warn", "ユーザー操作により中止しました（作れた候補は残し、次回は残りだけ作ります）")
+                break
+            entry = by_id.get(sticker_id)
+            if entry is None:
+                job.log("error", "CSVに存在しません", sticker_id)
+                continue
+
+            def on_start(remaining, sid=sticker_id):
+                job.log("info", f"候補を {remaining} 枚作ります", sid)
+
+            def on_event(sid, variant_id, status, detail):
+                job.api_calls += 1
+                job.done += 1
+                if status == "generated":
+                    job.log("ok", f"{variant_id} を作りました", sid)
+                else:
+                    job.log("error", f"{variant_id}: {detail}", sid)
+
+            # 記録の鍵の中で対象かどうかを確かめ直し、実行中の目印を付けてから作ります
+            # （番号の予約・登録・締めは variants.run_regen に任せます）
+            outcome = variants_mod.run_regen(cfg_, entry, count, generator, on_start=on_start,
+                                             on_event=on_event, should_stop=jobs.cancelled)
+            if not outcome["claimed"]:
+                job.log("skip", "対象ではなくなったか、別の処理が実行中のため作りませんでした", sticker_id)
+            elif outcome["complete"]:
+                job.log("ok", "再生成の候補を作り終えました", sticker_id)
+            else:
+                job.log("warn", "途中で止まりました（作れた候補は残し、次回は残りだけ作ります）", sticker_id)
+        job.result["api_calls"] = job.api_calls
+
+    @app.post("/api/variants/generate")
+    def api_variants_generate():
+        """regen の印が付いたスタンプに、新しい候補を作ります。
+
+        dry_run=true なら対象・枚数・費用だけを返します（プロバイダを作らず、APIキーも使いません）。
+        実行するときは、確認画面で見た合計枚数（expected_total）を添えてください。
+        いまの合計と違えば、確認し直してもらうため生成を始めません。
+        """
+        cfg_ = current_config()
+        body = request.get_json(silent=True) or {}
+        if body.get("regen_only") is not True:
+            return jsonify({"error": "いまは regen_only=true（再生成の印が付いたスタンプだけ）に対応しています"}), 400
+        try:
+            count = _regen_count(body)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        try:
+            entries = entries_or_error()
+        except CsvLoadError as exc:
+            return jsonify({"error": str(exc)}), 400
+        if variants_state(cfg_) == "corrupt":
+            return _variant_error(variants_mod.StateCorruptError(variants_mod.corrupt_message(cfg_)))
+
+        plan = variants_mod.regen_plan(cfg_, [e.id for e in entries], count)
+        total = plan["total"]
+        summary = {
+            "count": count, "targets": plan["targets"], "busy": plan["busy"], "total": total,
+            "usd": estimate_cost_usd(cfg_.model, cfg_.quality, total),
+            "model": cfg_.model, "quality": cfg_.quality,
+            "max_count": variants_mod.REGEN_MAX_COUNT, "max_total": variants_mod.REGEN_MAX_TOTAL,
+        }
+        if total > variants_mod.REGEN_MAX_TOTAL:
+            return jsonify({**summary, "error": (
+                f"1回に作れる候補は {variants_mod.REGEN_MAX_TOTAL} 枚までです（今回 {total} 枚）。"
+                "1スタンプあたりの枚数を減らしてください")}), 400
+        if body.get("dry_run"):
+            return jsonify(summary)
+
+        expected = body.get("expected_total")
+        if isinstance(expected, bool) or not isinstance(expected, int):
+            return jsonify({"error": "確認画面の合計枚数（expected_total）を指定してください"}), 400
+        if total == 0:
+            return jsonify({**summary, "error": "再生成の対象がありません（印が無いか、作り終えています）"}), 400
+        if expected != total:
+            return jsonify({**summary, "error": "対象が変わりました。もう一度確認してから実行してください"}), 409
+        if not cfg_.api_key:
+            return jsonify({"error": "OPENAI_API_KEY が未設定です。.env に記入してください。"}), 400
+        try:
+            image_generator_mod.create_provider(cfg_)      # 設定の誤りをここで知らせる（通信はしません）
+            check_master_image(cfg_)
+        except (ProviderError, ValueError, MasterImageMissingError) as exc:
+            return jsonify({"error": str(exc)}), 400
+        try:
+            job = jobs.start("variants", total, _run_regen, [t["id"] for t in plan["targets"]], count)
+        except RuntimeError as exc:                         # ほかの処理が実行中（同時のリクエストを含む）
+            return jsonify({"error": str(exc)}), 409
+        return jsonify({**summary, "job": job.to_dict()})
+
+    # ------------------------------------------------------------------
+    # 初回候補生成（Phase 7）: 候補が1件も無いスタンプに、最初の候補を作る
+    # ------------------------------------------------------------------
+    def _run_initial(job: Job, ids: list[str], count: int) -> None:
+        """初回生成の候補を作るジョブ。API を呼んでいる間は鍵を持ちません（記録の更新時だけ）。"""
+        cfg_ = current_config()
+        logger = RunLogger(cfg_.log_path, echo=False)
+        state = StateStore(cfg_.state_path)
+        generator = ImageGenerator(cfg_, logger, state, dry_run=False)
+        by_id = {e.id: e for e in entries_or_error()}
+
+        for sticker_id in ids:
+            if jobs.cancelled():
+                job.log("warn", "ユーザー操作により中止しました（作れた候補は残し、次回は残りだけ作ります）")
+                break
+            entry = by_id.get(sticker_id)
+            if entry is None:
+                job.log("error", "CSVに存在しません", sticker_id)
+                continue
+
+            def on_start(remaining, recovered, sid=sticker_id):
+                if recovered:
+                    job.log("ok", f"前回作れていた {recovered} 枚を登録しました（APIは呼びません）", sid)
+                job.log("info", f"最初の候補を {remaining} 枚作ります", sid)
+
+            def on_event(sid, variant_id, status, detail):
+                job.api_calls += 1
+                job.done += 1
+                if status == "generated":
+                    job.log("ok", f"{variant_id} を作りました", sid)
+                else:
+                    job.log("error", f"{variant_id}: {detail}", sid)
+
+            # 記録の鍵の中で対象かどうかを確かめ直し、実行中の目印を付けてから作ります
+            outcome = variants_mod.run_initial(cfg_, entry, count, generator, on_start=on_start,
+                                               on_event=on_event, should_stop=jobs.cancelled)
+            if outcome["closed"]:
+                job.log("ok", f"前回の続きを締めました（登録 {outcome['recovered']} 枚、APIは呼びません）",
+                        sticker_id)
+            elif not outcome["claimed"]:
+                job.log("skip", "対象ではなくなったか、別の処理が実行中のため作りませんでした", sticker_id)
+            elif outcome["complete"]:
+                job.log("ok", "最初の候補を作り終えました（採用は候補比較の画面で行います）", sticker_id)
+            else:
+                job.log("warn", "途中で止まりました（作れた候補は残し、次回は残りだけ作ります）", sticker_id)
+        job.result["api_calls"] = job.api_calls
+
+    @app.post("/api/variants/initial")
+    def api_variants_initial():
+        """候補が1件も無いスタンプに、最初の候補を作ります（途中で止まった初回生成の続きも）。
+
+        dry_run=true なら対象・枚数・費用だけを返します（プロバイダを作らず、何も書きません）。
+        実行するときは、確認画面で見た合計枚数（expected_total）を添えてください（再生成と同じ）。
+        """
+        cfg_ = current_config()
+        body = request.get_json(silent=True) or {}
+        ids = body.get("ids")
+        if (not isinstance(ids, list) or not ids
+                or not all(isinstance(i, str) and i.strip() for i in ids)):
+            return jsonify({"error": "対象のスタンプ（ids）を1件以上選んでください"}), 400
+        ids = [i.strip() for i in ids]
+        if len(set(ids)) != len(ids):
+            return jsonify({"error": "同じスタンプが重複して指定されています"}), 400
+        try:
+            count = _regen_count(body)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        try:
+            entries = entries_or_error()
+        except CsvLoadError as exc:
+            return jsonify({"error": str(exc)}), 400
+        known = {e.id for e in entries}
+        unknown = [i for i in ids if i not in known]
+        if unknown:
+            return jsonify({"error": f"IDが見つかりません: {', '.join(unknown)}"}), 400
+        if variants_state(cfg_) == "corrupt":
+            return _variant_error(variants_mod.StateCorruptError(variants_mod.corrupt_message(cfg_)))
+
+        plan = variants_mod.initial_plan(cfg_, ids, count)
+        total = plan["total"]
+        summary = {
+            "ids": ids, "count": count, "targets": plan["targets"],
+            "target_ids": [t["id"] for t in plan["targets"]], "target_count": len(plan["targets"]),
+            "skipped": plan["skipped"], "busy": plan["busy"], "total": total, "expected_total": total,
+            "usd": estimate_cost_usd(cfg_.model, cfg_.quality, total),
+            "model": cfg_.model, "quality": cfg_.quality,
+            "max_count": variants_mod.INITIAL_MAX_COUNT, "max_total": variants_mod.INITIAL_MAX_TOTAL,
+        }
+        if total > variants_mod.INITIAL_MAX_TOTAL:
+            return jsonify({**summary, "error": (
+                f"1回に作れる候補は {variants_mod.INITIAL_MAX_TOTAL} 枚までです（今回 {total} 枚）。"
+                "1スタンプあたりの枚数か、スタンプの数を減らしてください")}), 400
+        if body.get("dry_run"):
+            return jsonify(summary)
+
+        expected = body.get("expected_total")
+        if isinstance(expected, bool) or not isinstance(expected, int):
+            return jsonify({"error": "確認画面の合計枚数（expected_total）を指定してください"}), 400
+        if not plan["targets"]:
+            return jsonify({**summary, "error": "初回生成の対象がありません（候補・原画があるか、実行中です）"}), 400
+        if expected != total:
+            return jsonify({**summary, "error": "対象が変わりました。もう一度確認してから実行してください"}), 409
+        if not cfg_.api_key:
+            return jsonify({"error": "OPENAI_API_KEY が未設定です。.env に記入してください。"}), 400
+        try:
+            image_generator_mod.create_provider(cfg_)      # 設定の誤りをここで知らせる（通信はしません）
+            check_master_image(cfg_)
+        except (ProviderError, ValueError, MasterImageMissingError) as exc:
+            return jsonify({"error": str(exc)}), 400
+        try:
+            job = jobs.start("initial", total, _run_initial, summary["target_ids"], count)
+        except JobBusyError as exc:                         # ほかの処理が実行中（同時のリクエストを含む）
+            return jsonify({"error": str(exc)}), 409
+        return jsonify({**summary, "job": job.to_dict()})
+
+    @app.post("/api/variants/<sticker_id>/<variant_id>/adopt")
+    def api_variants_adopt(sticker_id: str, variant_id: str):
+        """候補を採用します（退避・合成・検証は既存の variants.adopt に任せます）。"""
+        cfg_ = current_config()
+        entry, err = _variant_entry(sticker_id)
+        if err:
+            return err
+        try:
+            style = style_or_error()
+        except FontNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 400
+        try:
+            result = variants_mod.adopt(cfg_, entry, variant_id, style=style)
+        except variants_mod.VariantError as exc:
+            return _variant_error(exc)
+        sticker = variants_mod.get_sticker(cfg_, sticker_id)
+        return jsonify({
+            "sticker": sticker.to_dict() if sticker else None,
+            "final_size_kb": round(result["size_bytes"] / 1024, 1),
+            "warnings": result["warnings"],
+            "validation": vd.load_result(cfg_),
+            "packages_status": packages_status(cfg_),
+        })
+
+    @app.post("/api/variants/<sticker_id>/<variant_id>/verdict")
+    def api_variants_verdict(sticker_id: str, variant_id: str):
+        """候補に人の判断（pending / rejected / regen）を付けます。"""
+        cfg_ = current_config()
+        body = request.get_json(silent=True) or {}
+        try:
+            variants_mod.set_verdict(cfg_, sticker_id, variant_id, str(body.get("verdict", "")))
+        except variants_mod.VariantError as exc:
+            return _variant_error(exc)
+        return jsonify({"sticker": variants_mod.get_sticker(cfg_, sticker_id).to_dict()})
+
+    @app.post("/api/variants/<sticker_id>/<variant_id>/score")
+    def api_variants_score(sticker_id: str, variant_id: str):
+        """候補1件を再評価します（計算は scoring.py のみ。人の判断は変えません）。"""
+        from . import scoring
+
+        cfg_ = current_config()
+        try:
+            scoring.score_variant(cfg_, sticker_id, variant_id)
+        except (scoring.ScoringError, variants_mod.VariantError) as exc:
+            return _variant_error(exc)
+        return jsonify({"sticker": variants_mod.get_sticker(cfg_, sticker_id).to_dict(),
+                        "formula": scoring.SCORING_FORMULA})
+
+    @app.post("/api/variants/<sticker_id>/<variant_id>/rating")
+    def api_variants_rating(sticker_id: str, variant_id: str):
+        """候補に5段階の評価を付けます（null で消します）。"""
+        cfg_ = current_config()
+        body = request.get_json(silent=True) or {}
+        rating = body.get("rating")
+        if rating is not None:
+            try:
+                rating = int(rating)
+            except (TypeError, ValueError):
+                return jsonify({"error": f"評価は数字で指定してください: {rating}"}), 400
+        try:
+            variants_mod.set_rating(cfg_, sticker_id, variant_id, rating)
+        except variants_mod.VariantError as exc:
+            return _variant_error(exc)
+        return jsonify({"sticker": variants_mod.get_sticker(cfg_, sticker_id).to_dict()})
+
     @app.post("/api/stickers")
     def api_stickers_post():
         """CSV全体を保存します。上書き前に .bak を作ります。"""
@@ -864,40 +1337,50 @@ def create_app(config=None) -> Flask:
                 job.log("error", "CSVに存在しません", sticker_id)
                 continue
 
-            result = generator.generate_one(entry, force=force)
-            if result.status == "generated":
-                job.api_calls += 1
-                job.log("ok", "画像を生成しました", sticker_id)
-            elif result.status == "skipped":
-                job.log("skip", "既存画像のためスキップ（APIを呼びません）", sticker_id)
-            elif result.status == "dry-run":
-                job.log("info", "DRY-RUN（APIを呼びません）", sticker_id)
-                job.done += 1
-                continue
-            else:
-                job.done += 1
-                job.log("error", result.detail or "生成に失敗しました", sticker_id)
-                continue
-
+            # generated/<id>.png と final/<id>.png を書き換えるので、採用・取り込みと同じ
+            # スタンプの鍵を持って行います（採用の巻き戻しに、生成した画像を消されないため）。
+            # 鍵の順序は「スタンプ → 記録」。ここでは記録（variants.json）の鍵は取りません。
             try:
-                path, size_bytes, warnings = pipeline.render_final(cfg_, entry, style)
-                for w in warnings:
-                    job.log("warn", w, sticker_id)
-                report = vd.validate_sticker(path, cfg_)
-                for issue in report.issues:
-                    job.log("warn" if issue.severity == "WARNING" else "error",
-                            issue.message, sticker_id)
-                if report.ok:
-                    job.log("ok", f"完了 ({size_bytes / 1024:.0f}KB)", sticker_id)
-                    state.set(sticker_id, "complete")
-                else:
-                    state.set(sticker_id, "validation_failed", report.errors[0].message)
-            except Exception as exc:  # noqa: BLE001 - 1件の失敗で全体を止めない
-                job.log("error", f"{type(exc).__name__}: {exc}", sticker_id)
-                state.set(sticker_id, "error", str(exc))
+                with variants_mod.adopt_lock(cfg_, sticker_id):
+                    _generate_one_locked(job, generator, entry, force, cfg_, style, state)
+            except variants_mod.LockBusyError as exc:
+                job.log("error", f"{exc}（このスタンプは生成しませんでした）", sticker_id)
             job.done += 1
 
         job.result["api_calls"] = job.api_calls
+
+    def _generate_one_locked(job: Job, generator, entry, force: bool, cfg_, style, state) -> None:
+        """1スタンプ分の生成・合成・検証。スタンプの鍵を持った状態で呼びます。"""
+        sticker_id = entry.id
+        result = generator.generate_one(entry, force=force)
+        if result.status == "generated":
+            job.api_calls += 1
+            job.log("ok", "画像を生成しました", sticker_id)
+        elif result.status == "skipped":
+            job.log("skip", "既存画像のためスキップ（APIを呼びません）", sticker_id)
+        elif result.status == "dry-run":
+            job.log("info", "DRY-RUN（APIを呼びません）", sticker_id)
+            return
+        else:
+            job.log("error", result.detail or "生成に失敗しました", sticker_id)
+            return
+
+        try:
+            path, size_bytes, warnings = pipeline.render_final(cfg_, entry, style)
+            for w in warnings:
+                job.log("warn", w, sticker_id)
+            report = vd.validate_sticker(path, cfg_)
+            for issue in report.issues:
+                job.log("warn" if issue.severity == "WARNING" else "error",
+                        issue.message, sticker_id)
+            if report.ok:
+                job.log("ok", f"完了 ({size_bytes / 1024:.0f}KB)", sticker_id)
+                state.record(sticker_id, "complete")
+            else:
+                state.record(sticker_id, "validation_failed", report.errors[0].message)
+        except Exception as exc:  # noqa: BLE001 - 1件の失敗で全体を止めない
+            job.log("error", f"{type(exc).__name__}: {exc}", sticker_id)
+            state.record(sticker_id, "error", str(exc))
 
     @app.post("/api/generate")
     def api_generate():
@@ -926,7 +1409,10 @@ def create_app(config=None) -> Flask:
             except FontNotFoundError as exc:
                 return jsonify({"error": str(exc)}), 400
 
-        job = jobs.start("generate", len(ids), _run_generate, ids, force, dry_run)
+        try:
+            job = jobs.start("generate", len(ids), _run_generate, ids, force, dry_run)
+        except JobBusyError as exc:     # 入口の確認とほぼ同時に、別のジョブが始まった
+            return jsonify({"error": str(exc)}), 409
         return jsonify(job.to_dict())
 
     def _run_render(job: Job, ids: list[str]) -> None:
@@ -939,11 +1425,16 @@ def create_app(config=None) -> Flask:
                 break
             entry = by_id.get(sticker_id)
             job.done += 1
-            if entry is None or not (cfg_.dir_generated / f"{sticker_id}.png").exists():
+            if entry is None:
                 job.log("skip", "原画がないためスキップ", sticker_id)
                 continue
             try:
-                path, size_bytes, warnings = pipeline.render_final(cfg_, entry, style)
+                # final/<id>.png を書き換えるので、採用と同時に走らないようスタンプの鍵を持ちます
+                with variants_mod.adopt_lock(cfg_, sticker_id):
+                    if not (cfg_.dir_generated / f"{sticker_id}.png").exists():
+                        job.log("skip", "原画がないためスキップ", sticker_id)
+                        continue
+                    path, size_bytes, warnings = pipeline.render_final(cfg_, entry, style)
                 for w in warnings:
                     job.log("warn", w, sticker_id)
                 job.log("ok", f"再合成しました ({size_bytes / 1024:.0f}KB)", sticker_id)
@@ -962,7 +1453,10 @@ def create_app(config=None) -> Flask:
                 return jsonify({"error": str(exc)}), 400
         if jobs.is_running():
             return jsonify({"error": "すでに処理が実行中です"}), 409
-        job = jobs.start("render", len(ids), _run_render, ids)
+        try:
+            job = jobs.start("render", len(ids), _run_render, ids)
+        except JobBusyError as exc:     # 入口の確認とほぼ同時に、別のジョブが始まった
+            return jsonify({"error": str(exc)}), 409
         return jsonify(job.to_dict())
 
     # ------------------------------------------------------------------

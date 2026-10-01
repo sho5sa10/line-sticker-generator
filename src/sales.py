@@ -10,6 +10,8 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+from .atomic_write import atomic_write_text
+
 # "" は未販売（記録なし）
 STATUSES = ("", "review", "selling")
 STATUS_LABELS = {"": "未販売", "review": "申請中", "selling": "販売中"}
@@ -58,8 +60,8 @@ def set_status(config, ids, status: str) -> dict[str, str]:
         else:
             stickers.pop(sid, None)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
+    atomic_write_text(
+        path,
         json.dumps({"stickers": dict(sorted(stickers.items()))}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
     )
     return load_sales(config)

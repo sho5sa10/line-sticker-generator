@@ -94,7 +94,24 @@ def load_image_bytes(data: bytes) -> Image.Image:
 
 
 def import_image(config, entry: StickerEntry, data: bytes, style, logger=None, state=None) -> ImportResult:
-    """1枚取り込み、そのまま完成画像まで作って検証します。"""
+    """1枚取り込み、そのまま完成画像まで作って検証します。
+
+    同じスタンプの「候補の採用」と同時に走ると generated/<id>.png を奪い合うため、
+    採用と同じスタンプ単位の鍵を取ってから取り込みます（取り込みの中身は変えません）。
+    """
+    from . import variants
+
+    try:
+        with variants.adopt_lock(config, entry.id):
+            return _import_image_locked(config, entry, data, style, logger, state)
+    except variants.VariantError as exc:        # 採用処理が長く続いて鍵を取れなかった
+        if logger:
+            logger.error(entry.id, f"IMPORT FAILED: {exc}")
+        return ImportResult(entry.id, False, str(exc))
+
+
+def _import_image_locked(config, entry: StickerEntry, data: bytes, style, logger=None,
+                         state=None) -> ImportResult:
     try:
         rgba = load_image_bytes(data)
     except ImportError_ as exc:
@@ -122,8 +139,8 @@ def import_image(config, entry: StickerEntry, data: bytes, style, logger=None, s
         logger.event(entry.id, "TEXT RENDERED", f"{size_bytes / 1024:.0f}KB")
         logger.event(entry.id, "VALIDATION PASS" if report.ok else "VALIDATION FAIL")
     if state:
-        state.set(entry.id, "imported" if report.ok else "validation_failed",
-                  "" if report.ok else report.errors[0].message)
+        state.record(entry.id, "imported" if report.ok else "validation_failed",
+                     "" if report.ok else report.errors[0].message)
 
     return ImportResult(
         entry.id,
