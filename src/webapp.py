@@ -38,6 +38,7 @@ from . import llm as llm_mod
 from . import package_builder as pkg
 from . import pipeline
 from . import validator as vd
+from .atomic_write import atomic_write_text
 from .config import ConfigError, load_config
 from .csv_loader import CsvLoadError, StickerEntry, load_stickers, save_stickers
 from .image_generator import ImageGenerator, MasterImageMissingError, check_master_image
@@ -534,7 +535,7 @@ def create_app(config=None) -> Flask:
             return jsonify({"error": "キャラクターの説明が空です"}), 400
         path = cfg_.master_prompt_ja_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text + "\n", encoding="utf-8")
+        atomic_write_text(path, text + "\n")
         if isinstance(body.get("profile"), dict):
             cprof.save_profile(cfg_.character_profile_path, body["profile"])
         body = {"saved_to": str(path)}

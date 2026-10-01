@@ -13,6 +13,8 @@ from typing import Any
 import yaml
 from dotenv import load_dotenv
 
+from .atomic_write import atomic_write_text
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "sticker_config.yaml"
 
@@ -205,11 +207,11 @@ class Config:
             set_dotted(current, dotted, value)
             set_dotted(self.raw, dotted, value)  # 実行中の設定にも即反映
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
+        atomic_write_text(
+            path,
             "# このファイルは GUI から自動生成されます。\n"
             "# sticker_config.yaml の値をここで上書きします。手動編集も可能です。\n"
             + yaml.safe_dump(current, allow_unicode=True, sort_keys=False),
-            encoding="utf-8",
         )
         return path
 

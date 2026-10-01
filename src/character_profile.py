@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from .atomic_write import atomic_write_text
+
 HUMAN_KINDS = ["人（日本人）", "人"]
 # 体の色を選べる種類（人間と食べ物以外）
 FUR_KINDS = ["動物", "ふしぎな生き物"]
@@ -346,8 +348,8 @@ def load_profile(path: str | Path) -> dict | None:
 def save_profile(path: str | Path, profile: dict) -> Path:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(normalize(profile), ensure_ascii=False, indent=2) + "\n",
-                 encoding="utf-8")
+    text = json.dumps(normalize(profile), ensure_ascii=False, indent=2) + "\n"
+    atomic_write_text(p, text)
     return p
 
 

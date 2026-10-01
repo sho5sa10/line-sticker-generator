@@ -21,6 +21,7 @@ from datetime import date
 from pathlib import Path
 
 from . import character_profile as cprof
+from .atomic_write import atomic_write_text
 
 # 各項目の上限（全角は2文字として数えた値）
 LIMITS = {
@@ -412,5 +413,5 @@ def save_listing(config, listing: dict) -> dict:
     clean = {k: str(listing.get(k, "") or "").strip() for k in LIMITS}
     path = listing_path(config)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(clean, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_text(path, json.dumps(clean, ensure_ascii=False, indent=2))
     return clean
