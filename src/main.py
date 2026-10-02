@@ -548,12 +548,17 @@ def cmd_variants_best(config, args) -> int:
               file=sys.stderr)
         return EXIT_ERROR
     if ids:
-        known = {e.id for e in entries}
-        unknown = [i for i in ids if i not in known]
-        if unknown:
-            print(f"ERROR:\n  CSVにIDがありません: {', '.join(unknown)}", file=sys.stderr)
+        # 照合は既存の filter_entries に任せます（"1" と "001" を同じIDとして扱い、
+        # 以降は CSV 上の正規ID e.id だけを使います）。1件でも無いIDがあれば何もしません。
+        try:
+            entries = filter_entries(entries, ids=ids)
+        except CsvLoadError as exc:
+            print(f"ERROR:\n  {exc}", file=sys.stderr)
             return EXIT_ERROR
-        entries = [e for e in entries if e.id in ids]
+        except ValueError:
+            print(f"ERROR:\n  IDは数字で指定してください（例: --ids 001,002）: {', '.join(ids)}",
+                  file=sys.stderr)
+            return EXIT_ERROR
 
     if vr.is_corrupt(config):
         print(f"ERROR:\n  {vr.corrupt_message(config)}", file=sys.stderr)
