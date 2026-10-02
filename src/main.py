@@ -519,6 +519,110 @@ def cmd_variants_score(config, args) -> int:
     return EXIT_ERROR if errors else EXIT_OK
 
 
+def _parse_ids(text: str | None) -> list[str]:
+    """--ids "001,003 005" を ["001", "003", "005"] にします（重複は1つに）。"""
+    out: list[str] = []
+    for part in (text or "").replace(",", " ").split():
+        if part not in out:
+            out.append(part)
+    return out
+
+
+def cmd_variants_best(config, args) -> int:
+    """各スタンプの代表候補（Gate無しで点数が最高の候補）を一覧にします。
+
+    既定では何も書きません。--adopt --ids を付けたときだけ、指定したスタンプの代表候補を
+    既存の採用処理（vr.adopt）で採用します。採用済み・代表なし・未評価のスタンプには触りません。
+    """
+    from . import scoring
+
+    try:
+        entries = load_stickers(config.csv_path)
+    except CsvLoadError as exc:
+        print(f"ERROR:\n  {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    ids = _parse_ids(args.ids)
+    if args.adopt and not ids:
+        print("ERROR:\n  --adopt には採用するスタンプを --ids で明示してください（例: --ids 001,003）",
+              file=sys.stderr)
+        return EXIT_ERROR
+    if ids:
+        known = {e.id for e in entries}
+        unknown = [i for i in ids if i not in known]
+        if unknown:
+            print(f"ERROR:\n  CSVにIDがありません: {', '.join(unknown)}", file=sys.stderr)
+            return EXIT_ERROR
+        entries = [e for e in entries if e.id in ids]
+
+    if vr.is_corrupt(config):
+        print(f"ERROR:\n  {vr.corrupt_message(config)}", file=sys.stderr)
+        return EXIT_ERROR
+    data = vr.load(config)
+    found = vr.list_all(config, [e.id for e in entries], data)
+    rows = []
+    for entry in entries:
+        status, best = scoring.representative(config, found.get(entry.id))
+        rows.append((entry, status, best))
+    if args.by_score:
+        rows.sort(key=lambda r: (r[2] is None, -scoring.total_score(r[2]) if r[2] else 0, r[0].index))
+
+    if not args.adopt:
+        print(f"{'ID':<5}{'STATUS':<16}{'BEST':<7}{'Q':>4}{'V':>5}  {'GATED':<6}FLAGS / セリフ")
+        print("─" * 72)
+        for entry, status, best in rows:
+            sticker = found.get(entry.id)
+            gated = sum(1 for v in sticker.variants if scoring.gates(v.flags)) if sticker else 0
+            total = sticker.variant_count if sticker else 0
+            vid, q, vis, flags = "-", "-", "-", "-"
+            if best is not None:
+                s = best.extra.get("derived_scores") or {}
+                vid, q, vis = best.variant_id, s.get("quality", "-"), s.get("visibility", "-")
+                flags = ",".join(scoring.warns(best.flags)) or "-"
+            shown = status
+            if status == scoring.STATUS_ADOPTED:
+                shown = f"{status}:{sticker.adopted}"
+            print(f"{entry.id:<5}{shown:<16}{vid:<7}{q!s:>4}{vis!s:>5}  {f'{gated}/{total}':<6}"
+                  f"{flags} 「{entry.text}」")
+        print("─" * 72)
+        counts = {}
+        for _, status, _ in rows:
+            counts[status] = counts.get(status, 0) + 1
+        print(" / ".join(f"{k} {v}件" for k, v in sorted(counts.items())))
+        best_ids = [e.id for e, status, _ in rows if status == scoring.STATUS_BEST]
+        if best_ids:
+            print(f"BEST のID: {','.join(best_ids)}")
+        print("※ 何も変更していません。採用するときは --adopt --ids で対象を明示してください。")
+        return EXIT_OK
+
+    config.ensure_output_dirs()
+    try:
+        style = TextStyle.from_config(config)
+    except FontNotFoundError as exc:
+        print(f"ERROR:\n  {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    adopted, skipped, failed = [], [], []
+    for entry, _, _ in rows:
+        # 採用の直前に最新の記録で判定し直します（一覧を作ったあとに変わっていても安全に）
+        status, best = scoring.representative(config, vr.get_sticker(config, entry.id))
+        if status != scoring.STATUS_BEST:
+            skipped.append(entry.id)
+            print(f"  {entry.id} SKIP {status}（採用しません）")
+            continue
+        try:
+            result = vr.adopt(config, entry, best.variant_id, style=style)
+        except Exception as exc:  # noqa: BLE001 - 原因を必ず画面に出し、次のスタンプへ進む
+            failed.append(entry.id)
+            print(f"  {entry.id} ERROR {best.variant_id}: {exc}", file=sys.stderr)
+            continue
+        adopted.append(entry.id)
+        print(f"  {entry.id} ADOPTED {result['variant_id']} → {result['final']}")
+    print("-" * 56)
+    print(f"採用 {len(adopted)}件 / 見送り {len(skipped)}件 / 失敗 {len(failed)}件")
+    return EXIT_ERROR if failed else EXIT_OK
+
+
 def cmd_variants_verdict(config, args) -> int:
     """候補に人の判断（pending / rejected / regen）を付けます。"""
     try:
@@ -815,6 +919,13 @@ def build_parser() -> argparse.ArgumentParser:
     vp.add_argument("--id", help="1件だけ評価するときのID (例: 001)")
     vp.add_argument("--force", action="store_true", help="計算済みでも評価をやり直す")
     vp.set_defaults(func=cmd_variants_score)
+
+    vp = vsub.add_parser("best", help="各スタンプの代表候補を一覧にする（既定では何も変更しません）")
+    vp.add_argument("--ids", help="対象のスタンプ (例: 001,003,005)。--adopt では必須")
+    vp.add_argument("--by-score", action="store_true", help="代表候補の点数が高い順に並べる")
+    vp.add_argument("--adopt", action="store_true",
+                    help="--ids のスタンプの代表候補を採用する（採用済み・代表なし・未評価は見送り）")
+    vp.set_defaults(func=cmd_variants_best)
 
     vp = vsub.add_parser("verdict", help="候補に人の判断を付ける（採用は adopt を使います）")
     vp.add_argument("--id", required=True, help="スタンプのID (例: 001)")

@@ -300,3 +300,47 @@ def score_all(config, sticker_ids, *, force: bool = False) -> list[dict]:
                          detail="評価中に候補が変更されたため保存しませんでした（再実行してください）")
         results.extend(part)
     return results
+
+
+# ---------------------------------------------------------------------------
+# 代表候補（評価結果を読むだけ。記録は変えません）
+# ---------------------------------------------------------------------------
+STATUS_ADOPTED = "ADOPTED"                # すでに採用済み（人の判断を優先し、触りません）
+STATUS_NO_CANDIDATES = "NO_CANDIDATES"    # 候補が1件も無い
+STATUS_UNSCORED = "UNSCORED"              # 未評価・式が古い候補がある（先に variants score）
+STATUS_BEST = "BEST"                      # 代表候補がある
+STATUS_REGEN_REQUIRED = "REGEN_REQUIRED"  # 使える候補が無い（Gate付き・不採用・作り直しの印だけ）
+
+
+def total_score(variant) -> int:
+    scores = variant.extra.get("derived_scores")
+    scores = scores if isinstance(scores, dict) else {}
+    return sum(v for v in (scores.get("quality"), scores.get("visibility"))
+               if isinstance(v, int) and not isinstance(v, bool))
+
+
+def _eligible(config, variant) -> bool:
+    """代表にしてよい候補か: Gate が無く、人が不採用・作り直しにしておらず、画像がある。"""
+    return (not gates(variant.flags)
+            and variant.verdict not in (vr.VERDICT_REJECTED, vr.VERDICT_REGEN)
+            and variant.exists(config))
+
+
+def representative(config, sticker) -> tuple[str, object | None]:
+    """1スタンプの状態と代表候補を返します（quality + visibility が最高。同点は候補IDの若い方）。
+
+    Returns:
+        (状態, 代表の Variant または None)。ADOPTED のときも参考として代表を返します。
+    """
+    variants = list(sticker.variants) if sticker is not None else []
+    if not variants:
+        return STATUS_NO_CANDIDATES, None
+    unscored = any(needs_scoring(v.to_dict()) for v in variants)
+    ok = [] if unscored else [v for v in variants if _eligible(config, v)]
+    # 同点は候補IDの若い方（v999 → v1000 の桁上がりも番号順になるよう、長さを先に比べます）
+    best = min(ok, key=lambda v: (-total_score(v), len(v.variant_id), v.variant_id)) if ok else None
+    if sticker.adopted:
+        return STATUS_ADOPTED, best
+    if unscored:
+        return STATUS_UNSCORED, None
+    return (STATUS_BEST, best) if best is not None else (STATUS_REGEN_REQUIRED, None)
