@@ -178,6 +178,50 @@ def test_adopt_only_adopts_best_and_skips_the_rest(cfg, capsys):
     assert "004 SKIP ADOPTED" in out and "採用 1件 / 見送り 4件 / 失敗 0件" in out
 
 
+# --- --ids の照合（"1" と "001" は同じID。内部では CSV 上の正規ID を使う）----------
+def _listed_ids(out: str) -> list[str]:
+    rows = out.split("─" * 72)[1]
+    return [line.split()[0] for line in rows.strip().splitlines()]
+
+
+@pytest.mark.parametrize("ids", ["002", "001,002,003", "1,2,3", "1 002,3", "001,1,002"])
+def test_ids_single_multiple_and_unpadded_match_csv_ids(cfg, capsys, ids):
+    _mixed(cfg)
+    assert cmd_variants_best(cfg, _args("--ids", ids)) == 0
+    expected = ["002"] if ids == "002" else (["001", "002"] if ids == "001,1,002" else ["001", "002", "003"])
+    assert _listed_ids(capsys.readouterr().out) == expected
+
+
+def test_all_eight_ids_are_listed(cfg, capsys):
+    csv_path = cfg.root / "data" / "stickers.csv"
+    rows = "".join(f"{i:03d},セリフ{i:03d},手を振る,笑顔,basic\n" for i in range(1, 9))
+    csv_path.write_text("id,text,action,expression,category\n" + rows, encoding="utf-8")
+    assert cmd_variants_best(cfg, _args("--ids", "001,002,003,004,005,006,007,008")) == 0
+    assert _listed_ids(capsys.readouterr().out) == [f"{i:03d}" for i in range(1, 9)]
+
+
+@pytest.mark.parametrize("ids", ["001,999", "1,2,abc", "001,1.5"])
+def test_adopt_with_any_unknown_or_invalid_id_changes_nothing(cfg, capsys, ids):
+    _mixed(cfg)
+    before = _snapshot(cfg)
+    assert cmd_variants_best(cfg, _args("--adopt", "--ids", ids)) == 1
+    assert _snapshot(cfg) == before
+    assert "ERROR" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("ids", ["001,002,003", "1,2,3"])
+def test_adopt_targets_the_canonical_csv_ids(cfg, capsys, ids):
+    _mixed(cfg)
+    assert cmd_variants_best(cfg, _args("--adopt", "--ids", ids)) == 0
+    state = json.loads(cfg.variants_path.read_text(encoding="utf-8"))["stickers"]
+    assert state["001"]["adopted"] == "v002"
+    assert (cfg.dir_final / "001.png").exists() and not (cfg.dir_final / "1.png").exists()
+    assert state["002"]["adopted"] is None and state["003"]["adopted"] is None
+    assert set(state) == {"001", "002", "003", "004"}           # "1" などの記録を作らない
+    out = capsys.readouterr().out
+    assert "001 ADOPTED v002" in out and "002 SKIP REGEN_REQUIRED" in out and "003 SKIP UNSCORED" in out
+
+
 def test_parse_ids_accepts_commas_and_spaces():
     from src.main import _parse_ids
     assert _parse_ids("001, 003 003,,005") == ["001", "003", "005"]
